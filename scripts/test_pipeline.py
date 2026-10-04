@@ -24,7 +24,7 @@ sys.path.insert(0, LIB)
 # No test may reach PyPI. The two that exercise installing lift this for their own runs.
 os.environ['TOKEN_COUNTER_NO_INSTALL'] = '1'
 
-from tokencounter import analyze, classify, deps, encoding, images, latency, ledger, render, rollout, worker  # noqa: E402
+from tokencounter import analyze, classify, deps, encoding, images, latency, ledger, pricing, render, rollout, worker  # noqa: E402
 
 RESULTS = []
 
@@ -2543,6 +2543,10 @@ def axis_model():
 
 def page_fixture():
     model = axis_model()
+    # The corpus's models are not in any price table; the page test should still draw the API
+    # value tile among the others, in every style.
+    model['api_value'] = {'available': True, 'usd': 1234.5, 'unpriced': 2,
+                          'prices': {'as_of': '2026-10-04'}}
     # The corpus times one response a day, and a day needs HOUR_MIN to be a point on the
     # response-time chart; the page test needs points to move.  Same days, same spans, more
     # responses.
@@ -2650,6 +2654,465 @@ def test_shared_time_axis():
           and 'No rate-limit snapshots' in h2, str(dom2))
 
 
+# --------------------------------------------------------------------------- API value
+
+# A price table of its own, so these tests do not move when scripts/fetch_prices.py
+# re-vendors the real one.  `big` has long-context, cache-write and Fast rates, `flat` has
+# none of those, and `pro` has no cached rate.
+PRICE_TABLE = {
+    'as_of': '2026-01-02', 'source': 'test', 'unit_tokens': 1_000_000,
+    'long_context_threshold': 272_000, 'web_search_per_call': 0.01,
+    'models': {
+        'big': {'standard': {'input': 2.0, 'cached_input': 0.2, 'cache_write': 2.5,
+                             'output': 10.0,
+                             'long': {'input': 4.0, 'cached_input': 0.4, 'cache_write': 5.0,
+                                      'output': 15.0}},
+                'fast': {'input': 4.0, 'cached_input': 0.4, 'cache_write': 5.0,
+                         'output': 20.0, 'long': None},
+                'long_context': True},
+        'flat': {'standard': {'input': 1.0, 'cached_input': 0.1, 'cache_write': None,
+                              'output': 8.0, 'long': None},
+                 'long_context': False},
+        'pro': {'standard': {'input': 30.0, 'cached_input': None, 'cache_write': None,
+                             'output': 180.0, 'long': None},
+                'long_context': False},
+    },
+}
+
+
+def _price_file(table=None):
+    path = os.path.join(tempfile.mkdtemp(), 'prices.json')
+    with open(path, 'w', encoding='utf-8') as fh:
+        if isinstance(table, str):
+            fh.write(table)
+        else:
+            json.dump(PRICE_TABLE if table is None else table, fh)
+    return path
+
+
+def _row(model, inp, cached=0, out=0, writes=None, tier=None, reasoning=0, ws=0):
+    u = {'input_tokens': inp, 'cached_input_tokens': cached, 'output_tokens': out,
+         'reasoning_output_tokens': reasoning, 'total_tokens': inp + out}
+    if writes is not None:
+        u['cache_write_input_tokens'] = writes
+    return {'model': model, 'tier': tier, 'usage': u, 'web_search': ws}
+
+
+def test_price_table():
+    """The vendored table loads with the network blocked; a malformed one is refused whole."""
+    code = (
+        'import socket, sys\n'
+        'def deny(*a, **k): raise RuntimeError("network access attempted")\n'
+        'socket.socket = deny; socket.create_connection = deny\n'
+        f'sys.path.insert(0, {LIB!r})\n'
+        'from tokencounter import pricing\n'
+        'import json\n'
+        't, why = pricing.load()\n'
+        'print(json.dumps([why, len(t["models"]), t["long_context_threshold"],'
+        ' "gpt-5.5" in t["models"] and "gpt-5.3-codex" in t["models"]] if t else [why]))\n'
+    )
+    p = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+    try:
+        got = json.loads(p.stdout)
+    except ValueError:
+        got = None
+    check('the vendored price table loads offline (network blocked)',
+          p.returncode == 0 and got and got[0] is None and got[1] > 20
+          and got[2] == 272_000 and got[3] is True, (p.stdout + p.stderr)[-400:])
+    t, why = pricing.load(_price_file())
+    check('a well-formed table loads', why is None and set(t['models']) == {'big', 'flat', 'pro'},
+          str(why))
+    bad = {
+        'not JSON': '{"models": ',
+        'no models': dict(PRICE_TABLE, models={}),
+        'no standard rates': dict(PRICE_TABLE, models={'x': {'fast': PRICE_TABLE['models']
+                                                              ['big']['fast']}}),
+        'a negative rate': dict(PRICE_TABLE, models={'x': {'standard': dict(
+            PRICE_TABLE['models']['flat']['standard'], output=-1)}}),
+        'a string rate': dict(PRICE_TABLE, models={'x': {'standard': dict(
+            PRICE_TABLE['models']['flat']['standard'], input='1.0')}}),
+        'no threshold': {k: v for k, v in PRICE_TABLE.items() if k != 'long_context_threshold'},
+        'a zero unit_tokens': dict(PRICE_TABLE, unit_tokens=0),
+        'a string unit_tokens': dict(PRICE_TABLE, unit_tokens='1000000'),
+        'an infinite rate': dict(PRICE_TABLE, models={'x': {'standard': dict(
+            PRICE_TABLE['models']['flat']['standard'], cached_input=float('inf'))}}),
+        'a NaN rate': dict(PRICE_TABLE, models={'x': {'standard': dict(
+            PRICE_TABLE['models']['flat']['standard'], output=float('nan'))}}),
+    }
+    for label, table in bad.items():
+        got, why = pricing.load(_price_file(table))
+        check(f'a table with {label} is refused, with a reason', got is None and bool(why), why)
+    got, why = pricing.load(os.path.join(tempfile.mkdtemp(), 'missing.json'))
+    check('a missing table is refused, with a reason', got is None and 'unreadable' in why, why)
+
+
+def test_pricing_math():
+    """Each response priced at its own model, tier and prompt size, with OpenAI's input split."""
+    t, _ = pricing.load(_price_file())
+    near = lambda a, b: a is not None and abs(a - b) < 1e-12
+
+    usd, why = pricing.price(t, _row('flat', 1000, 400, 50, reasoning=25))
+    check('ordinary, cached and output tokens at their own rates',
+          why is None and near(usd, (600 * 1.0 + 400 * 0.1 + 50 * 8.0) / 1e6), f'{usd} {why}')
+    check('reasoning is part of output, never added again',
+          near(pricing.price(t, _row('flat', 1000, 400, 50))[0], usd))
+    usd, _ = pricing.price(t, _row('big', 10_000, 4_000, 100, writes=5_000))
+    check('cache writes are part of input, priced at the write rate, apart from cached reads',
+          near(usd, (1_000 * 2.0 + 4_000 * 0.2 + 5_000 * 2.5 + 100 * 10.0) / 1e6), str(usd))
+    check('a model with no cache-write rate bills writes as ordinary input',
+          near(pricing.price(t, _row('flat', 1000, 400, 50, writes=300))[0],
+               (600 * 1.0 + 400 * 0.1 + 50 * 8.0) / 1e6))
+    check('a model with no cached rate bills cached input as ordinary input',
+          near(pricing.price(t, _row('pro', 2000, 1000))[0], 2000 * 30.0 / 1e6))
+
+    check('a prompt of exactly the threshold is short context',
+          near(pricing.price(t, _row('big', 272_000))[0], 272_000 * 2.0 / 1e6))
+    check('one token over prices the whole request at long-context rates',
+          near(pricing.price(t, _row('big', 272_001, 1_000, 10))[0],
+               (271_001 * 4.0 + 1_000 * 0.4 + 10 * 15.0) / 1e6))
+    check('a model with no long-context rates keeps its rates at any size',
+          near(pricing.price(t, _row('flat', 400_000))[0], 400_000 * 1.0 / 1e6))
+    check('a long prompt in a tier with no long-context rate is unpriced, not guessed',
+          pricing.price(t, _row('big', 300_000, tier='priority')) == (None, 'long_context'))
+
+    check('Fast mode (priority) is priced at Fast rates',
+          near(pricing.price(t, _row('big', 1000, tier='priority'))[0], 1000 * 4.0 / 1e6))
+    check("Codex's default sentinel is standard",
+          near(pricing.price(t, _row('big', 1000, tier='default'))[0], 1000 * 2.0 / 1e6))
+    check('a tier the model has no rates for is unpriced',
+          pricing.price(t, _row('flat', 1000, tier='flex')) == (None, 'tier'))
+    check('an unknown tier is unpriced',
+          pricing.price(t, _row('big', 1000, tier='scale')) == (None, 'tier'))
+    check('a dated snapshot is priced as its alias',
+          near(pricing.price(t, _row('flat-2026-01-01', 1000))[0], 1000 * 1.0 / 1e6))
+    check('an unlisted model is unpriced', pricing.price(t, _row('nope', 1000)) == (None, 'model')
+          and pricing.price(t, _row(None, 1000)) == (None, 'model'))
+    damaged = {'model': 'flat', 'usage': {'input_tokens': 'x', 'cached_input_tokens': None,
+                                          'output_tokens': 1000}}
+    check('a damaged count prices as zero instead of raising',
+          near(pricing.price(t, damaged)[0], 1000 * 8.0 / 1e6))
+    check('web searches carry the per-call fee',
+          near(pricing.web_search(t, _row('flat', 0, ws=3)), 0.03))
+
+
+def _token_count(t, last, total):
+    return _at(t, 'event_msg', {'type': 'token_count',
+                                'info': {'last_token_usage': last, 'total_token_usage': total}})
+
+
+def _searches_corpus(d):
+    """Three files: an explicit stream with a context snapshot and two tier changes, a file
+    whose legacy record is written before its explicit one, and a legacy-only file."""
+    t = 1_790_000_000
+    _write(d, 'rollout-a.jsonl', [
+        _at(t, 'session_meta', {'session_id': 'A', 'id': 'A'}),
+        _at(t, 'turn_context', {'model': 'big', 'effort': 'high'}),
+        _user(t + 1),
+        _at(t + 2, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
+        _at(t + 3, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
+        _at(t + 4, 'token_usage_record', {'response_id': 'a0', 'usage': {
+            'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 50,
+            'cached_input_tokens': 0, 'reasoning_output_tokens': 0}}),
+        _at(t + 5, 'token_usage_record', _usage('a1', 1000, 0, 10)),
+        _at(t + 6, 'event_msg', {'type': 'thread_settings_applied', 'thread_settings': {
+            'model': 'big', 'model_provider_id': 'openai', 'service_tier': 'priority'}}),
+        _user(t + 7),
+        _at(t + 8, 'token_usage_record', _usage('a2', 2000, 1000, 20)),
+        _at(t + 9, 'event_msg', {'type': 'thread_settings_applied', 'thread_settings': {
+            'model': 'big', 'model_provider_id': 'openai'}}),
+        _user(t + 10),
+        _at(t + 12, 'token_usage_record', _usage('a3', 3000, 0, 5)),
+    ])
+    _write(d, 'rollout-b.jsonl', [
+        _at(t, 'session_meta', {'session_id': 'B', 'id': 'B'}),
+        _at(t, 'turn_context', {'model': 'big', 'effort': 'high'}),
+        _user(t + 1),
+        _at(t + 2, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
+        _token_count(t + 3, {'input_tokens': 500, 'cached_input_tokens': 0,
+                             'output_tokens': 5, 'reasoning_output_tokens': 0,
+                             'total_tokens': 505},
+                     {'input_tokens': 500, 'output_tokens': 5, 'total_tokens': 505}),
+        _at(t + 3, 'token_usage_record', _usage('b1', 500, 0, 5)),
+    ])
+    snap = {'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0,
+            'reasoning_output_tokens': 0, 'total_tokens': 40}
+    real = {'input_tokens': 700, 'cached_input_tokens': 0, 'output_tokens': 7,
+            'reasoning_output_tokens': 0, 'total_tokens': 707}
+    _write(d, 'rollout-c.jsonl', [
+        _at(t, 'session_meta', {'session_id': 'C', 'id': 'C'}),
+        _at(t, 'turn_context', {'model': 'flat', 'effort': 'low'}),
+        _user(t + 1),
+        _at(t + 2, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
+        _token_count(t + 3, snap, dict(snap)),
+        _token_count(t + 4, real, dict(real, total_tokens=747)),
+        _token_count(t + 5, real, dict(real, total_tokens=747)),   # a repeat: never charged
+    ])
+
+
+def test_tier_and_searches_extracted():
+    """Each charged row carries the tier requested before it and the searches made for it."""
+    d = tempfile.mkdtemp()
+    _searches_corpus(d)
+    for label, fn in (('full', worker.process), ('metrics-only', worker.metrics_only)):
+        data = {os.path.basename(p): fn(p) for p in rollout.discover(d)}
+        charged, _ = ledger.build(data)
+        got = {f: [(r['tier'], r['web_search']) for r in rows] for f, rows in charged.items()}
+        inferred = [r['tier_inferred'] for r in charged.get('rollout-a.jsonl', [])]
+        check(f'{label}: the tier follows each settings snapshot',
+              [x[0] for x in got.get('rollout-a.jsonl', [])][1:] == ['priority', 'default'],
+              str(got))
+        check(f"{label}: the first turn, whose snapshot Codex never persists, takes the "
+              f"file's first snapshot and says so",
+              got.get('rollout-a.jsonl', [(None,)])[0][0] == 'priority'
+              and inferred == [True, False, False], f'{got} {inferred}')
+        check(f'{label}: a context snapshot does not take the searches before it',
+              [x[1] for x in got.get('rollout-a.jsonl', [])] == [2, 0, 0], str(got))
+        check(f'{label}: a search lands on the stream the ledger charges, whichever writes first',
+              got.get('rollout-b.jsonl') == [(None, 1)], str(got))
+        check(f'{label}: on the legacy stream, searches land on the charged record',
+              got.get('rollout-c.jsonl') == [(None, 1)], str(got))
+
+
+def test_replayed_search_not_charged_twice():
+    """A search the parent made after its last usage record, replayed into a fork child, is
+    not charged to the child's first response."""
+    d = tempfile.mkdtemp()
+    t = 1_790_000_000
+    parent = [
+        _at(t, 'session_meta', {'session_id': 'P', 'id': 'P'}),
+        _at(t, 'turn_context', {'model': 'big', 'effort': 'high'}),
+        _user(t + 1),
+        _at(t + 2, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
+        _at(t + 3, 'token_usage_record', _usage('p1', 100, 0, 1)),
+        _user(t + 10),
+        _at(t + 11, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
+        _at(t + 12, 'event_msg', {'type': 'turn_aborted', 'reason': 'interrupted'}),
+    ]
+    _write(d, 'rollout-parent.jsonl', parent)
+    c = t + 3600
+    # The child replays the parent's records stamped a millisecond apart, then works.
+    child = [_at(c, 'session_meta', {'session_id': 'P', 'id': 'K', 'parent_thread_id': 'P'})]
+    for i, r in enumerate(parent[1:], 1):
+        child.append(dict(r, timestamp=_at(c + i / 1000, 'x', {})['timestamp']))
+    child += [_user(c + 5), _at(c + 6, 'token_usage_record', _usage('k1', 200, 0, 2))]
+    _write(d, 'rollout-child.jsonl', child)
+    data = {os.path.basename(p): worker.metrics_only(p) for p in rollout.discover(d)}
+    charged, _ = ledger.build(data)
+    got = {f: [(r['response_id'], r['web_search']) for r in rows] for f, rows in charged.items()}
+    check("a fork child's replayed, unanswered search is not charged to its first response",
+          got == {'rollout-parent.jsonl': [('p1', 1)], 'rollout-child.jsonl': [('k1', 0)]},
+          str(got))
+
+
+def test_fetch_prices_parser():
+    """scripts/fetch_prices.py, offline, against the pricing page the vendored table came from."""
+    import fetch_prices as fp
+    with open(fp.FIXTURE, encoding='utf-8') as fh:
+        md = fh.read()
+    models, threshold, ws = fp.parse_pricing(md)
+    check('the threshold and the web search fee are read off the page',
+          threshold == 272_000 and ws == 0.01, f'{threshold} {ws}')
+    m = models.get('gpt-5.5') or {}
+    check('a flagship model has a rate per tier, its name without the context note',
+          set(m) == {'standard', 'flex', 'fast'} and m['standard']['input'] == 5.0
+          and m['standard']['long']['output'] == 45.0 and m['fast']['long'] is None
+          and not any('(' in k for k in models), str(m)[:300])
+    check('Batch is never read as a tier',
+          not any('batch' in t for t in models.values()), '')
+    check('the Codex table is read per tier',
+          (models.get('gpt-5.3-codex') or {}).get('fast', {}).get('input') == 3.5, '')
+    cy = (models.get('gpt-5.6-cyber') or {}).get('standard') or {}
+    check('the Cyber table is read as standard rates, and repeats keep the flagship rates',
+          (cy.get('input'), cy.get('cache_write'), cy.get('output')) == (12.5, 15.625, 75.0)
+          and set(models['gpt-5.6-sol']) == {'standard', 'flex', 'fast'}, str(cy))
+    check('image, audio and embedding models are not taken for text models',
+          not any(k.startswith(('gpt-image', 'gpt-realtime', 'text-embedding', 'tts'))
+                  for k in models), '')
+    page = fp.parse_model_page('| Metric | Price | Unit |\n| --- | ---: | --- |\n'
+                               '| Input | $1.25 | 1M tokens |\n| Cached input | $0.125 | 1M tokens |\n'
+                               '| Output | $10 | 1M tokens |\n')
+    check('a model page gives standard rates',
+          (page['input'], page['cached_input'], page['output']) == (1.25, 0.125, 10.0), str(page))
+    with open(pricing.DEFAULT_PRICES, encoding='utf-8') as fh:
+        vendored = json.load(fh)['models']
+    stale = [k for k, v in models.items()
+             if {t: r for t, r in (vendored.get(k) or {}).items() if t in v} != v]
+    check('the vendored table is what the parser makes of the page kept beside it',
+          not stale, str(stale[:5]))
+
+
+def test_interrupted_turns_counted():
+    """Aborted turns are counted, a fork child's replayed copy of its parent's left out."""
+    d = tempfile.mkdtemp()
+    t = 1_790_000_000
+    _write(d, 'rollout-parent.jsonl', [
+        _at(t, 'session_meta', {'session_id': 'P', 'id': 'P'}),
+        _user(t + 1),
+        _at(t + 50, 'event_msg', {'type': 'turn_aborted', 'reason': 'interrupted'}),
+    ])
+    c = t + 3600
+    # The replay is stamped with the child's creation time a millisecond apart, record by
+    # record, as Codex writes it; the child's own work starts seconds later.
+    _write(d, 'rollout-child.jsonl', [
+        _at(c, 'session_meta', {'session_id': 'P', 'id': 'K', 'parent_thread_id': 'P'}),
+        _user(c + .001),
+        _at(c + .002, 'event_msg', {'type': 'turn_aborted', 'reason': 'interrupted'}),
+        _user(c + 5),
+        _at(c + 30, 'event_msg', {'type': 'turn_aborted', 'reason': 'interrupted'}),
+    ])
+    data = {p: worker.metrics_only(p) for p in rollout.discover(d)}
+    check('aborted turns are counted, a replayed copy left out',
+          analyze.turn_aborts(data) == (2, 1), str(analyze.turn_aborts(data)))
+
+
+def _priced_corpus(d):
+    """One session over two days: `big` at standard and Fast, a long `big` prompt, `flat` with a
+    web search, and a model no table lists; then an interrupted turn."""
+    t = 1_790_000_000
+    recs = [
+        _at(t, 'session_meta', {'session_id': 'V', 'id': 'V', 'cwd': '/w'}),
+        _at(t, 'turn_context', {'model': 'big', 'effort': 'high'}),
+        _user(t + 1),
+        _at(t + 2, 'token_usage_record', _usage('v1', 10_000, 4_000, 100)),     # tier unrecorded
+        _at(t + 3, 'event_msg', {'type': 'thread_settings_applied', 'thread_settings': {
+            'model': 'big', 'model_provider_id': 'openai', 'service_tier': 'priority'}}),
+        _user(t + 4),
+        _at(t + 5, 'token_usage_record', _usage('v2', 20_000, 10_000, 200)),     # Fast
+        _at(t + 6, 'event_msg', {'type': 'thread_settings_applied', 'thread_settings': {
+            'model': 'big', 'model_provider_id': 'openai'}}),
+        _user(t + 7),
+        _at(t + 8, 'token_usage_record', _usage('v3', 300_000, 0, 1_000)),       # long context
+        _at(t + 86_400, 'turn_context', {'model': 'flat', 'effort': 'low'}),
+        _user(t + 86_401),
+        _at(t + 86_402, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
+        _at(t + 86_403, 'token_usage_record', _usage('v4', 1_000, 0, 10)),
+        _at(t + 86_410, 'turn_context', {'model': 'mystery', 'effort': 'low'}),
+        _user(t + 86_411),
+        _at(t + 86_412, 'token_usage_record', _usage('v5', 5_000, 0, 50)),
+        _at(t + 86_420, 'event_msg', {'type': 'turn_aborted', 'reason': 'interrupted'}),
+    ]
+    _write(d, 'rollout-v.jsonl', recs)
+    # A one-turn thread, as `codex exec` writes it: no settings snapshot at all.
+    _write(d, 'rollout-w.jsonl', [
+        _at(t + 200, 'session_meta', {'session_id': 'W', 'id': 'W', 'cwd': '/w'}),
+        _at(t + 200, 'turn_context', {'model': 'big', 'effort': 'high'}),
+        _user(t + 201),
+        _at(t + 202, 'token_usage_record', _usage('w1', 200_000, 0, 20)),
+    ])
+    v1 = (6_000 * 4.0 + 4_000 * 0.4 + 100 * 20.0) / 1e6      # first turn: inferred Fast
+    v2 = (10_000 * 4.0 + 10_000 * 0.4 + 200 * 20.0) / 1e6
+    v3 = (300_000 * 4.0 + 1_000 * 15.0) / 1e6
+    v4 = (1_000 * 1.0 + 10 * 8.0) / 1e6
+    w1, w1_fast = (200_000 * 2.0 + 20 * 10.0) / 1e6, (200_000 * 4.0 + 20 * 20.0) / 1e6
+    low = v1 + v2 + v3 + v4 + w1 + 0.01
+    return low, low - w1 + w1_fast
+
+
+def test_api_value_headline():
+    """The report prices every response, says what it could not price, and shows the total
+    as a headline tile worded as a counterfactual."""
+    import report as cli
+    d = tempfile.mkdtemp()
+    want, want_high = _priced_corpus(d)
+    data = {p: worker.process(p) for p in rollout.discover(d)}
+    charged, counters = ledger.build(data)
+    table = pricing.load(_price_file())
+    model = analyze.analyze(data, charged, counters, scope={'label': 'test'}, prices=table)
+    av = model['api_value']
+    check('the API value is the sum of every priced response and the web search fee',
+          av['available'] and abs(av['usd'] - want) < 1e-9, f"{av['usd']} want {want}")
+    check('what it could not price is counted, with the model and the reason',
+          av['priced'] == 5 and av['unpriced'] == 1
+          and av['unpriced_models'] == [{'model': 'mystery', 'reason': 'model',
+                                         'responses': 1, 'input': 5_000, 'output': 50}], str(av))
+    check('tiers, inferred and unrecorded tiers, long prompts, searches and aborts are counted',
+          av['tiers'] == {'standard': 3, 'fast': 2} and av['tier_inferred'] == 1
+          and av['tier_unrecorded'] == 1 and av['long_context'] == 1
+          and av['web_search_calls'] == 1 and av['aborted_turns'] == 1, str(av))
+    check('the upper bound prices the unrecorded tier at Fast, and only that',
+          abs(av['usd_high'] - want_high) < 1e-9, f"{av['usd_high']} want {want_high}")
+    check('the days and the sessions add up to the total',
+          abs(sum(x['api_usd'] for x in model['daily']) - av['usd']) < 1e-9
+          and abs(sum(x['api_usd'] for x in model['sessions']) - av['usd']) < 1e-9,
+          str([x['api_usd'] for x in model['daily']]))
+
+    page = render.render(model)
+    tiles = page[page.index('class="tiles"'):page.index('</div>\n\n')]
+    check('the API value is a headline tile, worded as a counterfactual',
+          f'<div class="k">API value</div><div class="v">{render.usd(av["usd"])}</div>' in tiles
+          and 'if billed at API list prices of Jan 2, 2026' in tiles
+          and '1 response unpriced' in tiles
+          and f'up to {render.usd(av["usd_high"])} if untiered responses ran in Fast mode'
+          in tiles, tiles[:700])
+    undated = render.render(dict(model, api_value=dict(av, prices={})))
+    check('a table with no date says so on the tile',
+          'if billed at API list prices of an unknown date' in undated)
+    check('dollars are formatted to fit a tile',
+          [render.usd(x) for x in (0.4, 12.345, 1234.5, 123_456, 2_345_678)]
+          == ['$0.40', '$12.35', '$1,234', '$123.5K', '$2.35M'])
+    hostile = render.render(dict(model, api_value=dict(av, prices=dict(
+        av['prices'], as_of='<img src=x onerror=alert(1)>'))))
+    check('a hostile price-table date is escaped', '<img src=x' not in hostile)
+
+    lines = cli.api_summary(av)
+    check('stdout says the figure is not a bill, and what it left out',
+          'not a bill' in lines[0] and any('mystery 1' in x for x in lines)
+          and any('aborted turn' in x for x in lines)
+          and any('in total if they ran in Fast mode' in x for x in lines)
+          and any('1 web search $0.01' in x for x in lines), '\n'.join(lines))
+
+    none = analyze.analyze(data, charged, counters, scope={'label': 'test'},
+                           prices=(None, 'price table unreadable (test)'))
+    nav = none['api_value']
+    check('without a price table the report says why, and draws no tile',
+          not nav['available'] and 'unreadable' in nav['reason']
+          and '<div class="k">API value</div>' not in render.render(none)
+          and all(x['api_usd'] is None for x in none['daily'])
+          and none['sessions'][0]['api_usd'] is None
+          and cli.api_summary(nav)[0].startswith('API value not available'), str(nav))
+    unpriced = analyze.analyze(data, charged, counters, scope={'label': 'test'},
+                               prices=pricing.load(_price_file(dict(PRICE_TABLE, models={
+                                   'other': PRICE_TABLE['models']['flat']}))))
+    check('with nothing priced the report names the models, and draws no tile',
+          not unpriced['api_value']['available']
+          and 'mystery' in unpriced['api_value']['reason']
+          and '<div class="k">API value</div>' not in render.render(unpriced),
+          str(unpriced['api_value'].get('reason')))
+
+
+def test_prices_option():
+    """--prices replaces the vendored table; an unreadable one costs the run its API value
+    and nothing else."""
+    d = tempfile.mkdtemp()
+    root = os.path.join(d, 'sessions')
+    day = os.path.join(root, '2026', '09', '20')
+    os.makedirs(day)
+    _priced_corpus(day)
+    home = os.path.join(d, 'home')
+
+    def run(*extra):
+        out = tempfile.mkdtemp()
+        jpath = os.path.join(out, 'm.json')
+        err = io.StringIO()
+        with _codex_home(home) as cli, contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(['--sessions-root', root, '--no-open', '--no-account', '--procs', '1',
+                           '--metrics-only', '--json', jpath, *extra])
+        model = json.load(open(jpath, encoding='utf-8')) if rc == 0 else None
+        return rc, model, err.getvalue()
+
+    rc, m, _ = run('--prices', _price_file())
+    av = (m or {}).get('api_value') or {}
+    check('--prices prices the usage with the table it names',
+          rc == 0 and av.get('available') and av['prices']['default'] is False
+          and av['prices']['as_of'] == '2026-01-02', str(av)[:300])
+    rc, m, err = run('--prices', os.path.join(d, 'no-such-table.json'))
+    av = (m or {}).get('api_value') or {}
+    check('an unreadable --prices table costs the API value, not the run',
+          rc == 0 and av.get('available') is False and 'API value not computed' in err
+          and m['totals']['responses'] == 6, f'rc={rc} {av} {err[-300:]}')
+
+
 def main():
     test_offline_tokenizer()
     test_encoding_cached()
@@ -2695,6 +3158,14 @@ def main():
     test_limit_events()
     test_limit_events_chart()
     test_shared_time_axis()
+    test_price_table()
+    test_pricing_math()
+    test_tier_and_searches_extracted()
+    test_replayed_search_not_charged_twice()
+    test_fetch_prices_parser()
+    test_interrupted_turns_counted()
+    test_api_value_headline()
+    test_prices_option()
     test_render()
     bad = sum(1 for _, ok, _ in RESULTS if not ok)
     print(f'\n{len(RESULTS) - bad}/{len(RESULTS)} passed')

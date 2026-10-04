@@ -6,9 +6,11 @@ uncached input, names the account it covers, and renders a local HTML dashboard 
 Every figure comes from `~/.codex/sessions/**/rollout-*.jsonl`. One other file is read, and
 only to put a name on the report: `~/.codex/auth.json`, for the non-secret identity claims in
 its id_token — access and refresh tokens are never parsed, and `--no-account` skips the file
-entirely. No daemon, no interception, and no conversion of tokens into money or rate-limit
-consumption. The report makes one network call, once: if `tiktoken` is missing, the first run
-installs it from PyPI (see [Install](#install)). Nothing of yours is sent.
+entirely. No daemon, no interception, and no conversion of tokens into rate-limit
+consumption. It does put a dollar figure on the usage: what it would cost at OpenAI's API
+list prices, from a price table that ships with the plugin (see [API value](#api-value)).
+The report makes one network call, once: if `tiktoken` is missing, the first run installs it
+from PyPI (see [Install](#install)). Nothing of yours is sent.
 
 The one exception is opt-in and separate: the `token-share` skill posts daily token counts to
 the public leaderboard at [tokenusage.dev](https://tokenusage.dev), with your report page at a
@@ -109,7 +111,9 @@ the leaderboard's. Sent: per-day responses, recorded input, cached input, output
 and reasoning tokens, plus each month's top sessions by active time and by tokens (a one-way
 hash of the session id, start and end times, active time, counts and model name), plus each
 weekly rate-limit window (its start, the plan and percentages Codex logged for it, and the
-tokens counted in it; tokenusage.dev estimates each plan's weekly limit from these). Never
+tokens counted in it; tokenusage.dev estimates each plan's weekly limit from these), plus
+the [API value](#api-value) per day, per session and in total (tokenusage.dev ignores it
+for now: its schema drops fields it does not know). Never
 sent: prompts, outputs, tool results, file contents or paths, session titles, or anything
 from `auth.json`. `--out payload.json` writes the exact payload for you to read without
 sending it.
@@ -157,6 +161,46 @@ of leads, visibly marked as inference, not as findings. The same restraint appli
 limit: the two curves share an axis, but no tokens-per-percent rate is published, because the
 corpus shows 95% of a window costing 2.81B recorded input one week and 790M another.
 
+## API value
+
+The report's API value tile says what the usage would cost **if it were billed at OpenAI's
+API list prices**. A ChatGPT plan is not billed per token, so this is a counterfactual, and
+the page words it as one. It is priced **per response**, from what Codex recorded for it:
+
+- **the model** of the turn that sent it;
+- **the processing tier** Codex requested. Fast mode sends `priority`, which costs 2× or
+  more. Codex records the thread's tier in the rollout, but never for a thread's first turn,
+  which takes the tier recorded next and is counted as inferred. A thread with no record
+  at all, such as a one-turn `codex exec` run, is priced at standard. Beside it is what
+  those responses would cost in Fast mode;
+- **the prompt size.** Above 272K input tokens, models with long-context rates charge them
+  for the whole request;
+- **OpenAI's input split.** Ordinary input, cached reads and cache writes each have their
+  own rate. Reasoning tokens are part of output and are not added again;
+- **web searches**, at $10 per 1,000 calls.
+
+The terminal line says what the figure leaves out:
+
+- responses whose model, tier or prompt size has no published rate. Codex's guardian
+  reviewer, `codex-auto-review`, is one. These are left out and named, never guessed;
+- aborted turns (interrupted, or replaced by a new turn). A response cut off by one writes no
+  usage record, so it is counted but cannot be priced;
+- the 10% regional-processing uplift.
+
+The prices ship with the plugin in `assets/vendor/openai_prices.json`, so the report works
+without internet. Two runs over the same logs agree until the table is refreshed on
+purpose:
+
+```
+python scripts/fetch_prices.py           # re-vendor from developers.openai.com/api/docs/pricing
+python scripts/fetch_prices.py --check   # how the vendored table differs from the live pages
+```
+
+The table's date is on the tile. Codex models that the pricing page no longer lists, such as
+`gpt-5-codex`, `gpt-5.1-codex*` and `gpt-5.2-codex`, are priced from their own model pages.
+Those pages publish standard rates only. `--prices table.json` prices the usage with any
+table in the same format.
+
 ## Where the numbers come from
 
 | On the page | Source |
@@ -168,6 +212,7 @@ corpus shows 95% of a window costing 2.81B recorded input one week and 790M anot
 | Rate-limit events per day | the same snapshots: those in which the server reported a limit as reached |
 | Response time, turn time, tool time | the records' own timestamps |
 | Time above the fastest pace (`--json`, terminal line) | **an estimate**, fitted to those times; not a measured queue time |
+| API value | Codex's own usage records, each response priced at the vendored OpenAI API list prices for its model, tier and prompt size |
 
 Input is counted because its content is in the log. Output and caching are not: reasoning
 tokens are encrypted (only summaries are readable), and what is cached is decided on the
@@ -199,6 +244,7 @@ report.py --include-archived       # count sessions whose rollout file is gone
 report.py --rebuild                # discard the index and re-parse
 report.py --no-account             # do not read auth.json; name no account
 report.py --no-install             # never install tiktoken; count no content without it
+report.py --prices table.json      # price the API value with another table
 report.py --doctor                 # what this machine provides, then exit
 ```
 
@@ -218,6 +264,7 @@ still charges over the whole corpus, because a fork child's ancestors may sit ou
 | Multiple processes | no | falls back to one, slower and identical |
 | A writable `CODEX_HOME` | no | output goes to the system temp directory, and the path is printed |
 | Network | once, to install `tiktoken` from PyPI if it is missing | the install fails, the run continues without content composition, and the next run tries again |
+| The vendored price table, `assets/vendor/openai_prices.json` | no; it ships with the plugin and is never downloaded | the API value is left out and the terminal line says why; every other figure is unaffected |
 
 `CODEX_HOME` is honoured everywhere Codex honours it. `--sessions-root` overrides the corpus
 alone, and moves the `auth.json` lookup with it so a copied corpus is never stamped with the
@@ -229,7 +276,7 @@ machine you are on.
 ```
 python scripts/fetch_vocab.py --verify   # vendored tokenizer parity with stock o200k_base
 python scripts/test_ledger.py            # 13 response-identity regressions
-python scripts/test_pipeline.py          # 253 pipeline assertions
+python scripts/test_pipeline.py          # 317 pipeline assertions
 python scripts/test_mutations.py         # every fix must fail when reverted
 python scripts/test_share.py             # the share payload, its privacy and its transport
 python scripts/bench.py                  # the parallelism grid
@@ -238,12 +285,15 @@ python scripts/verify_schema.py          # schema claims against the live corpus
 python scripts/verify_install.py         # the installed plugin is this code
 python scripts/diag_fork.py              # independent witness for fork-replay exclusion
 python scripts/ref_bpe.py                # pure-Python BPE oracle
+python scripts/fetch_prices.py --check   # vendored prices against the live pricing pages
 ```
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the four test scripts and
 `node scripts/test_page.js` on every pull request and every push to `main`, on Ubuntu and
 Windows with Python 3.8 and 3.14, plus `fetch_vocab.py --verify`. The rest need a real
-`~/.codex` corpus or an installed plugin, so they stay manual.
+`~/.codex` corpus or an installed plugin, so they stay manual. So does
+`fetch_prices.py --check`: it reads the live pricing pages, which change whenever OpenAI's
+prices do.
 
 ## Design
 

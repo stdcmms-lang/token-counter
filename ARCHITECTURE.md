@@ -47,11 +47,12 @@ Reproduce with:
 ```
 python scripts/fetch_vocab.py --verify     # §4  vendored tokenizer parity
 python scripts/test_ledger.py              # §2  13 response-identity regressions
-python scripts/test_pipeline.py            # §3–§7  237 pipeline assertions
+python scripts/test_pipeline.py            # §3–§7  317 pipeline assertions
 python scripts/test_mutations.py           # §11 every fix fails when reverted
 python scripts/bench.py                    # §3.4  the parallelism grid
 python scripts/verify_schema.py            # §2.2, §2.3 schema claims
 python scripts/verify_install.py           # §6  installed copy == this code
+python scripts/fetch_prices.py --check     # §5.9  vendored prices against the live pages
 ```
 
 ---
@@ -70,8 +71,12 @@ python scripts/verify_install.py           # §6  installed copy == this code
 5. **Response time.** How long each model call, turn and tool call took, from the records'
    own timestamps — and, separately and labelled as an estimate, how much of a response's
    time sat above the pace its fastest responses show (§5.8).
+6. **API value.** What the recorded usage would cost at OpenAI's published API list prices,
+   priced per response from a vendored table (§5.9). A counterfactual, worded as one: a
+   ChatGPT plan is not billed per token.
 
-Non-goals: cost/pricing translation (raw token counts only), live interception of in-flight
+Non-goals: a reconstructed bill (the API value prices *recorded* usage at *list* prices, and
+says what it could not price), fetching prices at run time, live interception of in-flight
 requests, modifying Codex behavior, and converting tokens into rate-limit consumption — the
 limit percentages are the server's own figures, recorded verbatim and never derived.
 
@@ -1095,6 +1100,97 @@ responses in eight model and effort groups, of which the fits are 0.05–0.1 s e
 `latency`: `responses`, `groups[]` (with `fit`), `hours[]`, `daily[]`, `turns`, `tools[]`
 and the constants used, in `method`.
 
+### 5.9 API value — recorded usage at list prices
+
+What the charged responses (§2.2) would cost if each were sent to the OpenAI API at its
+published list price. Not what anyone paid: a ChatGPT plan is not billed per token, and the
+page says "if billed at API list prices" under the figure.
+
+**Per response, never from totals** (`tokencounter.pricing.price`), because the rate depends
+on the response:
+
+- **Model** — the model of the turn that sent it (`turn_context`), looked up in the table;
+  a dated snapshot (`gpt-5-2025-08-07`) falls back to its alias. A model the table does not
+  list is **unpriced**, counted with its tokens, and named on stdout and in `--json`. Codex's
+  guardian reviewer (`codex-auto-review`) is one such model.
+- **Processing tier** — Codex writes an `event_msg`/`thread_settings_applied` snapshot into
+  the rollout (codex-rs `rollout/src/policy.rs` persists it) carrying the tier it will
+  request: `priority` for Fast mode, `flex`, or its `default` sentinel; the key is left out
+  when none is set, which is a recorded standard. `worker._service_tier` reads it, and every
+  usage record after it carries `tier`. **A thread's first turn never has one:** Codex
+  persists a snapshot only once the rollout file exists
+  (`send_event_raw_without_materializing_rollout`), and the file is created after the first
+  user message, so the turn-start snapshot is dropped. Codex's own test
+  `initial_plugin_ids_use_turn_context_without_extra_settings_checkpoints` asserts zero
+  snapshots after a first turn. The TUI re-sends its settings on every later turn, so the
+  second turn's snapshot carries the first turn's setting unless the user changed it in
+  between: `worker._backfill_tier` gives the records before a file's first snapshot that
+  snapshot's tier and marks them `tier_inferred`. A file with no snapshot at all (a one-turn
+  `codex exec` run, a one-turn sub-agent, an older Codex) keeps no tier, is priced at
+  standard and counted as `tier_unrecorded`, and `usd_high` prices those same responses at
+  Fast where the model has a Fast rate. Fast is the most a tier costs, and some models
+  default to it. Not logged at all: a per-turn tier override (`turn/start`'s
+  `serviceTierForTurn` applies to the turn's copy only) and the tier the server actually
+  *served*, which is in `response.completed`; Codex does not persist that. A tier with no
+  published rate for the model is unpriced.
+- **Prompt size** — above the long-context threshold (272K input tokens, read off the
+  pricing page) a model with long-context rates is charged them for the whole request. At
+  exactly the threshold it is short context ("Short context: ≤272K"). A tier with no
+  long-context rate on such a model (Fast on gpt-5.5) leaves a long request unpriced.
+- **Input split** — OpenAI's own formula (prompt-caching guide): ordinary input = input −
+  cached − cache writes, each at its own rate. Cache writes are a part of input, disjoint
+  from cached reads; GPT-5.6 and later bill them at 1.25× input. A model with no cached rate
+  bills cached tokens as ordinary input; one with no cache-write rate, writes. Reasoning is a
+  subset of output (§2.4) and is never added again.
+- **Web searches** — $10 per 1,000 calls on top of their tokens, which already ride in
+  input. The worker counts `web_search_call` items since each stream's last charged record
+  and puts the count on the next one, per stream: a both-stream file charges only the
+  explicit stream, and a search counted onto a legacy record written first would vanish
+  with it. A context snapshot (§2.4) never takes them, since the ledger never charges it.
+  Replayed records in a fork child drop with their searches. A replayed search that
+  followed the parent's last usage record (one made before an interruption) is still
+  pending when the replay ends, so in a file that declares a parent the pending counts are
+  cleared where its opening burst ends (§5.6), or the child's first response would take
+  it. Current Codex leaves searches out of forks anyway (codex-rs
+  `agent/control/spawn.rs`).
+
+**What is not in it**, and is said so: unpriced responses; **aborted turns** — a response cut
+off when its turn is aborted (interrupted, replaced by a new turn, a review ended, a budget
+limit) writes no usage record (Codex records usage only on `response.completed`), so
+`turn_aborted` events of every reason are counted (`analyze.turn_aborts`, a fork child's
+replayed copies left out as §5.6 does) and the count is printed beside the figure. A stream
+that drops is retried, and one that finally fails is logged as an error; neither is
+counted here;
+Batch rates, which Codex never uses; the 10% regional-processing uplift; and whatever the
+recorded total itself misses (§5.5).
+
+**The table never comes from the network at run time.** `assets/vendor/openai_prices.json`
+is written by `scripts/fetch_prices.py` from the pricing page's Markdown (the flagship
+tables per tier, the Cyber models' table as standard rates, the grouped table listing the
+Codex models, the web search fee and the threshold) and, for Codex models the page no
+longer lists (`gpt-5-codex`, `gpt-5.1-codex*`, `gpt-5.2-codex`, `codex-mini-latest`), each
+model's own page, which publishes standard rates only. Every figure is copied as printed; a
+"-" stays null. `--check` diffs the vendored file against the live pages. The page the
+table was built from is saved as `scripts/fixtures/openai_pricing.md` with it, and
+`test_pipeline.py` runs the parser on that copy offline, asserting the vendored table is
+what the parser makes of it. The loader requires a positive integer `unit_tokens` and
+finite rates: JSON parses `Infinity`, which would price a response at inf or nan. The table is validated whole on load (`pricing.load`): one
+malformed rate would price some responses and skip others, and a total built that way is
+wrong without looking wrong. `--prices PATH` (or `TOKEN_COUNTER_PRICES`) substitutes
+another table in the same format; an unreadable one costs the run its API value and nothing
+else.
+
+Prices are applied at analysis time, so the index (§3.2) holds no price: re-vendoring the
+table changes the next run's figure without a rebuild. The tier and search counts are
+extraction, in `worker.py`, which the extractor fingerprint already hashes.
+
+`--json` carries it under `api_value`: `usd` (tokens plus search fees), `usd_high` (the
+unrecorded tiers at Fast), `tokens_usd`, `web_search_usd` and `web_search_calls`, the table's
+`as_of` and source, `priced` and `unpriced` with reasons and the models behind them, `tiers`,
+`tier_inferred`, `tier_unrecorded`, `long_context`, `aborted_turns`, and `by_model`; each day and session carries
+`api_usd`, null when nothing on it was valued. The page shows it as a tile (§7), only when
+something was priced.
+
 ## 6. Plugin packaging
 
 Codex plugins are directories with `.codex-plugin/plugin.json` plus `skills/<name>/SKILL.md`,
@@ -1240,6 +1336,16 @@ and that no prompt, directory or session id is in it.
 Since 1.4.0 that page counts input with tiktoken when the report could (§5.7), so its input
 tile and daily chart read below the leaderboard's recorded input. The payload is unchanged.
 
+Since 1.8.0 the payload also carries the API value (§5.9), priced by the same
+`analyze.ApiValue` as the report: `api_usd` on each day and each session (null where nothing
+was valued — no priced response and no search fee — never a 0 that reads as free), and a top-level `api_value` with the total, the
+price table's date, priced and unpriced counts, tiers, the Fast upper bound and aborted
+turns. tokenusage.dev
+does not read these yet: its `SharePayloadSchema` (zod) strips keys it does not know rather
+than rejecting them, which was checked by parsing a `--out` payload with the server's own
+schema. They cost a share nothing until the server reads them, and the published page shows
+the tile either way.
+
 It is dry-run by default and sends only with `--yes`. A damaged record with cached > input
 or reasoning > output is clamped and counted rather than failing the share, because the
 server rejects that arithmetic outright. The first share returns a bearer token, stored per
@@ -1259,9 +1365,10 @@ The headline numbers and four charts. Everything else the model carries — sess
 reconciliation, images, the window table, the data-quality counters — is reported through
 `--json` and the stdout summary, not here (rev 12).
 
-1. Tiles — input (counted with tiktoken, §5.7), output, cache hit, sessions, the longest
-   session, the median response time (§5.8), and the weekly limit as the server's own
-   reported percentage
+1. Tiles — input (counted with tiktoken, §5.7), output, cache hit, the API value (§5.9;
+   only when something was priced, noting how many responses were not), sessions, the
+   longest session, the median response time (§5.8), and the weekly limit as the server's
+   own reported percentage
 2. **Cumulative tokens per weekly limit window** — tiktoken input plus Codex's output,
    restarting at zero at every reset, with the reported percentage overlaid (§5.6)
 3. **Daily input**, stacked by the model that was charged for it
@@ -1555,7 +1662,12 @@ Structural, not deferred work.
 - **Cache causation is unrecoverable** — no request-side telemetry exists (§5.2).
 - **Prompt reconstruction is an approximation** (§5.3), and 13.8% of reported input is
   unexplained residual.
-- **`cache_write_input_tokens` is always zero** and yields nothing (§2.3).
+- **`cache_write_input_tokens` is always zero** on the development corpus and yields
+  nothing there (§2.3). GPT-5.6 and later report cache writes, and the API value prices
+  them (§5.9).
+- **The API value is list price for recorded usage**, not a bill: unpriced models, an
+  unlogged served tier, an unrecorded tier (bounded by `usd_high`), responses cut off by an
+  aborted turn and the regional uplift are outside it, and each is counted or stated (§5.9).
 - **Tool schema coverage is partial** (§5.3).
 - **Model encoding is unpublished**, and the residual cannot settle it (§4.1).
 - **Image token formula is model-specific** and may be approximate (§5.4).
@@ -1591,6 +1703,24 @@ Structural, not deferred work.
 ---
 
 ## 10. Revision history
+
+**Rev 22** — the API value: recorded usage at OpenAI's API list prices (§5.9). Plugin 1.8.0.
+
+| Change | Cause |
+| --- | --- |
+| A headline tile and a stdout line: what the charged responses would cost at API list prices, worded as a counterfactual | Requested. Reverses the §1 non-goal "no cost translation"; the replacement non-goal is a reconstructed bill |
+| Priced per response, by model, requested tier, prompt size and OpenAI's input split | A total cannot say which responses crossed 272K or ran in Fast mode, and the rates differ by 2× and more |
+| The worker reads `thread_settings_applied`'s `service_tier`; a record with no snapshot before it is priced at standard and counted | Codex persists the requested tier there and nowhere else; `turn_context` carries none. Older rollouts have no snapshot, and saying so beats guessing Fast or standard silently |
+| Web searches are counted per stream and put on that stream's next charged record; a context snapshot never takes them | A both-stream file charges one stream, and a snapshot is never charged: either way the searches would have vanished. Two mutation cases |
+| `turn_aborted` events are counted, fork replays left out, and printed beside the figure | A response cut off by an interruption writes no usage record; its cost cannot be priced, only disclosed |
+| Prices vendored by `scripts/fetch_prices.py` from the pricing page and model pages; never fetched by the plugin | The report runs offline, and two runs over the same logs agree until the table is re-vendored on purpose |
+| A model, tier or long prompt the table has no rate for is unpriced and named, never folded in | A guessed rate makes a wrong total that looks right |
+| The share payload gains `api_usd` per day and session and a top-level `api_value` | Requested, ahead of the server reading them; its schema strips unknown keys, checked against the schema itself |
+| Review before merge, each finding reproduced first: a thread's first turn takes the tier of the file's first settings snapshot (`tier_inferred`), and `usd_high` bounds the files with none | **Major:** Codex never persists the first turn's snapshot (the rollout file does not exist yet), so every thread's first turn, and every one-turn `exec` run, priced at standard under a doc that blamed "older Codex". A Fast-mode session read $0.73 against $1.31 |
+| The loader requires a positive integer `unit_tokens` and finite rates; a table with no date reads "an unknown date" | A `--prices` table with `unit_tokens: 0` raised `ZeroDivisionError` and failed the run; `Infinity` priced at nan and wrote `$nan` and a bare `NaN` into the JSON |
+| A fork child's pending searches are cleared where its opening burst ends | A replayed search made before the parent's interruption was charged again to the child's first response: three fees for two searches |
+| `fetch_prices.py` reads the Cyber models' table; the page is kept as a fixture and the parser tested on it offline | `gpt-5.6-cyber` and `gpt-5.5-cyber` are published and were unpriced; the parser had no offline test |
+| `interrupted_turns` became `aborted_turns`, and a dropped stream is no longer said to be one | Every abort reason is counted (interrupted, replaced, review ended, budget limited), and a stream that fails is logged as an error, not an abort. Four mutation cases added |
 
 **Rev 21** — rate-limit events per day, as bars on the response-time chart (§5.6, §7).
 Plugin 1.7.0.
@@ -1894,8 +2024,8 @@ Built, installed and verified as `token-counter@jack-beanstalk-2022` on Codex CL
 | Check | Result |
 | --- | --- |
 | `scripts/test_ledger.py` | **13/13** response-identity regressions, including both round-3 counterexamples, the round-4 compaction case, cross-file `response_id` replay and the round-6 sibling counterexample |
-| `scripts/test_mutations.py` | **33/33** historical defects reverted, each caught by the test named for it |
-| `scripts/test_pipeline.py` | **253/253** across tokenizer (the vocabulary parsed from its own file, on Python 3.8 too), installing `tiktoken` on first use, input counted with tiktoken, classification, images, attribution, prompt reconstruction, windowed ledger scope, cache-key derivation, the index end to end (archiving, `--rebuild` against a held file), damage counting, rate-limit windows, cumulative-curve monotonicity, day spans across clock changes, account identity, failure modes, output escaping, the renderer and its three styles (Nocturne's validated palette pinned), the shared time axis the three charts are drawn on, response, turn and tool time with the pace estimate (§5.8), and rate-limit events per day with a fork child's replayed copies left out (§5.6) |
+| `scripts/test_mutations.py` | **43/43** historical defects reverted, each caught by the test named for it |
+| `scripts/test_pipeline.py` | **317/317** across tokenizer (the vocabulary parsed from its own file, on Python 3.8 too), installing `tiktoken` on first use, input counted with tiktoken, classification, images, attribution, prompt reconstruction, windowed ledger scope, cache-key derivation, the index end to end (archiving, `--rebuild` against a held file), damage counting, rate-limit windows, cumulative-curve monotonicity, day spans across clock changes, account identity, failure modes, output escaping, the renderer and its three styles (Nocturne's validated palette pinned), the shared time axis the three charts are drawn on, response, turn and tool time with the pace estimate (§5.8), rate-limit events per day with a fork child's replayed copies left out (§5.6), and the API value: the price table loaded offline and refused whole when malformed, the per-response arithmetic, tier and search extraction on both passes, the first turn's inferred tier, a fork child's replayed searches, aborted turns, the price-page parser on a saved copy, the tile and `--prices` (§5.9) |
 | `node scripts/test_page.js` | **62/62** on the page's own embedded script: shared ticks across all three time charts, the rate-limit event bars on their own axis, shared viewport, x-only zoom, drag distance, clamping, the pie recomposing with the range, and the Nocturne scene's solids and stage built from the same marks |
 | `scripts/fetch_vocab.py --verify` | sha256 `446a9538...`, 200,019 ranks, token-identical to stock `o200k_base` |
 | Offline tokenizer | builds and encodes with `socket.socket` hard-blocked in a fresh process |
@@ -1905,5 +2035,6 @@ Built, installed and verified as `token-counter@jack-beanstalk-2022` on Codex CL
 | `scripts/verify_install.py` | **17 files identical** — the installed plugin is this code, not an earlier copy of it. It compares the copy cached under the marketplace the manifest names: an earlier version scanned every marketplace and took the last alphabetically, so the cache orphaned by the `@local-dev` rename became the copy verified |
 | Installed run | executes from `~/.codex/plugins/cache/jack-beanstalk-2022/token-counter/1.0.0/` |
 
-Not built, and deliberately: incremental byte-offset tailing (§3.2), and any conversion of
-tokens into money or rate-limit consumption (§1, non-goals).
+Not built, and deliberately: incremental byte-offset tailing (§3.2), a reconstructed bill
+(the API value is list price for recorded usage, §5.9), fetching prices at run time, and any
+conversion of tokens into rate-limit consumption (§1, non-goals).

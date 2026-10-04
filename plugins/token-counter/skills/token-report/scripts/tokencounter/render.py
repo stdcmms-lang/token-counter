@@ -20,6 +20,7 @@ a chart's value axis never changes, so heights stay comparable at every zoom lev
 Every figure derived from inference rather than measurement carries a visible marker
 (ARCHITECTURE.md section 7).
 """
+import datetime
 import html
 import json
 import math
@@ -3327,6 +3328,52 @@ def pct(x, digits=1):
     return '&mdash;' if x is None else f'{100*x:.{digits}f}%'
 
 
+def usd(x):
+    """Dollars for a headline: cents under a thousand, whole dollars to six figures, then
+    K and M so the figure fits a tile in every style."""
+    if x is None or x != x:
+        return '&mdash;'
+    a = abs(x)
+    if a >= 1e6:
+        return f'${x/1e6:,.2f}M'
+    if a >= 1e5:
+        return f'${x/1e3:,.1f}K'
+    if a >= 1e3:
+        return f'${x:,.0f}'
+    return f'${x:,.2f}'
+
+
+def _as_of(day):
+    """``2026-10-04`` -> ``Oct 4, 2026``; anything else as it came, escaped."""
+    if day is None or day == '':
+        return 'an unknown date'
+    try:
+        d = datetime.date.fromisoformat(str(day))
+    except ValueError:
+        return esc(str(day))
+    return f'{d.strftime("%b")} {d.day}, {d.year}'
+
+
+def api_tile(av):
+    """The API value headline: what the recorded usage would cost at API list prices.
+
+    Worded as a counterfactual on the page itself ("if billed at API list prices"), since a
+    plan is not billed per token, and it says what it leaves out: responses it could not
+    price.  None when nothing was priced; `--json` and stdout say why.
+    """
+    if not (av or {}).get('available'):
+        return None
+    note = f"if billed at API list prices of {_as_of((av.get('prices') or {}).get('as_of'))}"
+    if av.get('unpriced'):
+        note += f" &middot; {av['unpriced']:,} response{'' if av['unpriced'] == 1 else 's'} unpriced"
+    # The tier is unknown for a file with no settings snapshot; say what Fast would make it,
+    # when that moves the figure by more than rounding.
+    hi = av.get('usd_high')
+    if hi is not None and hi - av['usd'] >= max(0.01, 0.005 * av['usd']):
+        note += f" &middot; up to {usd(hi)} if untiered responses ran in Fast mode"
+    return tile('API value', usd(av['usd']), note)
+
+
 def tile(k, v, note=''):
     n = f'<div class="n">{note}</div>' if note else ''
     return f'<div class="tile"><div class="k">{k}</div><div class="v">{v}</div>{n}</div>'
@@ -3689,6 +3736,7 @@ def render(model, public=False, style=None):
         tile('Cache hit', pct(t['cache_hit']),
              f"{big(t['cached'])} of {big(t['input'])} recorded by Codex" if tk
              else f"{big(t['cached'])} cached"),
+    ] + [x for x in (api_tile(model.get('api_value')),) if x] + [
         tile('Sessions', f"{t['sessions']:,}", f"{t['threads']:,} threads"),
     ] + top_tile + lat_tile + ([tile('Weekly limit used',
                '&mdash;' if wk_pct is None else f'{wk_pct:g}%', wk_note)]

@@ -29,8 +29,8 @@ Run from this skill's directory, with `python3` on macOS and Linux or `python` o
    python3 scripts/share.py
    ```
 
-2. Show the user the summary it printed: the handle, the date range, the totals, and the
-   per-month lines. Tell them the leaderboard is **public**, and that the report page the dry
+2. Show the user the summary it printed: the handle, the date range, the totals, the API
+   value line, and the per-month lines. Tell them the leaderboard is **public**, and that the report page the dry
    run wrote (the `report page` line gives its path) is published as is: anyone with the link
    sees it. They can open that file to check it first.
 3. On a first share, ask which **handle** they want shown (3-24 characters: lowercase
@@ -62,7 +62,11 @@ each weekly rate-limit window, its start, the plan type and the percentages used
 logged in its rate-limit snapshots, and the tokens counted in it. tokenusage.dev uses the
 windows to estimate how many tokens each plan's weekly limit holds. Also, over the last 30 days of responses: how many were timed, and their median and p90
 response time and turn time in seconds, in total and for each model and reasoning effort
-(no per-request times, no tool names, and no hour-of-day or weekday breakdown).
+(no per-request times, no tool names, and no hour-of-day or weekday breakdown). And the API
+value token-report computes: what the usage would cost at OpenAI's API list prices, per day
+(`api_usd`), per summarised session, and in total with the price table's date and how many
+responses could be priced (`api_value`). tokenusage.dev does not show it yet; its server
+drops fields it does not know, so sending it changes nothing there until it does.
 
 Also sent, unless `--no-report`: the report page, rendered by token-report with `--public`.
 It carries the charts' data (daily input by model, the cumulative token curve and
@@ -104,6 +108,9 @@ from this machine; `--forget` then lets the user start over under a new handle.
 
 - **Tokens** on the leaderboard are recorded input plus output. Cached input is part of
   recorded input, not added to it. These are counts Codex wrote to its logs, not a bill.
+- **API value** is those recorded responses priced at OpenAI's API list prices, the same
+  figure as the report's tile. It is what the usage would cost on the API, not what the
+  user paid; a day with nothing priced (and no web search fee) is sent as null.
 - **Days** are the user's local calendar days, as in token-report; a session belongs to the
   day and month its first response landed in.
 - **Active time** is the time between consecutive responses in a session, leaving out any

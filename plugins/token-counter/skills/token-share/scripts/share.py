@@ -12,8 +12,9 @@ The token-report skill sends nothing anywhere; its one network call installs tik
 PyPI when it is missing. This script is the one thing that sends, and it sends only when
 run with --yes. What it sends is daily token counts, a handful of
 per-session summaries -- counts, times and a model name -- and, per weekly rate-limit window,
-the plan and percentage the server reported beside the tokens counted in it, and over the last
-month the median and p90 response and turn time. Beside the
+the plan and percentage the server reported beside the tokens counted in it, over the last
+month the median and p90 response and turn time, and what the usage would cost at OpenAI's API
+list prices, per day and per session. Beside the
 numbers it publishes the token-report page itself, rendered for the public, so the link it
 prints opens the same page the user has locally. Never prompts, file contents, paths, session
 titles, or anything from auth.json. See the SKILL.md next to this file.
@@ -37,9 +38,9 @@ REPORT = os.path.normpath(os.path.join(HERE, '..', '..', 'token-report', 'script
 sys.path.insert(0, REPORT)
 
 import report as reportcli  # noqa: E402  -- enforces the Python floor on import
-from tokencounter import analyze, latency, ledger, render, rollout, worker  # noqa: E402
+from tokencounter import analyze, latency, ledger, pricing, render, rollout, worker  # noqa: E402
 
-CLIENT = {'name': 'token-counter', 'version': '1.7.0'}
+CLIENT = {'name': 'token-counter', 'version': '1.8.0'}
 SCHEMA = 1
 DEFAULT_API = 'https://tokenusage.dev/api'
 
@@ -171,6 +172,31 @@ def latency_summary(results, charged, now_s):
     }
 
 
+def api_value_summary(api, results):
+    """The payload's `api_value`: the total the days add up to, and what it covers. None
+    when there is no price table, so a share without one sends nothing under the name."""
+    if not api.on:
+        return None
+    m = api.model(results)
+    return {
+        'usd': _usd(m['usd']),
+        'usd_high': _usd(m['usd_high']),
+        'tokens_usd': _usd(m['tokens_usd']),
+        'web_search_usd': _usd(m['web_search_usd']),
+        'web_search_calls': m['web_search_calls'],
+        'prices_as_of': m['prices']['as_of'],
+        'prices_source': m['prices']['source'],
+        'prices_default': m['prices']['default'],
+        'responses': m['responses'],
+        'priced': m['priced'],
+        'unpriced': m['unpriced'],
+        'tier_unrecorded': m['tier_unrecorded'],
+        'tier_inferred': m['tier_inferred'],
+        'tiers': m['tiers'],
+        'aborted_turns': m['aborted_turns'],
+    }
+
+
 def active_seconds(epochs):
     """Time between consecutive responses, skipping gaps longer than IDLE_CAP_S."""
     total = 0.0
@@ -181,23 +207,38 @@ def active_seconds(epochs):
     return int(round(total))
 
 
-def build_payload(results, charged, handle=None, now=None):
+def _usd(x):
+    return None if x is None else round(x, 4)
+
+
+def build_payload(results, charged, handle=None, now=None, prices=None):
     """The share payload from extracted files and their charged ledger rows.
 
     Returns ``(payload, notes)``. Everything is counted from the canonical ledger, exactly as
     the report counts it, so the leaderboard and the local report agree on every day.
     Days are the sharer's **local** calendar days, as in the report.
+
+    The API value -- `api_usd` on each day and session, and `api_value` beside them -- is
+    priced exactly as the report prices it (`analyze.ApiValue`), from the vendored table
+    unless `prices` (what `pricing.load` returns) says otherwise. tokenusage.dev does not
+    read these fields yet; its schema strips keys it does not know, so they cost a share
+    nothing until it does. A day or session with nothing valued -- no priced response and
+    no search fee -- sends null, not a 0 that reads as free.
     """
     notes = collections.Counter()
     days = collections.defaultdict(collections.Counter)
     sessions = {}
     timeline = []
+    api = analyze.ApiValue(pricing.load() if prices is None else prices)
+    day_usd = collections.defaultdict(float)
+    day_valued = collections.Counter()
 
     for path, fr in sorted(results.items()):
         rows = charged.get(path) or []
         sid = fr.get('session_id') or path
         s = sessions.setdefault(sid, {'rows': [], 'counts': collections.Counter(),
-                                      'models': collections.Counter()})
+                                      'models': collections.Counter(), 'usd': 0.0,
+                                      'valued': 0})
         for r in rows:
             u = r.get('usage') or {}
             inp = int(u.get('input_tokens') or 0)
@@ -219,6 +260,14 @@ def build_payload(results, charged, handle=None, now=None):
                 continue
             e = worker.epoch(ts)
             timeline.append((e, inp, cch, out))
+            before = api.priced
+            usd = api.add(r)
+            # Valued: priced, or carrying a search fee. A day with neither sends null.
+            if usd is not None and (usd or api.priced > before):
+                day_usd[d] += usd
+                s['usd'] += usd
+                day_valued[d] += 1
+                s['valued'] += 1
             dd = days[d]
             dd['responses'] += 1
             dd['input'] += inp
@@ -261,6 +310,7 @@ def build_payload(results, charged, handle=None, now=None):
             'output': c['output'],
             'reasoning': c['reasoning'],
             'model': None if model == 'unknown' else model[:80],
+            'api_usd': _usd(s['usd']) if api.on and s['valued'] else None,
         })
 
     by_month = collections.defaultdict(list)
@@ -280,7 +330,8 @@ def build_payload(results, charged, handle=None, now=None):
         'client': dict(CLIENT),
         'generated_at': _iso(now_s),
         'days': [dict(date=d, responses=v['responses'], input=v['input'], cached=v['cached'],
-                      output=v['output'], reasoning=v['reasoning'], sessions=v['sessions'])
+                      output=v['output'], reasoning=v['reasoning'], sessions=v['sessions'],
+                      api_usd=_usd(day_usd[d]) if api.on and day_valued[d] else None)
                  for d, v in sorted(days.items()) if v['responses']],
         'sessions': sorted(keep.values(), key=lambda x: (x['start'], x['id'])),
         'windows': limit_windows(results, timeline, now_s),
@@ -288,6 +339,9 @@ def build_payload(results, charged, handle=None, now=None):
     lat = latency_summary(results, charged, now_s)
     if lat:
         payload['latency'] = lat
+    av = api_value_summary(api, results)
+    if av:
+        payload['api_value'] = av
     if handle:
         payload['handle'] = handle
     return payload, notes
@@ -441,6 +495,14 @@ def _describe_latency(lat):
             f"{r['median_s']:g}s, p90 {r['p90_s']:g}s; {len(lat['groups'])} model/effort groups")
 
 
+def _describe_api_value(av):
+    if not av:
+        return 'api value    not computed (no price table)'
+    return (f"api value    ${av['usd']:,.2f} at OpenAI API list prices of {av['prices_as_of']} "
+            f"({av['priced']:,} of {av['responses']:,} responses priced); "
+            f"tokenusage.dev does not show it yet")
+
+
 def describe(payload, notes, handle, api):
     """What will be sent, in words: printed before anything leaves the machine."""
     days = payload['days']
@@ -461,6 +523,7 @@ def describe(payload, notes, handle, api):
         f" (per month, the top {SESSIONS_PER_MONTH} by active time and by tokens)",
         _describe_windows(payload.get('windows') or []),
         _describe_latency(payload.get('latency')),
+        _describe_api_value(payload.get('api_value')),
         '',
         'month        tokens      sessions  longest session',
     ]
@@ -477,7 +540,8 @@ def describe(payload, notes, handle, api):
         'sent: per-day token counts; per-session start/end times, active time, token counts',
         'and model name, under a one-way hash of the session id; and per weekly limit window,',
         'its start, the plan and percentage used that Codex logged, and the tokens counted in it;',
-        'and, over the last month, the median and p90 response and turn time, in total and per model.',
+        'and, over the last month, the median and p90 response and turn time, in total and per model;',
+        'and the API list-price value of the usage, per day, per session and in total.',
         'never sent: prompts, outputs, file contents or paths, session titles, your',
         'account or email.',
     ]

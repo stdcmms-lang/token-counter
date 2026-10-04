@@ -1,6 +1,6 @@
 ---
 name: token-report
-description: Build a local HTML report of Codex token usage from rollout logs. Use when asked about token usage, the context window, cached vs uncached input, prompt caching, which sessions or tool outputs burn the most tokens, how long responses, turns or tools take (latency, response time, waiting or queueing), when the weekly rate limit last reset or how much of it is used, how often the rate limit was hit, which account the usage belongs to, or for a token/usage report or dashboard.
+description: Build a local HTML report of Codex token usage from rollout logs. Use when asked about token usage, the context window, cached vs uncached input, prompt caching, which sessions or tool outputs burn the most tokens, how long responses, turns or tools take (latency, response time, waiting or queueing), what the usage would cost or is worth at API prices (dollar value, API-equivalent cost), when the weekly rate limit last reset or how much of it is used, how often the rate limit was hit, which account the usage belongs to, or for a token/usage report or dashboard.
 ---
 
 # Token Report
@@ -8,9 +8,10 @@ description: Build a local HTML report of Codex token usage from rollout logs. U
 Re-tokenizes `~/.codex/sessions/**/rollout-*.jsonl` locally and renders a self-contained HTML
 dashboard. Every figure comes from rollout logs; `~/.codex/auth.json` is read only to name
 the account (id_token identity claims — never the access or refresh tokens, and
-`--no-account` skips it). Nothing is intercepted, nothing of the user's is sent anywhere, and
-no pricing translation is applied. The one network call is installing `tiktoken` from PyPI,
-once, when it is missing (see below). Publishing numbers to the tokenusage.dev leaderboard is
+`--no-account` skips it). Nothing is intercepted and nothing of the user's is sent anywhere.
+The API value is priced from a table of OpenAI's list prices that ships with the plugin; it
+is never fetched. The one network call is installing `tiktoken` from PyPI, once, when it is
+missing (see below). Publishing numbers to the tokenusage.dev leaderboard is
 a different skill, token-share, used only when the user asks to share.
 
 Run from this skill's directory. Use whichever interpreter name exists on the machine:
@@ -52,6 +53,7 @@ python3 scripts/report.py --rebuild                   # discard the index and re
 python3 scripts/report.py --no-account                # do not read auth.json
 python3 scripts/report.py --no-install                # never install tiktoken from PyPI
 python3 scripts/report.py --sessions-root PATH       # a corpus somewhere else
+python3 scripts/report.py --prices table.json        # price the API value with another table
 python3 scripts/report.py --doctor                   # what this machine provides, then exit
 ```
 
@@ -61,7 +63,8 @@ the index, marking every failed check with `!`, and exits non-zero if any check 
 
 Use `--no-open` when the user only wants numbers, and read the summary the script prints on
 stdout: one line of totals (responses, input counted with tiktoken, then Codex's recorded
-input, uncached, cache hit and output; without the tokenizer, recorded input only), a line
+input, uncached, cache hit and output; without the tokenizer, recorded input only), the API
+value with the lines under it saying what it priced and what it could not, a line
 of response time (median, p90, and the estimated share above the fastest pace), a line
 of rate-limit events (snapshots in which Codex logged a limit as reached, and how many days
 they fell on) when there were any, and, when an account and a limit window are available, a
@@ -112,9 +115,27 @@ over-read:
   time: retries, slow generation and ordinary variation land there too. Tool time includes
   any wait for the user's approval.
 
-Do not convert token counts into money, and do not invent a tokens-per-percent rate — the
-corpus shows 95% of a weekly window costing 2.81B recorded input one week and 790M another.
-Quoting the reported percentage and the reset times is fine; those are recorded facts.
+- **The API value is a counterfactual, not a bill.** It is what the recorded usage would
+  cost at OpenAI's API list prices as of the table's date, priced per response by model,
+  the processing tier Codex requested (Fast mode costs 2× or more), prompt size and the
+  cached/uncached split. Say "would cost at API list prices", never "you spent" or "you were
+  billed": a ChatGPT plan is not billed per token. Always pass on the lines under it:
+  responses it could not price (the model or tier has no published rate) and aborted turns
+  (a response cut off by an interruption writes no usage record) are not in the figure.
+  Codex never records the tier for a thread's first turn, so that turn takes the tier
+  recorded next (an inference, counted). A thread with no tier recorded at all, such as a
+  one-turn `codex exec` run, is priced at standard, and the line gives what it would cost in
+  Fast mode. If the user uses Fast mode, quote that higher figure as the upper bound.
+
+Quote the API value the report computed; do not price tokens yourself, with other rates, or
+from the totals, which cannot tell which responses ran in Fast mode or over 272K tokens. If
+the user wants other prices, `--prices table.json` takes a table in the vendored format. To
+refresh the vendored prices, `python3 scripts/fetch_prices.py` from the repository root is a
+packaging step, like the vocabulary; the report never downloads them.
+
+Do not invent a tokens-per-percent rate — the corpus shows 95% of a weekly window costing
+2.81B recorded input one week and 790M another. Quoting the reported percentage and the
+reset times is fine; those are recorded facts.
 
 ## If it fails
 
@@ -126,6 +147,9 @@ Quoting the reported percentage and the reset times is fine; those are recorded 
   *First run*). A missing or corrupt vocabulary is fixed with `python3 scripts/fetch_vocab.py`
   once from the repository root; that is a packaging step, and the report never downloads
   the vocabulary.
+- `API value not available` — either no response's model is in the price table (the line
+  names the models), or the table could not be read (a broken `--prices` file, or a damaged
+  install: `--doctor` shows the table it found). Every other figure is unaffected.
 - `No rollout files found` — Codex has not written any sessions yet, or `CODEX_HOME` points
   elsewhere. The message prints the directory it searched. Pass `--sessions-root` to override.
 - `index unusable` / `process pool unavailable` — both are optimisations and both degrade on
@@ -137,8 +161,9 @@ Quoting the reported percentage and the reset times is fine; those are recorded 
 
 ## What the report contains
 
-Five headline numbers — input (counted with tiktoken), output, cache hit, sessions, and the
-weekly limit as the server's own reported percentage — plus the longest session, and three
+Headline numbers — input (counted with tiktoken), output, cache hit, the API value (when
+anything could be priced), sessions, and the weekly limit as the server's own reported
+percentage — plus the longest session, and three
 charts: a cumulative token curve per weekly limit window with the reported percentage
 overlaid; daily input stacked by the model that was charged for it; response time by day,
 as two lines, the median and the p90, with the rate-limit events Codex logged each day as

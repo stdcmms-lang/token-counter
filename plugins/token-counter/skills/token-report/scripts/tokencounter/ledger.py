@@ -102,6 +102,12 @@ def _charged_record(rec, stream):
         'ts': rec.get('ts'),
         'model': rec.get('model'),
         'effort': rec.get('effort'),
+        # The processing tier requested (None: none recorded in the file; `tier_inferred`:
+        # taken from the file's first snapshot, for its first turn) and the web searches made
+        # producing it, all for pricing (tokencounter.pricing).
+        'tier': rec.get('tier'),
+        'tier_inferred': bool(rec.get('tier_inferred')),
+        'web_search': rec.get('web_search') or 0,
         'response_id': rec.get('response_id'),
         'stream': stream,
         'index': rec.get('i'),

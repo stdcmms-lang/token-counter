@@ -24,7 +24,7 @@ sys.path.insert(0, LIB)
 
 import test_pipeline as tp                                       # noqa: E402
 import report as rp                                              # noqa: E402
-from tokencounter import analyze, classify, latency, ledger, render, rollout, worker  # noqa: E402
+from tokencounter import analyze, classify, latency, ledger, pricing, render, rollout, worker  # noqa: E402
 
 
 def ledger_case(name_fragment):
@@ -505,6 +505,139 @@ def _burst_too_long():
     worker.OPENING_BURST_GAP_S = 10
     return lambda: setattr(worker, 'OPENING_BURST_GAP_S', orig)
 
+
+def _pricing_with(*edits):
+    """`tokencounter.pricing` re-executed from source with ``(old, new)`` edits applied, as
+    `_worker_with` does for the worker: the price arithmetic is inline in `price`."""
+    import types
+    path = pricing.__file__
+    with open(path, encoding='utf-8') as fh:
+        src = fh.read()
+    for old, new in edits:
+        assert src.count(old) == 1, f'edit anchor not unique: {old!r}'
+        src = src.replace(old, new)
+    mod = types.ModuleType('tokencounter.pricing')
+    mod.__file__, mod.__package__ = path, 'tokencounter'
+    exec(compile(src, path, 'exec'), mod.__dict__)
+    return mod
+
+
+@case('cache writes are billed on top of ordinary input',
+      lambda: tp.test_pricing_math())
+def _writes_double_billed():
+    # OpenAI's formula takes writes out of input: ordinary = input - cached - writes.  Left
+    # in, every written token is billed twice, once as input and once at the write rate.
+    orig = tp.pricing
+    tp.pricing = _pricing_with(("usd = ((inp - cached - writes) * r_in",
+                                "usd = ((inp - cached) * r_in"))
+    return lambda: setattr(tp, 'pricing', orig)
+
+
+@case('a prompt of exactly the threshold is priced as long context',
+      lambda: tp.test_pricing_math())
+def _threshold_inclusive():
+    # The page: "Short context: <=272K input tokens. Long context: >272K."
+    orig = tp.pricing
+    tp.pricing = _pricing_with(("if inp > table['long_context_threshold'] and",
+                                "if inp >= table['long_context_threshold'] and"))
+    return lambda: setattr(tp, 'pricing', orig)
+
+
+@case('a search lands on whichever stream writes first',
+      lambda: tp.test_tier_and_searches_extracted())
+def _searches_shared():
+    # A both-stream file charges the explicit stream; one pending count consumed by the
+    # legacy record written before it drops the search from the charged row.
+    orig = tp.worker
+    tp.worker = _worker_with((
+        "                rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0\n",
+        "                rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0\n"
+        "                ws_pending['explicit'] = 0\n"))
+    return lambda: setattr(tp, 'worker', orig)
+
+
+@case('a context snapshot takes the searches before it',
+      lambda: tp.test_tier_and_searches_extracted())
+def _snapshot_takes_searches():
+    # The ledger never charges a zero/zero snapshot, so searches attached to one vanish.
+    orig = tp.worker
+    tp.worker = _worker_with((
+        "            if _is_model_call(None, u, None, 'explicit'):\n",
+        "            if True:\n"))
+    return lambda: setattr(tp, 'worker', orig)
+
+
+@case('a settings snapshot with no tier reads as no snapshot',
+      lambda: tp.test_tier_and_searches_extracted())
+def _absent_tier_unrecorded():
+    # Codex leaves `service_tier` out when none is set: that is a recorded standard, and
+    # reading it as unrecorded counts every such response as a guess.
+    orig = worker._service_tier
+
+    def absent_is_none(payload):
+        ts = payload.get('thread_settings')
+        v = ts.get('service_tier') if isinstance(ts, dict) else None
+        return v if isinstance(v, str) and v else None
+    worker._service_tier = absent_is_none
+    return lambda: setattr(worker, '_service_tier', orig)
+
+
+@case("a fork child's replayed interruptions are counted as its own",
+      lambda: tp.test_interrupted_turns_counted())
+def _replayed_aborts():
+    orig = worker.OPENING_BURST_GAP_S
+    worker.OPENING_BURST_GAP_S = -1
+    return lambda: setattr(worker, 'OPENING_BURST_GAP_S', orig)
+
+
+
+@case("a thread's first turn keeps no tier, though its file records one",
+      lambda: tp.test_tier_and_searches_extracted())
+def _no_backfill():
+    # Codex never persists the first turn's settings snapshot: without the back-fill every
+    # thread's first turn is priced at standard, Fast mode or not.
+    orig = tp.worker
+    tp.worker = _worker_with(("    _backfill_tier(res, first_tier)\n", ""))
+    return lambda: setattr(tp, 'worker', orig)
+
+
+@case("a fork child's replayed, unanswered search is charged to its first response",
+      lambda: tp.test_replayed_search_not_charged_twice())
+def _replayed_search_pending():
+    orig = tp.worker
+    tp.worker = _worker_with((
+        "                    if res['parent_thread_id']:\n"
+        "                        ws_pending['explicit'] = ws_pending['legacy'] = 0\n", ""))
+    return lambda: setattr(tp, 'worker', orig)
+
+
+@case('an infinite or NaN rate passes validation',
+      lambda: tp.test_price_table())
+def _infinite_rate():
+    # JSON parses Infinity and NaN; a table carrying one prices a response at inf or nan,
+    # which reaches the page as "$nan" and the JSON as an invalid bare NaN.
+    orig = pricing._rate_ok
+    pricing._rate_ok = lambda v, required: (not required if v is None else
+                                            isinstance(v, (int, float))
+                                            and not isinstance(v, bool) and not v < 0)
+    return lambda: setattr(pricing, '_rate_ok', orig)
+
+
+@case('the Cyber models table is skipped',
+      lambda: tp.test_fetch_prices_parser())
+def _cyber_skipped():
+    import types
+    import fetch_prices
+    path = fetch_prices.__file__
+    with open(path, encoding='utf-8') as fh:
+        src = fh.read()
+    old = "                    cyber[got[0]] = {'standard': got[1]}\n"
+    assert src.count(old) == 1
+    mod = types.ModuleType('fetch_prices')
+    mod.__file__ = path
+    exec(compile(src.replace(old, "                    pass\n"), path, 'exec'), mod.__dict__)
+    sys.modules['fetch_prices'] = mod
+    return lambda: sys.modules.__setitem__('fetch_prices', fetch_prices)
 
 def main():
     print(f'{len(CASES)} mutations\n')

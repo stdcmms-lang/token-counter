@@ -6,8 +6,10 @@
     report.py --session <id-or-prefix> # single-session deep dive
     report.py --fast                   # every core instead of half
     report.py --json out.json          # machine-readable model, no HTML
+    report.py --prices table.json      # price the usage with another table
 
 Reads ~/.codex/sessions/**/rollout-*.jsonl, and ~/.codex/auth.json for the account name.
+The API value is priced from a vendored table of OpenAI's list prices, never fetched.
 No daemon, no interception, and no network -- except, once, to install tiktoken from PyPI
 when it is missing (--no-install turns that off).  See ARCHITECTURE.md.
 """
@@ -33,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tokencounter import account as accountlib  # noqa: E402
-from tokencounter import analyze, deps, index, ledger, render, rollout, worker  # noqa: E402
+from tokencounter import analyze, deps, index, ledger, pricing, render, rollout, worker  # noqa: E402
 
 # Fixed input for the tokenizer fingerprint in `_extractor_version`.  Exercises the parts of
 # the split pattern most likely to differ between implementations: contractions, CJK, an
@@ -310,6 +312,9 @@ def main(argv=None):
                     help='do not install tiktoken from PyPI when it is missing; the content '
                          'composition is then empty (also TOKEN_COUNTER_NO_INSTALL=1)')
     ap.add_argument('--vocab', metavar='PATH', help='override the vendored BPE path')
+    ap.add_argument('--prices', metavar='PATH',
+                    help='price table for the API value, in the vendored file\'s format '
+                         '(default: the vendored OpenAI list prices; also TOKEN_COUNTER_PRICES)')
     ap.add_argument('--sessions-root', metavar='PATH', help='override ~/.codex/sessions')
     ap.add_argument('--quiet', action='store_true')
     ap.add_argument('--doctor', action='store_true',
@@ -441,8 +446,12 @@ def main(argv=None):
         # Identity is read once, after extraction, and never enters the index: it is not a
         # property of any rollout file and must not be cached against one.
         acct = accountlib.read(a.sessions_root, enabled=not a.no_account)
+        # Read from disk, never fetched: the vendored table, or the one --prices names.
+        prices = pricing.load(a.prices)
+        if prices[0] is None and not a.quiet:
+            print(f'API value not computed: {prices[1]}', file=sys.stderr)
         model = analyze.analyze(results, charged, counters, scope=scope, focus=focus,
-                                extra_quality=extra, account=acct)
+                                extra_quality=extra, account=acct, prices=prices)
         if not a.quiet:
             print(f'  ledger + analysis in {time.time()-t0:.1f}s', file=sys.stderr)
 
@@ -488,6 +497,8 @@ def main(argv=None):
                   f"{t['uncached']/1e6:.0f}M uncached | "
                   f"{hit} cached | "
                   f"{t['output']/1e6:.0f}M output")
+        for line in api_summary(model.get('api_value')):
+            print(line)
         lt = model.get('latency') or {}
         if lt.get('available'):
             r = lt['responses']
@@ -526,6 +537,52 @@ def main(argv=None):
     finally:
         if cache is not None:
             cache.close()
+
+
+_UNPRICED_WHY = {'model': 'model not in the price table',
+                 'tier': 'no published rate for its tier',
+                 'long_context': 'no long-context rate for its tier'}
+
+
+def api_summary(av):
+    """The API value as stdout lines: the figure, then what it covers and leaves out."""
+    av = av or {}
+    if not av.get('available'):
+        return [f"API value not available -- {av.get('reason') or 'no price table'}"]
+    p = av.get('prices') or {}
+    lines = [f"API value ${av['usd']:,.2f} if billed at OpenAI API list prices of "
+             f"{p.get('as_of') or '?'}{'' if p.get('default', True) else ' (from --prices)'}"
+             f" -- recorded usage priced, not a bill"]
+    parts = [f"{av['priced']:,} of {av['responses']:,} responses priced"]
+    tiers = av.get('tiers') or {}
+    for k, label in (('fast', 'Fast'), ('flex', 'Flex'), ('ultrafast', 'Ultrafast')):
+        if tiers.get(k):
+            parts.append(f"{tiers[k]:,} at {label} rates")
+    if av.get('tier_inferred'):
+        n = av['tier_inferred']
+        parts.append(f"{n:,} first-turn response{'' if n == 1 else 's'} given the tier of the "
+                     f"thread's first settings snapshot")
+    if av.get('tier_unrecorded'):
+        hi = av.get('usd_high')
+        parts.append(f"{av['tier_unrecorded']:,} with no recorded tier, priced at standard"
+                     + (f" (${hi:,.2f} in total if they ran in Fast mode)"
+                        if hi is not None and hi > av['usd'] + 0.005 else ''))
+    if av.get('long_context'):
+        parts.append(f"{av['long_context']:,} at long-context rates")
+    if av.get('web_search_calls'):
+        n = av['web_search_calls']
+        parts.append(f"{n:,} web search{'' if n == 1 else 'es'} ${av['web_search_usd']:,.2f}")
+    lines.append('  ' + ' | '.join(parts))
+    for why, n in sorted((av.get('unpriced_by_reason') or {}).items(), key=lambda kv: -kv[1]):
+        models = [m for m in (av.get('unpriced_models') or []) if m['reason'] == why]
+        names = ', '.join(f"{m['model']} {m['responses']:,}" for m in models[:4])
+        lines.append(f"  unpriced: {n:,} response{'' if n == 1 else 's'}, "
+                     f"{_UNPRICED_WHY.get(why, why)}" + (f" ({names})" if names else ''))
+    if av.get('aborted_turns'):
+        n = av['aborted_turns']
+        lines.append(f"  {n:,} aborted turn{'' if n == 1 else 's'} (interrupted or replaced): a "
+                     f"response cut off by one writes no usage record, so it is not in the figure")
+    return lines
 
 
 def tokenizer_status(a):
@@ -654,6 +711,15 @@ def doctor(a):
                           f'{len(TOKENIZER_PROBE)}-char probe')
     except Exception as exc:                        # noqa: BLE001 - reporting, not handling
         line('vocabulary', f'{exc.__class__.__name__}: {exc}', False)
+
+    print('\nprices (API value; read from disk, never fetched)')
+    table, why = pricing.load(a.prices)
+    if table is None:
+        line('price table', why, False)
+    else:
+        line('price table', table['path'])
+        line('as of', f"{table.get('as_of') or '(no date)'} | {len(table['models']):,} models | "
+                      f"{table.get('source') or ''}")
 
     print('\nindex')
     db = os.path.join(out_dir(), 'index.db')

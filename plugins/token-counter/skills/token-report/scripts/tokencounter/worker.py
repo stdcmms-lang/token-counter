@@ -120,6 +120,45 @@ def _request_anchor(anchor_ts, compact_ts):
     return compact_ts if (a is not None and c is not None and c > a) else anchor_ts
 
 
+def _service_tier(payload):
+    """The processing tier a `thread_settings_applied` snapshot records for the thread.
+
+    Codex writes the tier it will request -- ``priority`` for Fast mode, ``flex``, or its
+    ``default`` sentinel -- and leaves the key out when none is set, which is a recorded
+    standard, not an unknown.  ``None`` is kept for a record that is not such a snapshot, so
+    a response with no snapshot before it stays distinguishable from one priced at standard.
+
+    A thread's first turn has none: Codex persists a snapshot only once the rollout file
+    exists, and the file is created after the first user message, so the turn-start
+    snapshot is dropped (codex-rs `send_event_raw_without_materializing_rollout`; its test
+    `initial_plugin_ids_use_turn_context_without_extra_settings_checkpoints` asserts zero).
+    `_backfill_tier` covers that turn from the file's first snapshot.
+    """
+    ts = payload.get('thread_settings')
+    if not isinstance(ts, dict):
+        return None
+    v = ts.get('service_tier')
+    return v if isinstance(v, str) and v else 'default'
+
+
+def _backfill_tier(res, first_tier):
+    """Give the records before a file's first settings snapshot that snapshot's tier.
+
+    They are the thread's first turn, whose own snapshot Codex never persists
+    (`_service_tier`); the next snapshot is written when the second turn starts and carries
+    the same setting unless the user changed it in between.  An inference, so each record
+    says so (`tier_inferred`).  A file with no snapshot at all -- a one-turn `codex exec`
+    run, or an older Codex -- keeps None: there is nothing to infer from.
+    """
+    if first_tier is None:
+        return
+    for stream in ('explicit', 'legacy'):
+        for rec in res[stream]:
+            if rec.get('tier') is None:
+                rec['tier'] = first_tier
+                rec['tier_inferred'] = True
+
+
 def _ends_response(outer, payload):
     """Whether a record means no response is still in flight: a turn opening or aborting.
 
@@ -326,6 +365,10 @@ def _extract(path, full, vocab=None, num_threads=1):
         # Timing (ARCHITECTURE.md 5.8): when each turn opened, indexed by turn, and every
         # tool call as [name, call time in epoch seconds, seconds from the call to its output].
         'turn_starts': [], 'tool_times': [],
+        # Every turn Codex logged as aborted (interrupted, replaced by a new turn, a review
+        # ended, a budget limit), as epoch seconds.  A response cut off by one writes no
+        # usage record, so its cost is not in any figure; these count the turns.
+        'turn_aborts': [],
         'counters': {},
         'error': None,
     }
@@ -343,6 +386,12 @@ def _extract(path, full, vocab=None, num_threads=1):
     hints = None
 
     model = effort = None
+    # The processing tier requested from here on (`_service_tier`), None until a snapshot,
+    # and the first snapshot's, for the records before it (`_backfill_tier`).
+    tier = first_tier = None
+    # Web searches since each stream's last charged record.  Per stream, because a file with
+    # both streams charges only one of them, and a search must land on the record charged.
+    ws_pending = {'explicit': 0, 'legacy': 0}
     turn_index = -1
     seen_rid = set()
     call_names = {}
@@ -446,6 +495,12 @@ def _extract(path, full, vocab=None, num_threads=1):
             if rt is not None:
                 if burst_end is not None and rt - burst_end > OPENING_BURST_GAP_S:
                     burst_open = False
+                    # A fork child's opening burst is its parent's replayed history.  A
+                    # search the parent made after its last usage record -- before an
+                    # interruption -- would otherwise land on the child's first response,
+                    # and the parent's own file already counts it.
+                    if res['parent_thread_id']:
+                        ws_pending['explicit'] = ws_pending['legacy'] = 0
                 else:
                     burst_end = rt if burst_end is None else max(burst_end, rt)
 
@@ -525,7 +580,12 @@ def _extract(path, full, vocab=None, num_threads=1):
                     continue
                 seen_rid.add(rid)
             u = payload.get('usage') or {}
+            # A context snapshot is never charged, so searches wait for the next record.
+            ws = 0
+            if _is_model_call(None, u, None, 'explicit'):
+                ws, ws_pending['explicit'] = ws_pending['explicit'], 0
             rec = {'usage': u, 'ts': ts, 'model': model, 'effort': effort,
+                   'tier': tier, 'web_search': ws,
                    'response_id': rid, 'i': len(res['explicit']),
                    'req_ts': _request_start(req_ts, req_frozen, anchor_ts),
                    'turn': turn_index}
@@ -537,6 +597,20 @@ def _extract(path, full, vocab=None, num_threads=1):
 
         if outer == 'event_msg':
             et = payload.get('type')
+            if et == 'thread_settings_applied':
+                got = _service_tier(payload)
+                if got is not None:
+                    tier = got
+                    if first_tier is None:
+                        first_tier = got
+                    ctr['thread_settings'] += 1
+                continue
+            if et == 'turn_aborted':
+                rt = epoch(ts)
+                if rt is None:
+                    ctr['turn_abort_no_time'] += 1
+                else:
+                    res['turn_aborts'].append(round(rt, 3))
             if et != 'token_count':
                 if _ends_response(outer, payload):
                     req_ts, req_frozen = None, False
@@ -579,7 +653,8 @@ def _extract(path, full, vocab=None, num_threads=1):
                 ctr['raw_repeat'] += 1
             prev_state = state
             rec = {'last': last, 'total': total, 'ts': ts, 'model': model,
-                   'effort': effort, 'i': len(res['legacy']),
+                   'effort': effort, 'tier': tier, 'web_search': 0,
+                   'i': len(res['legacy']),
                    'req_ts': _request_start(req_ts, req_frozen, anchor_ts),
                    'turn': turn_index}
             # Only a record the ledger can charge ends a response.  A repeat of the previous
@@ -590,6 +665,7 @@ def _extract(path, full, vocab=None, num_threads=1):
             if not (full_state == prev_full
                     or (li == 0 and lo_ == 0 and lt > 0)):
                 req_ts, req_frozen = None, False
+                rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0
             prev_full = full_state
             res['legacy'].append(rec)
             usage_marks.append(('legacy', rec['i'], list(pending)))
@@ -598,6 +674,10 @@ def _extract(path, full, vocab=None, num_threads=1):
 
         if outer == 'response_item':
             t = payload.get('type')
+            if t == 'web_search_call':
+                ws_pending['explicit'] += 1
+                ws_pending['legacy'] += 1
+                ctr['web_search_calls'] += 1
             # Timing reads items on both passes; it needs only their side and their stamps.
             side = _timing_side(payload)
             if side == 'output':
@@ -640,6 +720,7 @@ def _extract(path, full, vocab=None, num_threads=1):
             add_item(t or 'other', segs, imgs, classify.item_role(payload), tool)
             continue
 
+    _backfill_tier(res, first_tier)
     res['rate_limits'] = finish_rate_limits(rl_acc)
     res['opening_burst_end'] = None if burst_end is None else round(burst_end, 3)
     if call_at:

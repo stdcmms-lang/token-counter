@@ -10,7 +10,7 @@ import datetime
 import functools
 import re
 
-from . import classify, latency, worker
+from . import classify, latency, pricing, worker
 
 # A response is a cache-divergence *lead* when a large stable prompt prefix was not covered
 # by reported caching.  This is a hypothesis generator, not an attribution: the rollout
@@ -468,6 +468,144 @@ def limit_events(files, tz=None):
                        for d, n in sorted(days.items())]}, q)
 
 
+def turn_aborts(files):
+    """``(aborted turns, replayed copies left out)``: the turns Codex logged as aborted --
+    interrupted, replaced by a new turn, a review ended, or a budget limit reached.
+
+    A response cut off by an abort never writes a usage record, so whatever it cost is in no
+    figure; this is how many turns that could have happened in.  (A stream that drops is
+    retried, and one that finally fails is logged as an error, not as an abort.)  A fork child
+    replays its parent's records inside its opening burst, so in a file that declares a
+    parent, an abort inside that burst is the parent's and is left out, as `limit_events`
+    does.
+    """
+    n = replayed = 0
+    for _path, fr in sorted(files.items()):
+        burst = fr.get('opening_burst_end') if fr.get('parent_thread_id') else None
+        for t in (fr.get('turn_aborts') or []):
+            if burst is not None and t <= burst:
+                replayed += 1
+            else:
+                n += 1
+    return n, replayed
+
+
+# Unpriced models listed in `api_value`, most responses first.
+UNPRICED_MODELS = 20
+
+
+class ApiValue:
+    """The API list-price value of charged rows, accumulated one row at a time.
+
+    Priced per response by :mod:`tokencounter.pricing`; a response it cannot price is
+    counted with its reason and its tokens, never folded in at a guessed rate.  `loaded` is
+    what :func:`pricing.load` returns: ``(table, None)`` or ``(None, reason)``.
+    """
+
+    def __init__(self, loaded):
+        self.table, self.reason = loaded
+        self.usd = 0.0
+        self.ws_usd = 0.0
+        self.ws_calls = 0
+        self.priced = 0
+        self.unpriced = collections.Counter()
+        self.unpriced_models = collections.defaultdict(collections.Counter)
+        self.tiers = collections.Counter()
+        self.tier_unrecorded = 0
+        self.tier_inferred = 0
+        # The same responses with every unrecorded tier priced at Fast, where the model has a
+        # Fast rate: Codex writes no tier for a one-turn thread, and Fast costs 2x or more.
+        self.usd_high = 0.0
+        self.long = 0
+        self.by_model = collections.defaultdict(collections.Counter)
+
+    @property
+    def on(self):
+        return self.table is not None
+
+    def add(self, r):
+        """Price one charged row: its dollars, web search fees included, or None when there
+        is no price table.  An unpriced row still adds its web search fees."""
+        if self.table is None:
+            return None
+        n_ws = pricing._n(r.get('web_search'))
+        ws = pricing.web_search(self.table, r)
+        self.ws_calls += n_ws
+        self.ws_usd += ws
+        usd, why = pricing.price(self.table, r)
+        if why:
+            u = r.get('usage') or {}
+            self.unpriced[why] += 1
+            um = self.unpriced_models[(r.get('model') or 'unknown', why)]
+            um['responses'] += 1
+            um['input'] += pricing._n(u.get('input_tokens'))
+            um['output'] += pricing._n(u.get('output_tokens'))
+            return ws
+        self.priced += 1
+        self.usd += usd
+        self.tiers[pricing.tier_name(r.get('tier'))] += 1
+        if r.get('tier_inferred'):
+            self.tier_inferred += 1
+        if r.get('tier') is None:
+            self.tier_unrecorded += 1
+            fast, why_fast = pricing.price(self.table, dict(r, tier='priority'))
+            self.usd_high += usd if why_fast else max(fast, usd)
+        else:
+            self.usd_high += usd
+        if pricing.is_long(self.table, r):
+            self.long += 1
+        bm = self.by_model[pricing.lookup(self.table, r.get('model'))]
+        bm['usd'] += usd
+        bm['responses'] += 1
+        return usd + ws
+
+    def model(self, files):
+        aborted, aborted_replayed = turn_aborts(files)
+        if self.table is None:
+            return {'available': False, 'reason': self.reason,
+                    'aborted_turns': aborted}
+        unpriced = sum(self.unpriced.values())
+        out = {
+            'available': self.priced > 0,
+            'reason': None,
+            # Dollars: priced responses' tokens plus every web search's per-call fee.
+            'usd': round(self.usd + self.ws_usd, 6),
+            # `usd` with every response of unrecorded tier priced at Fast instead: the most
+            # the same responses could have cost.  Equal to `usd` when every tier is known.
+            'usd_high': round(self.usd_high + self.ws_usd, 6),
+            'tokens_usd': round(self.usd, 6),
+            'web_search_usd': round(self.ws_usd, 6),
+            'web_search_calls': self.ws_calls,
+            'prices': {'as_of': self.table.get('as_of'), 'source': self.table.get('source'),
+                       'models': len(self.table['models']),
+                       'default': self.table.get('path') == pricing.DEFAULT_PRICES},
+            'responses': self.priced + unpriced,
+            'priced': self.priced,
+            'unpriced': unpriced,
+            'unpriced_by_reason': dict(self.unpriced),
+            'unpriced_models': [
+                dict(c, model=m, reason=why) for (m, why), c in sorted(
+                    self.unpriced_models.items(), key=lambda kv: -kv[1]['responses'])
+            ][:UNPRICED_MODELS],
+            # Priced at standard: their file holds no tier snapshot at all.
+            'tier_unrecorded': self.tier_unrecorded,
+            # A thread's first turn, given the tier of the file's first snapshot.
+            'tier_inferred': self.tier_inferred,
+            'tiers': dict(self.tiers),
+            'long_context': self.long,
+            'aborted_turns': aborted,
+            'aborted_turns_replayed': aborted_replayed,
+            'by_model': [{'model': m, 'usd': round(v['usd'], 6), 'responses': v['responses']}
+                         for m, v in sorted(self.by_model.items(), key=lambda kv: -kv[1]['usd'])],
+        }
+        if not self.priced:
+            seen = sorted({m for m, _ in self.unpriced_models})
+            out['reason'] = ('no responses in range' if not unpriced else
+                             'no response could be priced (models: '
+                             + ', '.join(seen[:6]) + (' ...' if len(seen) > 6 else '') + ')')
+        return out
+
+
 def _in_time_order(responses):
     """Charged responses oldest first, dropping those whose timestamp could not be read.
 
@@ -504,14 +642,19 @@ def _bucket_last(points):
 
 
 def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None,
-            account=None):
+            account=None, prices=None):
     """Build the full report model.
 
     `files`   path -> FileResult
     `charged` path -> charged usage rows (the canonical ledger)
     `counters` corpus-wide data-quality counters from the ledger
     `account`  identity record from :mod:`tokencounter.account`, or None
+    `prices`   what :func:`pricing.load` returned; None loads the vendored table
     """
+    api = ApiValue(pricing.load() if prices is None else prices)
+    # Days with anything valued: a priced response or a search fee.  The rest report None
+    # rather than 0, which would read as free.
+    api_days = set()
     totals = collections.Counter()
     daily = collections.defaultdict(collections.Counter)
     # Kept beside `daily` rather than nested inside it: `daily` is a Counter, and a Counter
@@ -563,6 +706,7 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
                 'tiktoken_input': 0, 'unique_tokens': 0, 'cats': collections.Counter(),
                 'cli': fr.get('cli_version'), 'resend_cost': 0,
                 'recon': 0, 'reported': 0, 'hot': [],
+                'api_usd': None,
             }
         s['threads'] += 1
         s['files'].append(path)
@@ -628,6 +772,10 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
             else:
                 tk_found += 1
             d = _day(r.get('ts'), fr.get('date')) or 'unknown'
+            priced_before = api.priced
+            usd = api.add(r)
+            if usd is not None and not (usd or api.priced > priced_before):
+                usd = None                  # unpriced, and no search fee either
             resp_ts.append((worker.epoch(r.get('ts')), inp, cch, out, tk))
             totals['responses'] += 1
             totals['input'] += inp
@@ -637,6 +785,10 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
             totals['tiktoken_input'] += tk
             dd = daily[d]
             dd['responses'] += 1
+            if usd is not None:
+                dd['api_usd'] += usd
+                api_days.add(d)
+                s['api_usd'] = (s['api_usd'] or 0.0) + usd
             dd['input'] += inp
             dd['cached'] += cch
             dd['output'] += out
@@ -708,6 +860,7 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
     for s in sessions.values():
         if not measured:
             s['tiktoken_input'] = None
+        s['api_usd'] = None if s['api_usd'] is None else round(s['api_usd'], 6)
         s['models'] = dict(s['models'])
         s['cats'] = dict(s['cats'])
         s['uncached'] = s['input'] - s['cached']
@@ -744,6 +897,8 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
         'account': account or {'available': False, 'reason': 'not requested'},
         'rate_limits': rate_limit_windows(files, resp_ts),
         'limit_events': lim,
+        # What the recorded usage would cost at OpenAI's API list prices (tokencounter.pricing).
+        'api_value': api.model(files),
         'totals': {
             'files': len(files),
             'sessions': len(sessions),
@@ -774,6 +929,7 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
         # bars on a real time axis shared with the limit chart, and a renderer re-deriving the
         # span from the date string would have to repeat the DST handling done here.
         'daily': [dict(v, date=d, uncached=v['input'] - v['cached'],
+                       api_usd=round(v['api_usd'], 6) if d in api_days else None,
                        models=dict(daily_models[d]),
                        **({'tiktoken_models': dict(daily_models_tk[d])} if measured
                           else {'tiktoken_input': None}),

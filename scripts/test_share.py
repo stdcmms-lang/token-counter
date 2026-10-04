@@ -20,7 +20,7 @@ SHARE = os.path.join(REPO, 'plugins', 'token-counter', 'skills', 'token-share', 
 sys.path.insert(0, SHARE)
 
 import share  # noqa: E402
-from tokencounter import analyze, ledger, rollout, worker  # noqa: E402
+from tokencounter import analyze, ledger, pricing, rollout, worker  # noqa: E402
 
 RESULTS = []
 SECRET_PROMPT = 'PLEASE-NEVER-UPLOAD-THIS-PROMPT'
@@ -141,11 +141,18 @@ def test_nothing_private_is_sent():
     check('no working directory in the payload', SECRET_CWD not in blob and 'someone' not in blob)
     check('no raw session id in the payload', '11111111-aaaa' not in blob)
     check('only the documented keys are sent',
-          set(p) == {'schema', 'client', 'generated_at', 'days', 'sessions', 'windows', 'handle'}
+          set(p) == {'schema', 'client', 'generated_at', 'days', 'sessions', 'windows', 'handle',
+                     'api_value'}
           and all(set(d) == {'date', 'responses', 'input', 'cached', 'output', 'reasoning',
-                             'sessions'} for d in p['days'])
+                             'sessions', 'api_usd'} for d in p['days'])
           and all(set(x) == {'id', 'day', 'start', 'end', 'active_s', 'responses', 'input',
-                             'cached', 'output', 'reasoning', 'model'} for x in p['sessions']),
+                             'cached', 'output', 'reasoning', 'model', 'api_usd'}
+                  for x in p['sessions'])
+          and set(p['api_value']) == {'usd', 'usd_high', 'tokens_usd', 'web_search_usd',
+                                      'web_search_calls', 'prices_as_of', 'prices_source',
+                                      'prices_default', 'responses', 'priced', 'unpriced',
+                                      'tier_unrecorded', 'tier_inferred', 'tiers',
+                                      'aborted_turns'},
           json.dumps(p)[:400])
     *_, w, _ = _build(_corpus_file(_limit_records()))
     check('only the documented keys are sent per limit window',
@@ -208,6 +215,55 @@ def test_latency():
     check('a corpus that cannot be timed sends no latency', 'latency' not in q, str(q.keys()))
     *_, old, _ = _build(_corpus_file(_timed_records('2026-01-05', [2, 4, 6, 8, 10])))
     check('responses older than a month are not timed', 'latency' not in old, str(old.get('latency')))
+
+
+def test_api_value():
+    """The API value rides along per day, per session and in total, priced as the report
+    prices it; a day with nothing priced sends null, and no table sends no field."""
+    _utc()
+    results, charged, counters, p, _ = _build(_corpus(CORPUS))
+    av = p['api_value']
+    table, _ = pricing.load()
+    rate = table['models']['gpt-5-codex']['standard']
+    # CORPUS: 7 responses of 1,000 in / 400 cached / 50 out, and 2 of 50,000 / 10,000 / 2,000.
+    want = (7 * (600 * rate['input'] + 400 * rate['cached_input'] + 50 * rate['output'])
+            + 2 * (40_000 * rate['input'] + 10_000 * rate['cached_input']
+                   + 2_000 * rate['output'])) / 1e6
+    check('the total is every response priced at the model\'s list price',
+          abs(av['usd'] - want) < 1e-6 and av['priced'] == 9 and av['unpriced'] == 0,
+          f"{av} want {want}")
+    check('the days add up to the total',
+          abs(sum(d['api_usd'] for d in p['days']) - av['usd']) < 1e-3, str(p['days']))
+    model = analyze.analyze(results, charged, counters, scope={'label': 'test'})
+    check('the total is the report\'s', abs(model['api_value']['usd'] - av['usd']) < 1e-4,
+          f"report {model['api_value']['usd']} share {av['usd']}")
+    check('the price table is named by its date', av['prices_as_of'] == table['as_of']
+          and av['prices_default'] is True, str(av))
+
+    *_, q, _ = _build(_corpus([('44444444-dddd', ['2026-09-03T10:00:00.000Z'],
+                                {'model': 'not-a-priced-model'})]))
+    check('a day with no priced response sends null, not zero',
+          [d['api_usd'] for d in q['days']] == [None]
+          and [x['api_usd'] for x in q['sessions']] == [None]
+          and q['api_value']['priced'] == 0 and q['api_value']['unpriced'] == 1,
+          json.dumps(q)[:400])
+
+    recs = _session('55555555-eeee', ['2026-09-10T10:00:00.000Z'], model='not-a-priced-model')
+    recs.insert(3, {'timestamp': '2026-09-10T10:00:00.000Z', 'type': 'response_item',
+                    'payload': {'type': 'web_search_call', 'status': 'completed'}})
+    *_, ws, _ = _build(_corpus_file(recs))
+    check('an unpriced day still carries its search fee, so the days add up to the total',
+          [d['api_usd'] for d in ws['days']] == [0.01] and ws['api_value']['usd'] == 0.01
+          and ws['api_value']['priced'] == 0 and ws['api_value']['web_search_calls'] == 1,
+          json.dumps(ws)[:400])
+
+    root = _corpus(CORPUS)
+    results = {pp: worker.metrics_only(pp) for pp in rollout.discover(root)}
+    charged, _ = ledger.build(results)
+    none, _ = share.build_payload(results, charged, prices=(None, 'test: no table'))
+    check('without a price table nothing is sent under the name',
+          'api_value' not in none and all(d['api_usd'] is None for d in none['days']),
+          json.dumps(none)[:300])
 
 
 def test_sessions_are_capped_per_month():
@@ -540,6 +596,7 @@ def main():
     test_damaged_counts_are_clamped()
     test_limit_windows()
     test_latency()
+    test_api_value()
     test_transport()
     bad = sum(1 for _, ok, _ in RESULTS if not ok)
     print(f'\n{len(RESULTS) - bad}/{len(RESULTS)} passed')
