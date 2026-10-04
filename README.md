@@ -262,7 +262,7 @@ still charges over the whole corpus, because a fork child's ancestors may sit ou
 | `~/.codex/auth.json` | no | the report names no account (`--no-account` does this on purpose) |
 | SQLite index at `~/.codex/token-counter/index.db` | no | every run re-parses; a corrupt, locked or unwritable index is reported and skipped |
 | Multiple processes | no | falls back to one, slower and identical |
-| A writable `CODEX_HOME` | no | output goes to the system temp directory, and the path is printed |
+| A writable `CODEX_HOME` | no | output goes to a directory of the user's own under the system temp directory (`token-counter-<uid>`, 0700), and the path is printed |
 | Network | once, to install `tiktoken` from PyPI if it is missing | the install fails, the run continues without content composition, and the next run tries again |
 | The vendored price table, `assets/vendor/openai_prices.json` | no; it ships with the plugin and is never downloaded | the API value is left out and the terminal line says why; every other figure is unaffected |
 

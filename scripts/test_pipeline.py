@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -1859,9 +1860,10 @@ def test_request_start_edge_cases():
     check('a repeated legacy record does not end the response in flight', got == [4, 10],
           str(got))
 
-    # Items the model emits that are not in the classifier's output list -- a web search --
-    # and local bookkeeping it does not know at all must not pass for the request's start.
+    # Local bookkeeping the classifier does not know at all, written before the response's
+    # first output, and a web search the model ran must not pass for the request's start.
     got = _timed([meta, tc(t), _user(t + 1),
+                  _at(t + 2, 'response_item', {'type': 'ghost_snapshot'}),
                   _at(t + 3, 'response_item', {'type': 'web_search_call', 'status': 'completed'}),
                   _at(t + 4, 'response_item', {'type': 'ghost_snapshot'}),
                   _at(t + 6, 'response_item', {'type': 'reasoning', 'summary': []}),
@@ -1979,8 +1981,11 @@ def test_latency_caps_and_counters():
             dict(base, req_ts=None, ts=None)]
     tools = [['exec', t + 1, 3.0], ['exec', t + 1, 0.0], ['exec', t + 1, latency.TOOL_CAP_S + 1],
              ['exec', t - 5, 2.0], ['exec', None, None], [['exec'], t + 1, 1.0]]
-    files = {'a': {'turn_starts': [iso(t)], 'tool_times': tools},
-             'b': {'turn_starts': [], 'tool_times': [['exec', t, 1.0]]}}
+    # Both are fork children: only a file that declares a parent has history replayed into
+    # it, and so a replay boundary for its tool calls.
+    files = {'a': {'turn_starts': [iso(t)], 'tool_times': tools, 'parent_thread_id': 'p'},
+             'b': {'turn_starts': [], 'tool_times': [['exec', t, 1.0]],
+                   'parent_thread_id': 'p'}}
     lat, q = latency.build(files, {'a': rows, 'b': []})
     check('each rejected sample is counted under its own reason',
           (q['latency_samples'], q['latency_nonpositive'], q['latency_over_cap'],
@@ -1997,6 +2002,14 @@ def test_latency_caps_and_counters():
            q['tool_replayed'], q['tool_no_time'], q['tool_without_response'])
           == (2, 1, 1, 1, 1, 1)
           and {x['tool'] for x in lat['tools']} == {'exec', 'unknown'}, str(dict(q)))
+    # The same calls in files that declare no parent: nothing there is replayed, so a call
+    # before the first timed response -- in a turn that was interrupted -- is still timed.
+    own = {k: {kk: vv for kk, vv in v.items() if kk != 'parent_thread_id'}
+           for k, v in files.items()}
+    _, q_own = latency.build(own, {'a': rows, 'b': []})
+    check("a file that declares no parent has none of its tool calls taken for a replay",
+          (q_own['tool_calls_timed'], q_own['tool_replayed'], q_own['tool_without_response'])
+          == (4, 0, 0), str(dict(q_own)))
     none, q2 = latency.build({'a': {}}, {'a': []})
     check('no responses: the section says why instead of showing zeros',
           none == {'available': False, 'reason': 'no charged responses in range'}, str(none))
@@ -3113,6 +3126,434 @@ def test_prices_option():
           and m['totals']['responses'] == 6, f'rc={rc} {av} {err[-300:]}')
 
 
+# --------------------------------------------------------------------------- review findings
+
+def stat_mode(p):
+    import stat
+    return stat.S_IMODE(os.stat(p).st_mode)
+
+
+def test_temp_fallback_is_private():
+    """The temp-directory fallback is this user's alone, or it is not used.
+
+    On Linux the temp directory is /tmp, which every local user can write: a fixed name
+    there is one anyone can make first, then fill with a `tiktoken` for `deps.activate` to
+    import, or a symlink for the report, the index or the share token to be written through.
+    """
+    import report as cli
+    posix = hasattr(os, 'getuid')
+    tmp = deps.roots()[1]
+    check('the temp fallback is named for the user',
+          not posix or os.path.basename(tmp) == f'token-counter-{os.getuid()}', tmp)
+
+    d = tempfile.mkdtemp()
+    open_dir = os.path.join(d, 'shared')
+    os.makedirs(open_dir)
+    os.chmod(open_dir, 0o777)
+    mine = os.path.join(d, 'mine')
+    made = deps.private(mine, create=True)
+    link = os.path.join(d, 'link')
+    linked = True
+    try:
+        os.symlink(mine, link)
+    except (OSError, NotImplementedError):
+        linked = False
+    check('a directory others can write is not trusted, nor a symlink to a trusted one',
+          not posix or (deps.private(open_dir) is None
+                        and (not linked or deps.private(link) is None)), open_dir)
+    check('a directory made for the purpose is trusted, and closed to others',
+          made == mine and (not posix or stat_mode(mine) & 0o077 == 0),
+          f'{made} {oct(stat_mode(mine)) if os.path.isdir(mine) else "-"}')
+
+    # A `tiktoken` planted in a temp root anyone can write is never put on the path.
+    home = os.path.join(d, 'home')
+    plant = os.path.join(open_dir, 'lib', deps.tag(), 'tiktoken')
+    os.makedirs(plant)
+    with open(os.path.join(plant, '__init__.py'), 'w') as fh:
+        fh.write('raise SystemExit("planted tiktoken imported")\n')
+    keep_roots, keep_path = deps.roots, list(sys.path)
+    keep_mods = {k: v for k, v in sys.modules.items() if k.split('.')[0] in deps._PROVIDED}
+    deps.roots = lambda: [home, open_dir]
+    try:
+        got = deps.activate()
+        on_path = any(p.startswith(open_dir) for p in sys.path)
+    finally:
+        deps.roots = keep_roots
+        sys.path[:] = keep_path
+        for k in [k for k in sys.modules if k.split('.')[0] in deps._PROVIDED]:
+            del sys.modules[k]
+        sys.modules.update(keep_mods)
+    check('an install planted in a temp root others can write is not activated',
+          not posix or (got is None and not on_path), f'{got} {on_path}')
+
+    # The report falls back only to a directory that is its own.
+    blocked = os.path.join(d, 'not-a-dir')
+    with open(blocked, 'w') as fh:
+        fh.write('x')
+    for fallback, why in ((open_dir, 'one someone else could have made'),
+                          (os.path.join(d, 'fresh'), 'one that does not exist yet')):
+        keep_out = list(cli._OUT_DIR)
+        deps.roots = lambda: [os.path.join(blocked, 'home'), fallback]
+        cli._OUT_DIR.clear()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                got = cli.out_dir()
+        finally:
+            deps.roots = keep_roots
+            cli._OUT_DIR[:] = keep_out
+        want_fallback = fallback != open_dir or not posix
+        check(f'an unwritable CODEX_HOME falls back to a private directory ({why})',
+              (got == fallback) == want_fallback and deps.private(got) == got,
+              f'{got} for {fallback}')
+        if got != fallback and os.path.basename(got).startswith('token-counter-'):
+            shutil.rmtree(got, ignore_errors=True)       # this run's own mkdtemp
+
+
+def test_report_write_fallback_is_a_fresh_file():
+    """When the report cannot be written where it belongs, it goes to a new file of its own,
+    never to a fixed name in the shared temp directory."""
+    import report as cli
+    root, home, _ = _indexed_corpus([('feed0001', 1)])
+    gone = os.path.join(tempfile.mkdtemp(), 'missing', 'dir')
+    keep = cli.out_dir
+    cli.out_dir = lambda: gone
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(['--sessions-root', root, '--no-open', '--no-account', '--quiet',
+                           '--no-cache', '--metrics-only'])
+    finally:
+        cli.out_dir = keep
+    m = re.search(r'writing (.+) instead', err.getvalue())
+    alt = m.group(1) if m else ''
+    check('an unwritable report path falls back to a fresh file, not a fixed temp name',
+          rc == 0 and os.path.isfile(alt)
+          and alt != os.path.join(tempfile.gettempdir(), 'report-all.html'),
+          f'rc={rc} {err.getvalue()[-300:]!r}')
+    if os.path.isfile(alt):
+        os.remove(alt)
+
+
+def test_codex_home_is_resolved_once():
+    """Every place that needs Codex's state directory asks the same function."""
+    from tokencounter import account, index
+    home = tempfile.mkdtemp()
+    keep = os.environ.get('CODEX_HOME')
+    os.environ['CODEX_HOME'] = home
+    try:
+        got = (rollout.codex_home(), rollout.sessions_root(), index.default_path(),
+               account.codex_home(), deps.roots()[0])
+    finally:
+        if keep is None:
+            os.environ.pop('CODEX_HOME', None)
+        else:
+            os.environ['CODEX_HOME'] = keep
+    want = (home, os.path.join(home, 'sessions'),
+            os.path.join(home, 'token-counter', 'index.db'), home,
+            os.path.join(home, 'token-counter'))
+    check('the corpus, the index, auth.json and the install all follow CODEX_HOME',
+          got == want, str(got))
+    readers = [n for n in sorted(os.listdir(os.path.join(LIB, 'tokencounter')))
+               if n.endswith('.py') and n != 'rollout.py'
+               and "environ.get('CODEX_HOME')"
+               in pathlib.Path(LIB, 'tokencounter', n).read_text(encoding='utf-8')]
+    check('only rollout.codex_home reads CODEX_HOME', readers == [], str(readers))
+
+
+def test_glob_characters_in_the_sessions_root():
+    """A `[` in the root is part of a directory name, not a pattern.  (`*` and `?` are too,
+    but Windows allows neither in a name.)"""
+    d = os.path.join(tempfile.mkdtemp(), 'br[x]')
+    day = os.path.join(d, '2026', '09', '20')
+    os.makedirs(day)
+    _write(day, 'rollout-2026-09-20T10-00-00-g.jsonl', _explicit_rollout('g', 1))
+    check('a sessions root with glob characters in its name is still read',
+          len(rollout.discover(d)) == 1, str(rollout.discover(d)))
+
+
+def test_session_prefix_within_the_range():
+    """`--session` matches within the requested dates: a session outside them is neither the
+    one asked for nor a rival that makes the prefix ambiguous."""
+    d = tempfile.mkdtemp()
+    root = os.path.join(d, 'sessions')
+    for day, sid in (('2026-09-01', 'abc1'), ('2026-09-20', 'abc2')):
+        sub = os.path.join(root, *day.split('-'))
+        os.makedirs(sub)
+        _write(sub, f'rollout-{day}T10-00-00-{sid}.jsonl', _explicit_rollout(sid, 1, day))
+    home = os.path.join(d, 'home')
+    rc, model, err = _run_indexed(root, home, '--no-cache', '--since', '2026-09-10',
+                                  '--session', 'abc')
+    check('a prefix is matched within the range, not across the corpus',
+          rc == 0 and model['deep_dive'] == ['abc2'], f'rc={rc} {err[-200:]!r}')
+    rc, model, err = _run_indexed(root, home, '--no-cache', '--since', '2026-09-10',
+                                  '--session', 'abc1')
+    check('a session wholly outside the range is reported, not an empty report',
+          rc == 3 and 'in the requested range' in err, f'rc={rc} {err[-200:]!r}')
+
+
+def test_index_key_only_when_the_index_is_used():
+    """The extractor fingerprint loads the vocabulary and encodes: only a run that reads or
+    writes the index pays for it."""
+    import report as cli
+    root, home, _ = _indexed_corpus([('feed0002', 1)])
+    calls, keep = [], cli._extractor_version
+    cli._extractor_version = lambda vocab=None: calls.append(vocab) or keep(vocab)
+    try:
+        for extra, want in ((['--no-cache'], 0), (['--metrics-only'], 0), ([], 1)):
+            calls.clear()
+            rc, _, _ = _run_indexed(root, home, *extra)
+            check(f'the index key is computed {want} time(s) with {extra or "the index"}',
+                  rc == 0 and len(calls) == want, f'rc={rc} calls={calls}')
+    finally:
+        cli._extractor_version = keep
+    check('the vocabulary is built once for a path, however it is named',
+          encoding.load() is encoding.load(encoding.vendor_path()))
+
+
+def test_malformed_records_are_survived():
+    """A record of an unexpected shape costs that record, never the file or the run."""
+    t = LAT_T0
+    d = tempfile.mkdtemp()
+    inf_rl = {'plan_type': 'pro', 'primary': {'used_percent': 5.0, 'window_minutes': 10080,
+                                              'resets_at': float('inf')}}
+    _write(d, 'rollout-odd.jsonl', [
+        _at(t, 'session_meta', {'session_id': 'O', 'id': 'O'}),
+        _at(t, 'turn_context', {'model': 'm1', 'effort': 'high'}),
+        _user(t + 1),
+        _at(t + 2, 'response_item', {'type': 'function_call', 'call_id': ['c2'],
+                                     'name': 'exec', 'arguments': '{}'}),
+        _at(t + 3, 'response_item', {'type': 'function_call_output', 'call_id': ['c2'],
+                                     'output': 'x'}),
+        _at(t + 4, 'event_msg', {'type': 'token_count', 'info': ['x']}),
+        _at(t + 5, 'token_usage_record', {'response_id': 'rs', 'usage': 'abc'}),
+        _at(t + 6, 'turn_context', {'model': {'x': 1}, 'effort': {'y': 2}}),
+        _at(t + 7, 'token_usage_record', dict(_usage('rl', 1, 0, 1), response_id=['r'])),
+        _at(t + 8, 'event_msg', {'type': 'token_count', 'rate_limits': inf_rl, 'info': {
+            'last_token_usage': {'input_tokens': 50, 'output_tokens': 5, 'total_tokens': 55},
+            'total_token_usage': {'input_tokens': 50, 'output_tokens': 5,
+                                  'total_tokens': 55}}}),
+        _said(t + 9),
+        _at(t + 10, 'token_usage_record', _usage('r2', 200, 0, 5))])
+    try:
+        got = {p: worker.process(p) for p in rollout.discover(d)}
+        r = next(iter(got.values()))
+        ok = (r['counters'].get('malformed_records', 0) >= 3
+              and [x['response_id'] for x in r['explicit']][-1] == 'r2'
+              and len(r['legacy']) == 1
+              and r['counters'].get('rate_limit_no_reset') == 1)
+        charged, counters = ledger.build(got)
+        model = analyze.analyze(got, charged, counters, scope={'label': 't'})
+        ok = ok and model['quality'].get('malformed_records', 0) >= 3
+        why = str(r['counters'])
+    except Exception as exc:                          # the failure is the finding
+        ok, why = False, repr(exc)
+    check('malformed records are counted and skipped on the full path, not raised', ok, why)
+
+
+def test_effort_is_per_turn():
+    """A turn whose context records no effort has none, not the previous turn's."""
+    t = LAT_T0
+    d = tempfile.mkdtemp()
+    _write(d, 'rollout-e.jsonl', [
+        _at(t, 'session_meta', {'session_id': 'F', 'id': 'F'}),
+        _at(t, 'turn_context', {'model': 'm1', 'effort': 'high'}),
+        _user(t + 1), _said(t + 2),
+        _at(t + 3, 'token_usage_record', _usage('r1', 100, 0, 5)),
+        _at(t + 10, 'turn_context', {'model': 'm2', 'effort': None}),
+        _user(t + 11), _said(t + 12),
+        _at(t + 13, 'token_usage_record', _usage('r2', 100, 0, 5))])
+    r = worker.metrics_only(rollout.discover(d)[0])
+    got = [(x['model'], x['effort']) for x in r['explicit']]
+    check("a turn with no effort is not labelled with the previous turn's",
+          got == [('m1', 'high'), ('m2', None)] and r['efforts'] == {'high': 1}, str(got))
+
+
+def test_explicit_snapshot_keeps_the_frozen_start():
+    """An uncharged context snapshot on the explicit stream does not end the response in
+    flight, as on the legacy stream."""
+    t = LAT_T0
+    snap = {'usage': {'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0,
+                      'reasoning_output_tokens': 0, 'total_tokens': 500}}
+    got = _timed([_at(t, 'session_meta', {'session_id': 'Z', 'id': 'Z'}),
+                  _at(t, 'turn_context', {'model': 'm1', 'effort': 'high'}),
+                  _user(t + 1), _said(t + 2),
+                  _at(t + 3, 'token_usage_record', snap),
+                  _out(t + 4, 'cx'),                  # written mid-stream
+                  _at(t + 10, 'token_usage_record', _usage('r1', 100, 0, 5))])
+    check('an explicit context snapshot mid-response keeps its start', got == [9], str(got))
+
+
+def test_model_calls_are_output():
+    """A model-emitted `*_call` is output: a web search between a response's reasoning and
+    its message keeps that reasoning out of the response's reconstructed prompt."""
+    check('a web search call is output, for prompt content as for timing',
+          classify.item_role({'type': 'web_search_call'}) == 'output'
+          and classify.item_role({'type': 'image_generation_call'}) == 'output'
+          and classify.item_role({'type': 'function_call_output'}) == 'input')
+    t = LAT_T0
+    recon = []
+    for search in (False, True):
+        d = tempfile.mkdtemp()
+        recs = [_at(t, 'session_meta', {'session_id': 'W', 'id': 'W'}),
+                _at(t, 'turn_context', {'model': 'm1', 'effort': 'high'}),
+                _user(t + 1, 'question ' * 30),
+                _at(t + 2, 'response_item', {'type': 'reasoning', 'summary': [
+                    {'type': 'summary_text', 'text': 'thinking it over ' * 100}]})]
+        if search:
+            recs.append(_at(t + 3, 'response_item', {'type': 'web_search_call',
+                                                     'status': 'completed'}))
+        recs += [_said(t + 4), _at(t + 5, 'token_usage_record', _usage('r1', 100, 0, 5))]
+        _write(d, 'rollout-w.jsonl', recs)
+        recon.append(worker.process(rollout.discover(d)[0])['responses'][0]['recon_input'])
+    check("a search does not pull the response's own reasoning into its prompt",
+          recon[0] == recon[1] and recon[0] > 0, str(recon))
+
+
+def test_fork_child_rate_limits_not_replayed():
+    """A fork child's replayed rate-limit snapshots, restamped with its creation time, are
+    the parent's: they neither redate the parent's windows nor open a window of their own."""
+    t = 1_790_000_000
+    a_reset, b_open = t + 86400, t + 2 * 86400
+    b_reset = b_open + WEEK
+    parent = [_rec('session_meta', {'session_id': 'P', 'id': 'P'}, 0),
+              _tc(t + 3600, 50.0, a_reset, 1000, 1000),
+              _tc(b_open, 5.0, b_reset, 2000, 1000),
+              _tc(b_open + 3600, 10.0, b_reset, 3000, 1000)]
+    parent[0]['timestamp'] = _at(t, 'x', {})['timestamp']
+    c = t + 3 * 86400
+    child = [_at(c, 'session_meta', {'session_id': 'P', 'id': 'K', 'parent_thread_id': 'P'})]
+    for i, r in enumerate(parent[1:], 1):
+        child.append(dict(r, timestamp=_at(c + i / 1000, 'x', {})['timestamp']))
+    child.append(_tc(c + 60, 15.0, b_reset, 4000, 1000))
+    d = tempfile.mkdtemp()
+    _write(d, 'rollout-parent.jsonl', parent)
+    _write(d, 'rollout-child.jsonl', child)
+    data = {os.path.basename(p): worker.metrics_only(p) for p in rollout.discover(d)}
+    kid = data['rollout-child.jsonl']
+    check("a fork child keeps only its own rate-limit snapshots",
+          kid['counters'].get('rate_limit_replayed') == 3
+          and [(w['resets_at'], w['n']) for w in kid['rate_limits']] == [(b_reset, 1)],
+          f"{kid['counters']} {[(w['resets_at'], w['n']) for w in kid['rate_limits']]}")
+    both = analyze.rate_limit_windows(data, [], now=c + 3600)
+    check('with the parent in range, the replay contradicts nothing',
+          both['overlapping'] == 0 and both['late_readings'] == 0
+          and [w['reset_at'] for w in both['windows']][-1] == b_open,
+          f"{both['overlapping']} {both['late_readings']} "
+          f"{[w['reset_at'] for w in both['windows']]}")
+    alone = analyze.rate_limit_windows({'c': kid}, [], now=c + 3600)
+    check('with the parent out of range, no old window appears and the reset stays put',
+          [w['reset_at'] for w in alone['windows']] == [b_open],
+          str([w['reset_at'] for w in alone['windows']]))
+
+
+def test_limit_tile_and_axis():
+    """The limit tile shows the current window, or says it has reset; the axis ends where
+    the data does; a window that is not weekly is not called weekly."""
+    model = axis_model()
+    rl = model['rate_limits']
+    dom = render._domain(model)
+    later = dict(model, rate_limits=dict(rl, now=rl['now'] + 90 * 86400))
+    check('the shared axis ends with the data, not at the wall clock',
+          render._domain(later) == dom and dom[1] < rl['now'], f'{dom} now={rl["now"]}')
+
+    cur = dict(rl['current'] or {}, last_pct=87.0, resets_at=rl['now'] - 3 * 86400,
+               expired=True)
+    page = render.render(dict(model, rate_limits=dict(rl, current=cur)))
+    tile = page.split('Weekly limit used')[1][:300] if 'Weekly limit used' in page else ''
+    check('a window that has reset is not shown as the current figure',
+          '87%' not in tile and 'no reading since' in tile and '&mdash;' in tile, tile)
+    cur = dict(cur, expired=False, resets_at=rl['now'] + 3 * 86400)
+    page = render.render(dict(model, rate_limits=dict(rl, current=cur)))
+    check('a live window shows its last reading',
+          '87%' in page.split('Weekly limit used')[1][:300])
+
+    five = dict(rl, weekly=False, window_minutes=300)
+    page = render.render(dict(model, rate_limits=five))
+    check('a 5-hour window is called a 5-hour limit, on the tile, the legend and the page',
+          '5-hour limit used' in page and '5-hour limit</span>' in page
+          and 'Weekly limit used' not in page and '"name":"5-hour"' in page, '')
+    check('window lengths are named',
+          [render.limit_name({'weekly': False, 'window_minutes': m})
+           for m in (1440, 2880, 300, 90)] == ['daily', '2-day', '5-hour', '90-minute']
+          and render.limit_name(rl) == 'weekly')
+
+
+def test_public_page_carries_no_tokenizer_path():
+    """The tokenizer note is an exception's first line, which names paths on the machine; the
+    page token-share publishes says only what happened."""
+    model = axis_model()
+    secret = '/home/jane/secret-project/o200k.tiktoken'
+    model['scope'] = dict(model.get('scope') or {}, metrics_only=True,
+                          tokenizer_note=f'vendored BPE not found at {secret}.')
+    check('the public page leaves the vocabulary path out',
+          secret not in render.render(model, public=True)
+          and 'Not counted:' in render.render(model, public=True))
+    check('the local page keeps it', secret in render.render(model))
+
+
+def test_page_source_compiles_cleanly():
+    """The page's script is Python string data: an escape Python does not know is a
+    SyntaxWarning on 3.12 and a SyntaxError later."""
+    import warnings
+    path = os.path.join(LIB, 'tokencounter', 'render.py')
+    with open(path, encoding='utf-8') as fh:
+        src = fh.read()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            compile(src, path, 'exec')
+        ok, why = True, ''
+    except (SyntaxError, SyntaxWarning, DeprecationWarning) as exc:
+        ok, why = False, str(exc)
+    check('render.py compiles with warnings as errors', ok, why)
+    check("the page's regex keeps its escapes", r'/var\((--[\w-]+)\)/' in render.JS)
+
+
+def test_windows_pool_cap():
+    """Windows' process pool refuses more than 61 workers."""
+    import report as cli
+    check('the worker count is capped at what the platform allows',
+          cli.max_procs('win32') == 61 and cli.max_procs('linux') == 64)
+
+
+def test_installed_version_order():
+    """`verify_install` compares against the newest installed version, by number."""
+    import verify_install
+    got = sorted(['1.9.0', '1.10.0', '1.8.0'], key=verify_install._version_key)
+    check("versions sort by number: '1.10.0' is newer than '1.9.0'",
+          got == ['1.8.0', '1.9.0', '1.10.0'], str(got))
+
+
+def test_fetch_vocab_checks_before_replacing():
+    """A cache blob or a download that is not the expected vocabulary never replaces the
+    vendored file."""
+    import fetch_vocab
+    import urllib.request
+    d = tempfile.mkdtemp()
+    vendor = os.path.join(d, 'vendor', 'o200k_base.tiktoken')
+    os.makedirs(os.path.dirname(vendor))
+    with open(vendor, 'wb') as fh:
+        fh.write(b'the good one\n')
+    bad = os.path.join(d, 'planted')
+    with open(bad, 'wb') as fh:
+        fh.write(b'planted\n')
+    keep = (fetch_vocab.VENDOR, fetch_vocab._cache_candidates, urllib.request.urlopen)
+    fetch_vocab.VENDOR = vendor
+    fetch_vocab._cache_candidates = lambda: iter([bad])
+    urllib.request.urlopen = lambda url, timeout=None: io.BytesIO(b'cut short')
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            ok = fetch_vocab.fetch()
+    finally:
+        fetch_vocab.VENDOR, fetch_vocab._cache_candidates, urllib.request.urlopen = keep
+    with open(vendor, 'rb') as fh:
+        kept = fh.read()
+    check('a blob with the wrong checksum is rejected and the vendored file kept',
+          ok is False and kept == b'the good one\n'
+          and os.listdir(os.path.dirname(vendor)) == ['o200k_base.tiktoken'],
+          f'{ok} {kept!r} {os.listdir(os.path.dirname(vendor))}')
+
+
 def main():
     test_offline_tokenizer()
     test_encoding_cached()
@@ -3167,6 +3608,23 @@ def main():
     test_api_value_headline()
     test_prices_option()
     test_render()
+    test_temp_fallback_is_private()
+    test_report_write_fallback_is_a_fresh_file()
+    test_codex_home_is_resolved_once()
+    test_glob_characters_in_the_sessions_root()
+    test_session_prefix_within_the_range()
+    test_index_key_only_when_the_index_is_used()
+    test_malformed_records_are_survived()
+    test_effort_is_per_turn()
+    test_explicit_snapshot_keeps_the_frozen_start()
+    test_model_calls_are_output()
+    test_fork_child_rate_limits_not_replayed()
+    test_limit_tile_and_axis()
+    test_public_page_carries_no_tokenizer_path()
+    test_page_source_compiles_cleanly()
+    test_windows_pool_cap()
+    test_installed_version_order()
+    test_fetch_vocab_checks_before_replacing()
     bad = sum(1 for _, ok, _ in RESULTS if not ok)
     print(f'\n{len(RESULTS) - bad}/{len(RESULTS)} passed')
     return 1 if bad else 0

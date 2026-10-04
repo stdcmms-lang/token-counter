@@ -13,6 +13,8 @@ import os
 import sqlite3
 import zlib
 
+from . import rollout
+
 SCHEMA_VERSION = 3
 
 DDL = """
@@ -35,8 +37,7 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 
 
 def default_path():
-    home = os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')
-    return os.path.join(home, 'token-counter', 'index.db')
+    return os.path.join(rollout.codex_home(), 'token-counter', 'index.db')
 
 
 def try_open(path=None):

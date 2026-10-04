@@ -102,7 +102,7 @@ def _extractor_version(vocab=None):
 # Counters carried out of the window.  Only the first group is summed into the headline
 # total: `unparseable_usage_records` is a *subset* of `unparseable_records`, and adding both
 # double-counted a single damaged line as two.
-DAMAGE_PRIMARY = ('unparseable_records', 'non_object_records')
+DAMAGE_PRIMARY = ('unparseable_records', 'non_object_records', 'malformed_records')
 DAMAGE_DETAIL = ('unparseable_usage_records',)
 
 
@@ -130,12 +130,6 @@ def damage_outside(results, window):
     return extra
 
 
-def codex_home():
-    """Codex's state directory.  ``CODEX_HOME`` moves it, and users do move it."""
-    return (os.environ.get('CODEX_HOME')
-            or os.path.join(os.path.expanduser('~'), '.codex'))
-
-
 _OUT_DIR = []
 
 
@@ -144,7 +138,9 @@ def out_dir():
 
     A read-only or absent ``CODEX_HOME`` is a setup this tool should survive: the report is
     still worth producing, it just lands somewhere else, and the path it lands at is printed
-    on stdout either way.
+    on stdout either way.  The fallback is used only when it is this user's alone
+    (`deps.private`); one that someone else made first is passed over for a fresh directory
+    of this run's own, which costs the index its reuse and nothing else.
     """
     if _OUT_DIR:
         return _OUT_DIR[0]
@@ -158,12 +154,19 @@ def out_dir():
             pass
         os.remove(probe)
     except OSError as exc:
-        d = fallback
-        os.makedirs(d, exist_ok=True)
+        d = (deps.private(fallback, create=True)
+             or tempfile.mkdtemp(prefix='token-counter-'))
         print(f'{home} is not writable ({exc.__class__.__name__}); using {d}',
               file=sys.stderr)
     _OUT_DIR.append(d)
     return d
+
+
+def max_procs(platform=sys.platform):
+    """The most worker processes a run starts.  Windows' process pool refuses more than 61,
+    and the refusal would read as a pool that cannot start and send the whole run down the
+    single-process path."""
+    return 61 if platform.startswith('win') else 64
 
 
 def open_local(path):
@@ -333,7 +336,7 @@ def main(argv=None):
     cores = os.cpu_count() or 4
     procs = a.procs if a.procs else (cores if a.fast else max(1, min(8, cores // 2)))
     threads = a.threads if a.threads else 1
-    procs = max(1, min(procs, 64))
+    procs = max(1, min(procs, max_procs()))
     threads = max(1, min(threads, 32))
 
     # The ledger always sees the whole corpus; only the *report* is windowed.  Filtering
@@ -367,7 +370,6 @@ def main(argv=None):
         if tokenizer_note:
             a.metrics_only = True
 
-    extractor = _extractor_version(a.vocab)
     db_path = os.path.join(out_dir(), 'index.db')
     if a.rebuild:
         why = _discard_index(db_path)
@@ -380,8 +382,11 @@ def main(argv=None):
     # `--metrics-only` bypasses the index entirely, in both directions. Reading it would
     # silently mix full cached results with metrics-only ones and make the content sections
     # depend on cache state; writing it would poison the index with attribution-free rows.
-    cache = None
+    cache = extractor = None
     if not (a.no_cache or a.metrics_only):
+        # Only a run that uses the index needs its key, and the key costs a vocabulary load
+        # and an encode.
+        extractor = _extractor_version(a.vocab)
         cache, why = index.try_open(db_path)
         if cache is None and not a.quiet:
             print(f'index unusable ({why}); running without it', file=sys.stderr)
@@ -406,11 +411,14 @@ def main(argv=None):
 
         focus = None
         if a.session:
-            match = {p for p, r in results.items()
-                     if (r.get('session_id') or '').startswith(a.session)
-                     or (r.get('thread_id') or '').startswith(a.session)}
+            # Matched within the requested range: a session outside it is neither the one
+            # asked for nor a rival that makes the prefix ambiguous.
+            match = {p for p in window if p in results
+                     and ((results[p].get('session_id') or '').startswith(a.session)
+                          or (results[p].get('thread_id') or '').startswith(a.session))}
             if not match:
-                print(f'No session matching {a.session!r}', file=sys.stderr)
+                ranged = ' in the requested range' if (a.since or a.until) else ''
+                print(f'No session matching {a.session!r}{ranged}', file=sys.stderr)
                 return 3
             sids = sorted({results[p].get('session_id') or p for p in match})
             if len(sids) > 1:
@@ -473,10 +481,12 @@ def main(argv=None):
             if a.out:               # an explicit path the user chose: do not second-guess it
                 print(f'could not write {out}: {exc}', file=sys.stderr)
                 return 5
-            alt = os.path.join(tempfile.gettempdir(), os.path.basename(out))
+            # A new file of its own, never a fixed name in a temp directory others can write.
+            fd, alt = tempfile.mkstemp(prefix=f'{os.path.splitext(os.path.basename(out))[0]}-',
+                                       suffix='.html')
             print(f'could not write {out} ({exc.__class__.__name__}); '
                   f'writing {alt} instead', file=sys.stderr)
-            with open(alt, 'w', encoding='utf-8') as fh:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
                 fh.write(page)
             out = alt
 
@@ -525,10 +535,16 @@ def main(argv=None):
             plan = acct.get('plan') or (cur or {}).get('plan_type')
             line = f"{who}{f' ({plan})' if plan else ''}"
             if cur:
-                pct = cur.get('last_pct')
-                line += (f" | weekly limit {'--' if pct is None else f'{pct:g}%'} used"
-                         f" | reset {cur.get('reset_at_iso') or '--'}"
-                         f" | next {cur.get('resets_at_iso') or '--'}")
+                name = render.limit_name(rl)
+                if cur.get('expired'):
+                    # The last reading belongs to a window that has since reset.
+                    line += (f" | {name} limit reset {cur.get('resets_at_iso') or '--'}, "
+                             f"no reading since")
+                else:
+                    pct = cur.get('last_pct')
+                    line += (f" | {name} limit {'--' if pct is None else f'{pct:g}%'} used"
+                             f" | reset {cur.get('reset_at_iso') or '--'}"
+                             f" | next {cur.get('resets_at_iso') or '--'}")
             print(line)
         print(out)
         if not a.no_open:
@@ -646,7 +662,7 @@ def doctor(a):
     line('platform', f'{sys.platform} | {os.cpu_count() or "?"} cores')
 
     print('\ncodex home')
-    home = codex_home()
+    home = rollout.codex_home()
     line('CODEX_HOME', os.environ.get('CODEX_HOME') or '(unset, using ~/.codex)')
     line('resolved', home, os.path.isdir(home))
     root = rollout.sessions_root(a.sessions_root)

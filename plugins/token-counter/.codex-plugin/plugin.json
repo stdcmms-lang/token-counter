@@ -1,6 +1,6 @@
 {
   "name": "token-counter",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Independently tokenize your Codex session history and report cached vs uncached input as a local HTML dashboard; optionally share the totals to the tokenusage.dev leaderboard.",
   "author": {
     "name": "hao.he@giga.ai"
@@ -26,7 +26,7 @@
   "interface": {
     "displayName": "Token Counter",
     "shortDescription": "See where your context window actually goes",
-    "longDescription": "Re-tokenizes Codex rollout logs locally with a vendored o200k_base vocabulary instead of trusting reported aggregates, attributes every token to a category (system prompt, tool output, user message, reasoning), measures cached against uncached input from the canonical usage ledger, and renders a self-contained HTML dashboard, with how long responses, turns and tool calls took from the logs' own timestamps. Raw token counts only: no pricing, no rate-limit translation. Nothing is intercepted at runtime, and the report never leaves the machine. A separate, opt-in skill shares daily token counts, per-session summaries and weekly rate-limit usage by plan -- never content, paths or account identity -- to the public leaderboard at tokenusage.dev, and only after a dry run and an explicit --yes.",
+    "longDescription": "Re-tokenizes Codex rollout logs locally with a vendored o200k_base vocabulary instead of trusting reported aggregates, attributes every token to a category (system prompt, tool output, user message, reasoning), measures cached against uncached input from the canonical usage ledger, and renders a self-contained HTML dashboard, with how long responses, turns and tool calls took from the logs' own timestamps. Beside the token counts it shows what the recorded usage would cost at OpenAI's API list prices, from a vendored price table that is never fetched -- a value, not a bill -- and never translates tokens into rate-limit percentages. Nothing is intercepted at runtime, and the report stays on the machine unless you share it. A separate, opt-in skill shares daily token counts, per-session summaries and weekly rate-limit usage by plan, and publishes the report page itself -- never content, paths or account identity -- to the public leaderboard at tokenusage.dev, and only after a dry run and an explicit --yes.",
     "developerName": "hao.he@giga.ai",
     "category": "Engineering",
     "capabilities": [

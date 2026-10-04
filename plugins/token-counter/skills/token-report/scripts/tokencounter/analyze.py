@@ -22,7 +22,7 @@ DEEP_DIVE_SESSIONS = 30
 # The weekly rate-limit window, in minutes, as the server quotes it.
 ALWAYS_QUALITY = ('replay_exclusion_applied', 'damage_outside_window',
                   'unparseable_records', 'unparseable_usage_records', 'non_object_records',
-                  'extraction_errors', 'archived_entries')
+                  'malformed_records', 'extraction_errors', 'archived_entries')
 
 WEEKLY_MINUTES = 10080
 
@@ -412,7 +412,8 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS):
                    'plan_type': latest_idle['plan_type'],
                    'tokens': {'input': 0, 'cached': 0, 'uncached': 0, 'output': 0,
                               'responses': 0},
-                   'expired': False}
+                   'expired': bool(latest_idle['resets_at_max']
+                                   and latest_idle['resets_at_max'] < now)}
 
     return {
         'available': True,
@@ -434,6 +435,18 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS):
     }
 
 
+def replay_end(fr):
+    """Where a file's replayed history ends, in epoch seconds, or ``None`` when it has none.
+
+    A fork child replays its parent's records stamped with its own creation time (section
+    2.5), all inside the file's opening burst, so in a file that declares a parent a record
+    stamped at or before the burst's end is the parent's, already counted in the parent's
+    file.  One rule for every per-record signal read here; the worker applies the same one
+    to rate-limit snapshots as it reads them.
+    """
+    return fr.get('opening_burst_end') if fr.get('parent_thread_id') else None
+
+
 def limit_events(files, tz=None):
     """``(events, data-quality counters)``: the snapshots in which Codex logged a rate limit
     as reached, counted per local day.
@@ -449,7 +462,7 @@ def limit_events(files, tz=None):
     q = collections.Counter()
     days = collections.Counter()
     for _path, fr in sorted(files.items()):
-        burst = fr.get('opening_burst_end') if fr.get('parent_thread_id') else None
+        burst = replay_end(fr)
         for t in (fr.get('limit_events') or []):
             if burst is not None and t <= burst:
                 q['limit_events_replayed'] += 1
@@ -481,7 +494,7 @@ def turn_aborts(files):
     """
     n = replayed = 0
     for _path, fr in sorted(files.items()):
-        burst = fr.get('opening_burst_end') if fr.get('parent_thread_id') else None
+        burst = replay_end(fr)
         for t in (fr.get('turn_aborts') or []):
             if burst is not None and t <= burst:
                 replayed += 1

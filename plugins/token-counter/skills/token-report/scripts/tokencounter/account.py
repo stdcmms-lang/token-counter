@@ -29,6 +29,8 @@ import base64
 import json
 import os
 
+from . import rollout
+
 # Claim names, as the id_token spells them.
 PLAIN_CLAIMS = {'email': 'email', 'name': 'name'}
 
@@ -62,8 +64,7 @@ def codex_home(sessions_root=None):
     """
     if sessions_root:
         return os.path.dirname(os.path.abspath(sessions_root))
-    env = os.environ.get('CODEX_HOME')
-    return env if env else os.path.join(os.path.expanduser('~'), '.codex')
+    return rollout.codex_home()
 
 
 def auth_path(sessions_root=None):

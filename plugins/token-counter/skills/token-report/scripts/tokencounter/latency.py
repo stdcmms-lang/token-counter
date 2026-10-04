@@ -209,12 +209,14 @@ def _local(t, tz):
         return None
 
 
-def build(files, charged, tz=None):
+def build(files, charged, tz=None, since=None):
     """``(latency model, data-quality counters)`` for the files in scope.
 
     `files` path -> FileResult, `charged` path -> the ledger's charged rows, in file order.
     `tz` pins the zone the hour-of-day and daily buckets are read in, for tests; ``None``
-    is the machine's own, as everywhere else in the report.
+    is the machine's own, as everywhere else in the report.  `since`, in epoch seconds,
+    leaves out responses that ended before it -- after they have served as the floor of the
+    next one's start, which dropping their rows beforehand would lose.
     """
     q = collections.Counter()
     samples = []                        # (start, seconds, out, uncached, group, path, turn)
@@ -226,6 +228,8 @@ def build(files, charged, tz=None):
         rows = charged.get(path) or []
         prev_end = None
         live_start = None
+        # Only a fork child replays history, so only its tool calls need the boundary.
+        forked = bool(fr.get('parent_thread_id'))
         for r in rows:
             # Charged, but stamped with the child's creation time: not timed, and not where
             # the file's own work -- the replay boundary for its tool calls -- begins.
@@ -245,6 +249,8 @@ def build(files, charged, tz=None):
                 continue
             if live_start is None:
                 live_start = start
+            if since is not None and end < since:
+                continue
             d = end - start
             if d <= 0:
                 q['latency_nonpositive'] += 1
@@ -260,15 +266,17 @@ def build(files, charged, tz=None):
             key = (path, r.get('turn'))
             turn_end[key] = max(turn_end.get(key, end), end)
 
-        # A file with no timed response has no work of its own to set the replay boundary
-        # with (`_own_work`), so its tool calls are counted and left out.
+        # A fork child with no timed response has no work of its own to set the replay
+        # boundary with (`_own_work`), so its tool calls are counted and left out.  A file
+        # that declares no parent replays nothing: a tool it ran before its first timed
+        # response -- in a turn that was interrupted, say -- is its own.
         for name, call_t, d in (fr.get('tool_times') or []):
-            if live_start is None:
+            if forked and live_start is None:
                 q['tool_without_response'] += 1
                 continue
             if call_t is None or d is None:
                 q['tool_no_time'] += 1
-            elif not _own_work(call_t, live_start):
+            elif forked and not _own_work(call_t, live_start):
                 q['tool_replayed'] += 1
             elif d <= 0:
                 q['tool_nonpositive'] += 1

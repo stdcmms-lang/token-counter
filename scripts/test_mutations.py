@@ -452,9 +452,9 @@ def _compaction_in_next():
 def _repeat_ends_response():
     orig = tp.worker
     tp.worker = _worker_with((
-        "            if not (full_state == prev_full\n"
-        "                    or (li == 0 and lo_ == 0 and lt > 0)):\n",
-        "            if True:\n"))
+        "                if not (full_state == prev_full\n"
+        "                        or (li == 0 and lo_ == 0 and lt > 0)):\n",
+        "                if True:\n"))
     return lambda: setattr(tp, 'worker', orig)
 
 
@@ -462,7 +462,8 @@ def _repeat_ends_response():
       lambda: tp.test_request_start_edge_cases())
 def _any_input_anchors():
     # `classify.item_role` calls everything it does not recognise input, which is right for
-    # prompt content and wrong for timing: a web search the model ran shortened its response.
+    # prompt content and wrong for timing: local bookkeeping written while a response streams
+    # (a ghost snapshot) shortened it.
     orig = worker._timing_side
     worker._timing_side = classify.item_role
     return lambda: setattr(worker, '_timing_side', orig)
@@ -550,9 +551,9 @@ def _searches_shared():
     # legacy record written before it drops the search from the charged row.
     orig = tp.worker
     tp.worker = _worker_with((
-        "                rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0\n",
-        "                rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0\n"
-        "                ws_pending['explicit'] = 0\n"))
+        "                    rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0\n",
+        "                    rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0\n"
+        "                    ws_pending['explicit'] = 0\n"))
     return lambda: setattr(tp, 'worker', orig)
 
 
@@ -562,8 +563,9 @@ def _snapshot_takes_searches():
     # The ledger never charges a zero/zero snapshot, so searches attached to one vanish.
     orig = tp.worker
     tp.worker = _worker_with((
-        "            if _is_model_call(None, u, None, 'explicit'):\n",
-        "            if True:\n"))
+        "                if charged_call:\n"
+        "                    ws, ws_pending['explicit'] = ws_pending['explicit'], 0\n",
+        "                ws, ws_pending['explicit'] = ws_pending['explicit'], 0\n"))
     return lambda: setattr(tp, 'worker', orig)
 
 
@@ -606,8 +608,8 @@ def _no_backfill():
 def _replayed_search_pending():
     orig = tp.worker
     tp.worker = _worker_with((
-        "                    if res['parent_thread_id']:\n"
-        "                        ws_pending['explicit'] = ws_pending['legacy'] = 0\n", ""))
+        "                        if res['parent_thread_id']:\n"
+        "                            ws_pending['explicit'] = ws_pending['legacy'] = 0\n", ""))
     return lambda: setattr(tp, 'worker', orig)
 
 
@@ -638,6 +640,249 @@ def _cyber_skipped():
     exec(compile(src.replace(old, "                    pass\n"), path, 'exec'), mod.__dict__)
     sys.modules['fetch_prices'] = mod
     return lambda: sys.modules.__setitem__('fetch_prices', fetch_prices)
+
+
+# ---- review findings (each reverted, each caught by the test written for it) -------------
+
+def _module_with(mod, *edits):
+    """`mod` re-executed from its source with ``(old, new)`` edits, as `_worker_with`."""
+    import types
+    path = mod.__file__
+    with open(path, encoding='utf-8') as fh:
+        src = fh.read()
+    for old, new in edits:
+        assert src.count(old) == 1, f'edit anchor not unique: {old!r}'
+        src = src.replace(old, new)
+    out = types.ModuleType(mod.__name__)
+    out.__file__, out.__package__ = path, mod.__package__
+    exec(compile(src, path, 'exec'), out.__dict__)
+    return out
+
+
+def _swap(name, new):
+    """Put `new` in place of `test_pipeline`'s global `name`; return the undo."""
+    orig = getattr(tp, name)
+    setattr(tp, name, new)
+    return lambda: setattr(tp, name, orig)
+
+
+def _swap_module(name, new):
+    """Put `new` in ``sys.modules[name]``, for code that imports it at call time."""
+    orig = sys.modules[name]
+    sys.modules[name] = new
+    return lambda: sys.modules.__setitem__(name, orig)
+
+
+def _share_test(fn):
+    """Run a `test_share.py` test, its assertions counted as this harness counts them."""
+    import test_share as ts
+    ts.RESULTS.clear()
+    fn(ts)
+    tp.RESULTS.extend(ts.RESULTS)
+
+
+# POSIX only: Windows has no uid, and its temp directory is already the user's own, so there
+# `deps.private` accepts any plain directory -- which is what this mutation reverts it to.
+_POSIX_ONLY = case if hasattr(os, 'getuid') else (lambda *a: (lambda fn: fn))
+
+
+@_POSIX_ONLY('the shared temp directory is trusted for tiktoken and for output',
+             lambda: tp.test_temp_fallback_is_private())
+def _shared_tmp_trusted():
+    from tokencounter import deps
+    orig = deps.private
+
+    def any_dir(d, create=False):
+        if create:
+            os.makedirs(d, exist_ok=True)
+        return d if os.path.isdir(d) else None
+    deps.private = any_dir
+    return lambda: setattr(deps, 'private', orig)
+
+
+@case("a fork child's replayed rate-limit snapshots are noted as its own",
+      lambda: tp.test_fork_child_rate_limits_not_replayed())
+def _replayed_limits():
+    return _swap('worker', _worker_with(("                if replay:\n",
+                                         "                if False:\n")))
+
+
+@case('an explicit context snapshot ends the response in flight',
+      lambda: tp.test_explicit_snapshot_keeps_the_frozen_start())
+def _explicit_snapshot_ends():
+    return _swap('worker', _worker_with((
+        "                if charged_call:\n"
+        "                    req_ts, req_frozen = None, False\n",
+        "                req_ts, req_frozen = None, False\n")))
+
+
+@case("a turn's effort is carried from the turn before",
+      lambda: tp.test_effort_is_per_turn())
+def _effort_carried():
+    return _swap('worker', _worker_with((
+        "                effort = payload.get('effort')\n",
+        "                effort = payload.get('effort') or effort\n")))
+
+
+@case('one malformed record takes the file with it',
+      lambda: tp.test_malformed_records_are_survived())
+def _malformed_raises():
+    return _swap('worker', _worker_with((
+        "        except Exception:                           # noqa: BLE001 - one record, counted\n",
+        "        except ZeroDivisionError:\n")))
+
+
+@case('a web search call is read as prompt input',
+      lambda: tp.test_model_calls_are_output())
+def _search_is_input():
+    orig = classify.item_role
+
+    def old(payload):
+        t = payload.get('type')
+        if t == 'message':
+            return 'output' if payload.get('role') == 'assistant' else 'input'
+        return 'output' if t in classify.OUTPUT_ITEMS else 'input'
+    classify.item_role = old
+    return lambda: setattr(classify, 'item_role', orig)
+
+
+@case("a file that declares no parent has its early tool calls taken for replays",
+      lambda: tp.test_latency_caps_and_counters())
+def _replay_boundary_everywhere():
+    return _swap('latency', _module_with(latency, (
+        "        forked = bool(fr.get('parent_thread_id'))\n",
+        "        forked = True\n")))
+
+
+@case('the shared axis stretches to the wall clock',
+      lambda: tp.test_limit_tile_and_axis())
+def _axis_to_now():
+    orig = render._domain
+
+    def stretched(model):
+        d = orig(model)
+        now = (model.get('rate_limits') or {}).get('now')
+        return d if not d or not now else [min(d[0], int(now)), max(d[1], int(now))]
+    render._domain = stretched
+    return lambda: setattr(render, '_domain', orig)
+
+
+@case("a window that has reset is shown as this week's figure",
+      lambda: tp.test_limit_tile_and_axis())
+def _expired_as_current():
+    return _swap('render', _module_with(render, ("    if cur.get('expired'):\n",
+                                                 "    if False:\n")))
+
+
+@case('the published page names the vocabulary path',
+      lambda: tp.test_public_page_carries_no_tokenizer_path())
+def _public_note_path():
+    return _swap('render', _module_with(render, (
+        "        why = ('the tokenizer was not available when this page was built.' if public\n",
+        "        why = (sc['tokenizer_note'] if public\n")))
+
+
+@case('a sessions root is read as a glob pattern',
+      lambda: tp.test_glob_characters_in_the_sessions_root())
+def _unescaped_root():
+    return _swap('rollout', _module_with(rollout, (
+        "glob.escape(sessions_root(root))", "sessions_root(root)")))
+
+
+@case('--session matches across the whole corpus',
+      lambda: tp.test_session_prefix_within_the_range())
+def _session_over_corpus():
+    return _swap_module('report', _module_with(rp, (
+        "            match = {p for p in window if p in results\n",
+        "            match = {p for p in results if p\n")))
+
+
+@case('the index key is computed on runs that use no index',
+      lambda: tp.test_index_key_only_when_the_index_is_used())
+def _key_always():
+    return _swap_module('report', _module_with(
+        rp, ("    cache = extractor = None\n",
+             "    cache = None\n    extractor = _extractor_version(a.vocab)\n"),
+        ("        extractor = _extractor_version(a.vocab)\n        cache, why", "        cache, why")))
+
+
+@case('the vocabulary cache is keyed on the raw argument',
+      lambda: tp.test_index_key_only_when_the_index_is_used())
+def _raw_cache_key():
+    import functools
+    from tokencounter import encoding as tcenc
+    orig = tcenc.load
+    tcenc.load = functools.lru_cache(maxsize=2)(
+        lambda path=None: tcenc._load.__wrapped__(tcenc.vendor_path(path)))
+    return lambda: setattr(tcenc, 'load', orig)
+
+
+@case('a module reads CODEX_HOME for itself',
+      lambda: tp.test_codex_home_is_resolved_once())
+def _own_codex_home():
+    from tokencounter import index
+    orig = index.default_path
+    index.default_path = lambda: os.path.join(os.path.expanduser('~'), '.codex',
+                                              'token-counter', 'index.db')
+    return lambda: setattr(index, 'default_path', orig)
+
+
+@case('installed versions are compared as strings',
+      lambda: tp.test_installed_version_order())
+def _string_versions():
+    import verify_install
+    orig = verify_install._version_key
+    verify_install._version_key = lambda v: v
+    return lambda: setattr(verify_install, '_version_key', orig)
+
+
+@case('a vocabulary blob replaces the vendored file before its checksum is read',
+      lambda: tp.test_fetch_vocab_checks_before_replacing())
+def _unchecked_vocab():
+    import fetch_vocab
+    orig = fetch_vocab._install
+
+    def unchecked(stage, origin):
+        os.replace(stage, fetch_vocab.VENDOR)
+        return True
+    fetch_vocab._install = unchecked
+    return lambda: setattr(fetch_vocab, '_install', orig)
+
+
+@case("share times the month's first response without the floor before it",
+      lambda: _share_test(lambda ts: ts.test_latency_floor_across_cutoff()))
+def _share_prefilter():
+    import test_share  # noqa: F401 -- puts the share skill on the path
+    import share
+    orig = share.latency_summary
+
+    def prefiltered(results, charged, now_s):
+        cutoff = now_s - share.LATENCY_DAYS * 86400
+        recent = {p: [r for r in rows if (share.worker.epoch(r.get('ts')) or 0) >= cutoff]
+                  for p, rows in charged.items()}
+        return orig(results, recent, now_s)
+    share.latency_summary = prefiltered
+    return lambda: setattr(share, 'latency_summary', orig)
+
+
+@case('the share token is written through a fixed temporary name',
+      lambda: _share_test(lambda ts: ts.test_state_write_ignores_a_planted_temp_file()))
+def _fixed_tmp_name():
+    import json as _json
+    import test_share  # noqa: F401 -- puts the share skill on the path
+    import share
+    orig = share.save_state
+
+    def fixed(state):
+        p = share.state_path()
+        tmp = p + '.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            _json.dump(state, fh, indent=1)
+        os.replace(tmp, p)
+    share.save_state = fixed
+    return lambda: setattr(share, 'save_state', orig)
+
 
 def main():
     print(f'{len(CASES)} mutations\n')

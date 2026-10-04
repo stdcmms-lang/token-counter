@@ -540,8 +540,10 @@ def test_transport():
               rc == 0 and [c[0] for c in Stub.calls[n:]] == ['POST'], str(Stub.calls[n:]))
 
         rc, out, _ = _run(root, home, '--api', api, '--yes', '--style', 'matisse')
+        # Marked as chosen, so it opens in it over a style a reader remembered elsewhere.
         check('--style is the style the shared page opens in',
-              rc == 0 and '<html lang="en" data-style="matisse">' in _page(_last('PUT'))
+              rc == 0 and '<html lang="en" data-style="matisse" data-style-set>'
+              in _page(_last('PUT'))
               and 'data-next="nocturne"' in _page(_last('PUT')), out)
 
         n = len(Stub.calls)
@@ -588,6 +590,53 @@ def test_transport():
     check('an unreachable server is reported, not raised', rc == 6 and 'could not reach' in err, err)
 
 
+def test_latency_floor_across_cutoff():
+    """The first response of the month sent is still floored by the end of the one before
+    it, though that one is older than the month and is not sent itself."""
+    now_s = datetime.datetime(2026, 10, 1, tzinfo=datetime.timezone.utc).timestamp()
+    cut = now_s - share.LATENCY_DAYS * 86400
+    iso = lambda x: (datetime.datetime.fromtimestamp(x, datetime.timezone.utc)
+                     .isoformat().replace('+00:00', 'Z'))
+    base = {'model': 'm', 'effort': 'e', 'turn': 0, 'usage': {'output_tokens': 1}}
+    rows = [dict(base, req_ts=iso(cut - 100), ts=iso(cut - 5)),
+            dict(base, req_ts=iso(cut - 50), ts=iso(cut + 20))]   # no input since: 25 s
+    lat = share.latency_summary({'a': {'turn_starts': []}}, {'a': rows}, now_s)
+    r = (lat or {}).get('responses') or {}
+    check('a response just inside the month is timed from the previous response\'s end',
+          r.get('n') == 1 and r.get('median_s') == 25.0, str(lat))
+
+
+def test_state_write_ignores_a_planted_temp_file():
+    """The share token goes through a new file of its own: a symlink left at a fixed
+    temporary name is never followed."""
+    home = tempfile.mkdtemp()
+    keep, keep_out = os.environ.get('CODEX_HOME'), list(share.reportcli._OUT_DIR)
+    os.environ['CODEX_HOME'] = home
+    share.reportcli._OUT_DIR.clear()
+    try:
+        p = share.state_path()
+        victim = os.path.join(tempfile.mkdtemp(), 'victim')
+        open(victim, 'w').close()
+        try:
+            os.symlink(victim, p + '.tmp')
+        except (OSError, NotImplementedError):
+            return                              # no symlinks here; nothing to plant
+        share.save_state({'endpoints': {'x': {'token': 'SECRET-TOKEN'}}})
+        with open(victim, encoding='utf-8') as fh:
+            leaked = fh.read()
+        got = share.load_state()
+        mode = stat.S_IMODE(os.stat(p).st_mode)
+    finally:
+        share.reportcli._OUT_DIR[:] = keep_out
+        if keep is None:
+            os.environ.pop('CODEX_HOME', None)
+        else:
+            os.environ['CODEX_HOME'] = keep
+    check('the share token is never written through a file planted at a fixed name',
+          leaked == '' and got['endpoints']['x']['token'] == 'SECRET-TOKEN'
+          and (mode == 0o600 or os.name == 'nt'), f'{leaked!r} {oct(mode)}')
+
+
 def main():
     test_payload_shape()
     test_payload_agrees_with_the_report()
@@ -598,6 +647,8 @@ def main():
     test_latency()
     test_api_value()
     test_transport()
+    test_latency_floor_across_cutoff()
+    test_state_write_ignores_a_planted_temp_file()
     bad = sum(1 for _, ok, _ in RESULTS if not ok)
     print(f'\n{len(RESULTS) - bad}/{len(RESULTS)} passed')
     return 1 if bad else 0

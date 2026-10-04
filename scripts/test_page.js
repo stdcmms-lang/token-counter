@@ -369,11 +369,13 @@ const verts = v => { const o = []; for (let i = 0; i < v.length; i += N3.VS) o.p
 // 3. zoom: horizontal only, both charts, pie included
 const before = { rl: rlHost.innerHTML, bars: transforms() };
 const mid = (DOM[0] + DOM[1]) / 2;
-run(`setSpan((VIEW[1]-VIEW[0])/8, ${mid}, L+PLOT/2)`);
+// A quarter: the fixture spans six days, and an eighth would be under the one-day floor.
+run(`setSpan((VIEW[1]-VIEW[0])/4, ${mid}, L+PLOT/2)`);
 flush();
 const view = run('VIEW');
 check('zooming shrinks the visible span',
-      Math.abs((view[1] - view[0]) - (DOM[1] - DOM[0]) / 8) < 1, `span=${view[1] - view[0]}`);
+      (DOM[1] - DOM[0]) / 4 > run('MIN_SPAN')
+      && Math.abs((view[1] - view[0]) - (DOM[1] - DOM[0]) / 4) < 1, `span=${view[1] - view[0]}`);
 const axisOf = s => (s.match(/text-anchor="end"[^>]*>([^<]+)</g) || []).join('|');
 check('the value axis is untouched by zooming',
       axisOf(before.rl) === axisOf(rlHost.innerHTML),
@@ -459,6 +461,33 @@ check('a phone still gets readable ticks, the same ones in every time chart',
 check('nothing is drawn outside the narrow plot area',
       tm1.every(t => +t.split('=')[0] >= run('L') - 0.5
                      && +t.split('=')[0] <= run('W') - run('RM') + 0.5), JSON.stringify(tm1));
+
+// 8. the style the page opens in: one named with --style beats one remembered from another
+// report; without one, the remembered style beats the default; the URL hash beats both.
+function openedIn(rootAttrs, remembered, hash) {
+  const stored = remembered ? { 'tc-style': remembered } : {};
+  const root = Object.assign(node(Object.assign({}, rootAttrs)),
+    { hasAttribute(k) { return this.attrs[k] !== undefined; } });
+  const c = Object.assign({}, ctx, {
+    document: Object.assign({}, ctx.document, { documentElement: root, addEventListener() {} }),
+    localStorage: { getItem: k => (k in stored ? stored[k] : null), setItem(k, v) { stored[k] = v; } },
+    location: { hash: hash || '' },
+    history: { replaceState() {} },
+  });
+  c.window = c; c.globalThis = c;
+  vm.createContext(c);
+  scripts.forEach(src => vm.runInContext(src, c));
+  return root.getAttribute('data-style');
+}
+const chosen = { 'data-style': 'matisse', 'data-style-set': '' };
+check('a page rendered with --style opens in it, over a style remembered elsewhere',
+      openedIn(chosen, 'nocturne') === 'matisse', openedIn(chosen, 'nocturne'));
+check('without --style, the remembered style wins over the default',
+      openedIn({ 'data-style': 'clinical' }, 'nocturne') === 'nocturne',
+      openedIn({ 'data-style': 'clinical' }, 'nocturne'));
+check('the style in the URL hash wins over both',
+      openedIn(chosen, 'nocturne', '#style=clinical') === 'clinical',
+      openedIn(chosen, 'nocturne', '#style=clinical'));
 
 console.log(bad ? `\n${bad} FAILED` : `\n${'all page checks passed'}`);
 process.exit(bad ? 1 : 0);

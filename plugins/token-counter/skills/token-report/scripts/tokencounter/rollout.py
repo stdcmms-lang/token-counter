@@ -22,12 +22,20 @@ USAGE_HINTS = (b'token_usage_record', b'token_count')
 META_HINT = b'session_meta'
 
 
+def codex_home():
+    """Codex's state directory.  ``CODEX_HOME`` moves it, and users do move it.
+
+    The one place it is resolved: the corpus, ``auth.json``, the index and tiktoken's
+    private install all live under it, and a copy of this rule that drifted would split them
+    across two directories.
+    """
+    return os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')
+
+
 def sessions_root(override=None):
     if override:
         return override
-    env = os.environ.get('CODEX_HOME')
-    home = env if env else os.path.join(os.path.expanduser('~'), '.codex')
-    return os.path.join(home, 'sessions')
+    return os.path.join(codex_home(), 'sessions')
 
 
 def file_date(path):
@@ -41,7 +49,8 @@ def file_date(path):
 
 def discover(root=None, since=None, until=None):
     """Rollout paths, oldest first.  `since`/`until` are inclusive ``YYYY-MM-DD``."""
-    pat = os.path.join(sessions_root(root), '**', 'rollout-*.jsonl')
+    # Escaped: a `[`, `*` or `?` in the root is part of a directory name, not a pattern.
+    pat = os.path.join(glob.escape(sessions_root(root)), '**', 'rollout-*.jsonl')
     out = []
     for p in glob.iglob(pat, recursive=True):
         d = file_date(p)

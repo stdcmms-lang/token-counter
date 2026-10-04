@@ -47,7 +47,9 @@ def installed_root():
         d = os.path.join(base, market, 'token-counter')
         if not os.path.isdir(d):
             continue
-        vers = sorted(v for v in os.listdir(d) if os.path.isdir(os.path.join(d, v)))
+        # By version number, not by string: '1.10.0' is newer than '1.9.0'.
+        vers = sorted((v for v in os.listdir(d) if os.path.isdir(os.path.join(d, v))),
+                      key=_version_key)
         if vers:
             found[market] = os.path.join(d, vers[-1])
     orphans = sorted(m for m in found if m != MARKET)
@@ -55,6 +57,12 @@ def installed_root():
         print(f'note: not checked, cached under another marketplace: {", ".join(orphans)}',
               file=sys.stderr)
     return found.get(MARKET)
+
+
+def _version_key(v):
+    """A sort key under which numeric parts compare as numbers, so '1.10.0' > '1.9.0', and
+    any other part sorts after them, as text."""
+    return tuple((0, int(p), '') if p.isdigit() else (1, 0, p) for p in v.split('.'))
 
 
 def digests(root):

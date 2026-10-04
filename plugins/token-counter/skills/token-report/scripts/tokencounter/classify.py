@@ -35,11 +35,16 @@ OUTPUT_ITEMS = frozenset({'reasoning', 'function_call', 'custom_tool_call',
 
 
 def item_role(payload):
-    """``'input'`` or ``'output'`` -- which side of the model call produced this item."""
+    """``'input'`` or ``'output'`` -- which side of the model call produced this item.
+
+    Anything the model emits as a ``*_call`` is output, as `worker._timing_side` reads it:
+    a ``web_search_call`` between a response's reasoning and its message is part of that
+    response, and calling it input split the response's own output into its prompt.
+    """
     t = payload.get('type')
     if t == 'message':
         return 'output' if payload.get('role') == 'assistant' else 'input'
-    if t in OUTPUT_ITEMS:
+    if t in OUTPUT_ITEMS or (isinstance(t, str) and t.endswith('_call')):
         return 'output'
     return 'input'
 

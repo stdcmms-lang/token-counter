@@ -60,17 +60,57 @@ def _sha256(path):
     return h.hexdigest()
 
 
+def _install(stage, origin):
+    """Move `stage` over the vendored file if it is the expected blob; delete it if not.
+
+    Checked before it replaces anything: a cache directory under a shared temp directory can
+    hold whatever another user put there, and a download can be cut short.
+    """
+    digest = _sha256(stage)
+    if digest != EXPECTED_SHA256:
+        os.remove(stage)
+        print(f'  rejected {origin}: sha256 {digest}, expected {EXPECTED_SHA256}',
+              file=sys.stderr)
+        return False
+    os.chmod(stage, 0o644)                  # mkstemp's 0600 is for the staging, not the asset
+    os.replace(stage, VENDOR)
+    return True
+
+
 def fetch():
-    os.makedirs(os.path.dirname(VENDOR), exist_ok=True)
+    """Vendor the blob from a cache or the URL.  The existing file is replaced only by one
+    whose sha256 matches; returns whether it was."""
+    d = os.path.dirname(VENDOR)
+    os.makedirs(d, exist_ok=True)
+
+    def stage():
+        fd, path = tempfile.mkstemp(prefix='.o200k-', suffix='.tmp', dir=d)
+        return os.fdopen(fd, 'wb'), path
+
     for src in _cache_candidates():
-        shutil.copyfile(src, VENDOR)
-        print(f'vendored from cache: {src}')
-        return
+        out, path = stage()
+        try:
+            with out, open(src, 'rb') as fh:
+                shutil.copyfileobj(fh, out)
+        except OSError:
+            os.remove(path)
+            continue
+        if _install(path, src):
+            print(f'vendored from cache: {src}')
+            return True
     import urllib.request
     print(f'downloading {VOCAB_URL} ...')
-    with urllib.request.urlopen(VOCAB_URL, timeout=60) as r, open(VENDOR, 'wb') as fh:
-        shutil.copyfileobj(r, fh)
+    out, path = stage()
+    try:
+        with out, urllib.request.urlopen(VOCAB_URL, timeout=60) as r:
+            shutil.copyfileobj(r, out)
+    except BaseException:
+        os.remove(path)
+        raise
+    if not _install(path, VOCAB_URL):
+        return False
     print('downloaded')
+    return True
 
 
 def verify():
@@ -111,8 +151,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--verify', action='store_true', help='verify only, do not fetch')
     a = ap.parse_args()
-    if not a.verify:
-        fetch()
+    if not a.verify and not fetch():
+        print(f'nothing vendored; {VENDOR} is unchanged', file=sys.stderr)
+        sys.exit(1)
     sys.exit(0 if verify() else 1)
 
 

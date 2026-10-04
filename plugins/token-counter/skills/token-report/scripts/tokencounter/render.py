@@ -315,7 +315,7 @@ const HOUR = 3600, DAY = 86400;
 const SCN = new Map();              // host -> {svg: () => element, vb: [w, h], clip, list, plot}
 const GLH = {dirty(){}};            // replaced by the WebGL layer once it is running
 const S3H = {dirty(){}};            // replaced by the 3D scene once it is running
-const varOf = f => (/var\((--[\w-]+)\)/.exec(f||'') || [])[1] || f;
+const varOf = f => (/var\\((--[\\w-]+)\\)/.exec(f||'') || [])[1] || f;
 function marks(host, svg, vb, clip, list, plot){
   if(list) SCN.set(host, {svg, vb, clip, list, plot}); else SCN.delete(host);
   GLH.dirty();
@@ -407,6 +407,8 @@ function axis(h, top, bot, tk, grid = true){
 // ---- chart 1: cumulative tokens per weekly limit window ------------------------------
 const RL = D.rate_limits || {};
 const WINS = RL.windows || [];
+// The window the limit chart draws: the weekly one, or the longest the logs quote without it.
+const LIMIT = (RL.name || 'weekly') + ' limit';
 // cum_points are [t, cumulative input, cumulative uncached, cumulative output], and a fifth
 // column, cumulative input counted with tiktoken, when the report counted it: the curve then
 // draws that input, beside Codex's output.  Input and output are summed rather than drawn
@@ -437,7 +439,7 @@ function drawRL(tk){
   const yp = p => H-B - (p/100)*(H-B-T);
 
   let s = `<svg viewBox="0 0 ${W} ${H}" data-h="${H}" data-t="${T}" data-b="${B}" role="img" `+
-          `aria-label="cumulative tokens per weekly limit window">`;
+          `aria-label="cumulative tokens per ${LIMIT} window">`;
   s += `<defs><clipPath id="tcclip-rl"><rect x="${L}" y="0" width="${PLOT}" height="${H}"/>`+
        `</clipPath></defs>`;
   // horizontal guides + left axis (measured) + right axis (reported)
@@ -1906,7 +1908,7 @@ const N3 = (()=>{
     const G = Geo(), W = [], glass = [], hits = [], PW = info.pw || N3PW;
     const [px, py, pw, ph] = rec.plot, H = WIN_H, zb = -FIN/2 - .45;
     const at = p => [(p[0] - px)/pw, (py + ph - p[1])/ph];
-    const lg = legendLines([{s: 'cumulative tokens', c: '--uncached'}, {s: 'weekly limit', c: '--warn'}],
+    const lg = legendLines([{s: 'cumulative tokens', c: '--uncached'}, {s: LIMIT, c: '--warn'}],
                            0, PW, cx.measure);
     let bx = stone(G, cx, -2.3, PW + 1.5, -1.5, 1.35, lg.rows);
     legendOn(G, W, cx, lg, 1.35);
@@ -2587,9 +2589,9 @@ void main(){
     content: 'What filled the window',
     models: TK ? 'Input by model' : 'Recorded input by model',
   };
-  const NAMES = {ledger: 'The numbers', windows: 'Weekly limit windows', daily: 'Daily input',
-                 latency: 'Response time', content: 'What filled the window',
-                 models: 'Input by model'};
+  const NAMES = {ledger: 'The numbers', windows: LIMIT[0].toUpperCase() + LIMIT.slice(1) + ' windows',
+                 daily: 'Daily input', latency: 'Response time',
+                 content: 'What filled the window', models: 'Input by model'};
   function exhibits(){
     EX.length = 0;
     const panels = document.querySelectorAll('.wrap > .panel');
@@ -3263,11 +3265,15 @@ function initStyles(){
   let id = null;
   const m = /style=([a-z]+)/.exec((typeof location !== 'undefined' && location.hash) || '');
   if(m) id = m[1];
+  // A page rendered with --style opens in it: the style was asked for by name, and a pick
+  // remembered from another report must not override it.  Without one, the remembered pick
+  // wins over the default.
+  const own = STYLES.findIndex(s=>s[0] === (ROOT.getAttribute && ROOT.getAttribute('data-style')));
+  const pinned = ROOT.hasAttribute && ROOT.hasAttribute('data-style-set');
+  if(!id && pinned && own >= 0) id = STYLES[own][0];
   if(!id){ try{ id = localStorage.getItem('tc-style'); }catch(_){} }
   // A style this page no longer carries (a bookmark, or one remembered from an older
-  // report) falls back to the one the page was rendered in: the first, or the style the
-  // sharer picked for a shared page, whose readers have nothing remembered.
-  const own = STYLES.findIndex(s=>s[0] === (ROOT.getAttribute && ROOT.getAttribute('data-style')));
+  // report) falls back to the one the page was rendered in.
   const i = STYLES.findIndex(s=>s[0] === id);
   applyStyle(i >= 0 ? i : Math.max(own, 0));
   const btn = byId('stylebtn');
@@ -3284,6 +3290,19 @@ initStyles();
 
 def esc(s):
     return html.escape('' if s is None else str(s), quote=True)
+
+
+def limit_name(rl):
+    """What to call the rate-limit window the report draws: ``weekly``, or, in logs that
+    quote no weekly window, the length of the longest one they do (``5-hour``)."""
+    wm = rl.get('window_minutes')
+    if rl.get('weekly', True) or not isinstance(wm, int) or wm <= 0:
+        return 'weekly'
+    if wm % 1440 == 0:
+        return 'daily' if wm == 1440 else f'{wm // 1440}-day'
+    if wm % 60 == 0:
+        return f'{wm // 60}-hour'
+    return f'{wm}-minute'
 
 
 def rel(seconds):
@@ -3403,9 +3422,10 @@ def _domain(model):
             lo = t if lo is None else min(lo, t)
             hi = t if hi is None else max(hi, t)
 
+    # Not the wall clock: a report whose data ends in the past, by --until or by a long
+    # break, would otherwise stretch to today and squeeze every chart into its left edge.
     rl = model.get('rate_limits') or {}
     if rl.get('available'):
-        seen(rl.get('now'))
         for w in (rl.get('windows') or []):
             seen(w.get('reset_at'))
             for p in (w.get('cum_points') or []):
@@ -3657,17 +3677,29 @@ def render(model, public=False, style=None):
     domain = _domain(model)
 
     # The weekly figure is the server's own percentage, not a token count of ours, and it
-    # keeps that wording so a reader cannot take it for something this page measured.
+    # keeps that wording so a reader cannot take it for something this page measured.  Once
+    # its window has reset, the last reading describes a week that is over, and nothing has
+    # been read since: it is not shown as the current figure.
     cur = rl.get('current') or {}
+    limit = limit_name(rl)
     wk_pct = cur.get('last_pct')
     wk_next, wk_now = cur.get('resets_at'), rl.get('now')
-    wk_note = (f'resets in {rel(wk_next - wk_now)}'
-               if (wk_now and wk_next and wk_next > wk_now) else 'reported by the server')
+    if cur.get('expired'):
+        wk_pct = None
+        wk_note = (f'reset {rel(wk_now - wk_next)} ago &middot; no reading since'
+                   if (wk_now and wk_next) else 'reset since the last reading')
+    else:
+        wk_note = (f'resets in {rel(wk_next - wk_now)}'
+                   if (wk_now and wk_next and wk_next > wk_now) else 'reported by the server')
 
     sc = model.get('scope') or {}
     cat_note = None
     if sc.get('tokenizer_note'):
-        cat_note = (f'Not counted: {sc["tokenizer_note"]} Every other figure on this page '
+        # The note is an exception's first line, and those name paths on this machine: the
+        # vocabulary's, the install directory's.  A public page says only what happened.
+        why = ('the tokenizer was not available when this page was built.' if public
+               else sc['tokenizer_note'])
+        cat_note = (f'Not counted: {why} Every other figure on this page '
                     f'comes from the usage records and is unaffected.')
     elif sc.get('metrics_only'):
         cat_note = ('Not counted: this report was produced with --metrics-only, which reads '
@@ -3738,7 +3770,7 @@ def render(model, public=False, style=None):
              else f"{big(t['cached'])} cached"),
     ] + [x for x in (api_tile(model.get('api_value')),) if x] + [
         tile('Sessions', f"{t['sessions']:,}", f"{t['threads']:,} threads"),
-    ] + top_tile + lat_tile + ([tile('Weekly limit used',
+    ] + top_tile + lat_tile + ([tile(f'{limit[0].upper()}{limit[1:]} limit used',
                '&mdash;' if wk_pct is None else f'{wk_pct:g}%', wk_note)]
          if rl.get('available') else []))
 
@@ -3750,7 +3782,7 @@ def render(model, public=False, style=None):
   <div class="chart" id="rlchart"></div>
   <div class="legend">
     <span><i style="background:var(--uncached)"></i>cumulative tokens</span>
-    <span><i style="background:var(--warn)"></i>weekly limit</span>
+    <span><i style="background:var(--warn)"></i>{limit} limit</span>
   </div>
 </div>"""
 
@@ -3764,6 +3796,7 @@ def render(model, public=False, style=None):
         'gl_styles': GL_STYLES,
         'scene_styles': SCENE_STYLES,
         'rate_limits': {
+            'name': limit,
             'now': rl.get('now'),
             'current': rl.get('current'),
             'windows': [{k: w[k] for k in
@@ -3804,8 +3837,12 @@ def render(model, public=False, style=None):
     at = next((i for i, (sid, _) in enumerate(STYLES) if sid == style), 0)
     first, nxt = STYLES[at], STYLES[(at + 1) % len(STYLES)]
 
+    # Marked when --style chose it, so the page opens in it over a style remembered from
+    # another report (initStyles).
+    pinned = ' data-style-set' if any(sid == style for sid, _ in STYLES) else ''
+
     return f"""<!doctype html>
-<html lang="en" data-style="{first[0]}"><head><meta charset="utf-8">
+<html lang="en" data-style="{first[0]}"{pinned}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Codex Token Report</title>
 <style>{CSS}{STYLE_CSS}</style></head><body>

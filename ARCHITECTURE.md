@@ -1321,11 +1321,13 @@ user gets opens the same page they have locally. `share.py` runs token-report's 
 with `--public --no-open`, which renders the page from the full pipeline (the index is used
 as usual) with two differences: the top-session tile drops its note, the session id prefix
 and the `cwd` basename, the only strings on the page taken from the machine rather than
-counted; and `auth.json` is not read. The response-time chart goes with the rest: the
+counted, and a tokenizer failure is described without the exception text, which names the
+vocabulary's or the install directory's path; and `auth.json` is not read. The response-time chart goes with the rest: the
 median and p90 response time per day, and the rate-limit events per day (§5.6). Tool names, which come from the machine
 (MCP servers among them), are on neither page. The dry run and the token-share skill both
-list the chart among what is published. `--style` bakes the style the page opens in, which the
-page falls back to when the reader has none remembered. The page is written to disk on the
+list the chart among what is published. `--style` bakes the style the page opens in, over any
+style the reader has remembered from another report; without it, a remembered style wins over
+the first. The page is written to disk on the
 dry run, so what goes public can be opened first, and on `--yes` it is gzipped and `PUT`
 after the numbers under the same token. tokenusage.dev serves it with
 `Content-Security-Policy: sandbox allow-scripts` and nothing else allowed, so it runs with an
@@ -1368,7 +1370,9 @@ reconciliation, images, the window table, the data-quality counters — is repor
 1. Tiles — input (counted with tiktoken, §5.7), output, cache hit, the API value (§5.9;
    only when something was priced, noting how many responses were not), sessions, the
    longest session, the median response time (§5.8), and the weekly limit as the server's
-   own reported percentage
+   own reported percentage -- or, once that window has reset with no reading since, how long
+   ago it reset. Logs that quote no weekly window get the longest one they do, named for its
+   length ("5-hour limit"), here and on the chart
 2. **Cumulative tokens per weekly limit window** — tiktoken input plus Codex's output,
    restarting at zero at every reset, with the reported percentage overlaid (§5.6)
 3. **Daily input**, stacked by the model that was charged for it
@@ -1704,6 +1708,35 @@ Structural, not deferred work.
 
 ## 10. Revision history
 
+**Rev 23** — after a review of the whole repository. Every finding was checked against the
+code, and the ones a test could reach were reproduced first. Plugin 1.8.1.
+
+| Change | Cause |
+| --- | --- |
+| The temp-directory fallback is `token-counter-<uid>`, made 0700, and trusted only while it is a real directory this user owns that no one else can open (`deps.private`); `activate` skips it otherwise, and `out_dir` then takes a fresh `mkdtemp` | **Security:** the fallback was `/tmp/token-counter` on Linux, which any local user could create first. `activate` searched it on every run that had no tiktoken yet, so a planted `tiktoken` package ran as the victim; the report, the index and the share token were written there too |
+| A report that cannot be written goes to a new `mkstemp` file; the share token through one too | Both opened a fixed name in a directory others could write, following any symlink planted at it |
+| `scripts/fetch_vocab.py` stages the blob and checks its sha256 before it replaces the vendored file | A cache blob from the shared `$TMPDIR/data-gym-cache`, or a cut-off download, replaced the vocabulary first and failed the check after, leaving it in the tree |
+| The worker catches an error per record, counts it as `malformed_records` (a damage counter, carried out of the window too), and goes on | One record with a list for `info`, a string for `usage`, a list `call_id` or `response_id`, or a dict model raised out of the pool; `_run` read the exception as a pool that could not start, re-ran the corpus serially, and failed the run anyway. The test for a list `call_id` ran only the ledger pass |
+| A rate-limit reset of `Infinity` counts as no reset | `int(inf)` raised, and took the record's usage with it |
+| A fork child's opening burst does not feed `note_rate_limits` (`rate_limit_replayed`); `analyze.replay_end` is the one rule `limit_events` and `turn_aborts` read | The replayed snapshots were dated at the child's creation: with the parent in range they read as late and overlapping readings, and with it out of range (`--since`) they opened a spurious window and moved the current one's reset |
+| On the explicit stream only a charged record ends the response in flight | A zero/zero context snapshot cleared the frozen start, as the legacy stream had been fixed not to, and a tool output after it became the next response's start |
+| A turn's effort is its own `turn_context`'s, or none | A turn on a model with no reasoning effort was labelled with the previous turn's |
+| `classify.item_role` reads any `*_call` as output | A `web_search_call` between a response's reasoning and its message split the trailing output run, so the reasoning summary was counted into that response's own prompt |
+| The tool-call replay boundary applies only to files that declare a parent | A non-fork file's tool calls before its first timed response (an interrupted first turn) were dropped as `tool_replayed` |
+| `latency.build(since=)`: share times the last month with every row as a floor | Rows were filtered first, so the month's first response in each file lost the previous response's end as the floor of its start |
+| The page's domain no longer includes the wall clock | A report with `--until` in the past, or after a long break, stretched every chart to today. The page test had zoomed by a factor that only cleared the one-day minimum because of it |
+| The limit tile and stdout line say a window has reset rather than showing its last reading; a non-weekly window is named for its length | After a reset with no use since, the tile read "87%, reported by the server" and stdout gave a "next" reset in the past. Logs with only a 5-hour window were labelled weekly |
+| The public page's tokenizer note carries no exception text | The first line named the vocabulary's path, so a damaged install published the home directory to `/r/<handle>` |
+| `--session` matches within the date range, and says so when nothing in it matches | A session outside the range made a prefix ambiguous, and one wholly outside it produced an empty report with no message |
+| `glob.escape` on the sessions root | A `[` in `CODEX_HOME` turned the root into a pattern and the corpus read as empty |
+| `--style` marks the page (`data-style-set`) and the page opens in it over a remembered style; without it, the remembered style still wins | `report.py --style matisse` opened in whatever style the browser last remembered |
+| The page's script has no escape Python does not know | `\(` and `\w` in a non-raw string are a SyntaxWarning on 3.12 and later |
+| Worker processes are capped at 61 on Windows | `ProcessPoolExecutor` refuses more there, and the refusal sent `--fast` on a large machine down the single-process path |
+| `encoding.load` caches by resolved path; the extractor fingerprint is computed only when the index is used | The vocabulary was built twice per run, and `--no-cache` and `--metrics-only` paid for a key they never used |
+| `rollout.codex_home` is the one place `CODEX_HOME` is read | Five copies of the rule, in `report`, `rollout`, `deps`, `index` and `account` |
+| `verify_install.py` picks the newest installed version by number | `'1.9.0'` sorted after `'1.10.0'` |
+| The token-report skill no longer mentions a zoom toolbar; the manifest no longer says "no pricing" or that the report never leaves the machine | The toolbar was removed in Rev 13; the API value (Rev 22) and the published page (1.3.0) made the other two false |
+
 **Rev 22** — the API value: recorded usage at OpenAI's API list prices (§5.9). Plugin 1.8.0.
 
 | Change | Cause |
@@ -2024,9 +2057,9 @@ Built, installed and verified as `token-counter@jack-beanstalk-2022` on Codex CL
 | Check | Result |
 | --- | --- |
 | `scripts/test_ledger.py` | **13/13** response-identity regressions, including both round-3 counterexamples, the round-4 compaction case, cross-file `response_id` replay and the round-6 sibling counterexample |
-| `scripts/test_mutations.py` | **43/43** historical defects reverted, each caught by the test named for it |
-| `scripts/test_pipeline.py` | **317/317** across tokenizer (the vocabulary parsed from its own file, on Python 3.8 too), installing `tiktoken` on first use, input counted with tiktoken, classification, images, attribution, prompt reconstruction, windowed ledger scope, cache-key derivation, the index end to end (archiving, `--rebuild` against a held file), damage counting, rate-limit windows, cumulative-curve monotonicity, day spans across clock changes, account identity, failure modes, output escaping, the renderer and its three styles (Nocturne's validated palette pinned), the shared time axis the three charts are drawn on, response, turn and tool time with the pace estimate (§5.8), rate-limit events per day with a fork child's replayed copies left out (§5.6), and the API value: the price table loaded offline and refused whole when malformed, the per-response arithmetic, tier and search extraction on both passes, the first turn's inferred tier, a fork child's replayed searches, aborted turns, the price-page parser on a saved copy, the tile and `--prices` (§5.9) |
-| `node scripts/test_page.js` | **62/62** on the page's own embedded script: shared ticks across all three time charts, the rate-limit event bars on their own axis, shared viewport, x-only zoom, drag distance, clamping, the pie recomposing with the range, and the Nocturne scene's solids and stage built from the same marks |
+| `scripts/test_mutations.py` | **62/62** historical defects reverted, each caught by the test named for it |
+| `scripts/test_pipeline.py` | **354/354** across tokenizer (the vocabulary parsed from its own file, on Python 3.8 too), installing `tiktoken` on first use, input counted with tiktoken, classification, images, attribution, prompt reconstruction, windowed ledger scope, cache-key derivation, the index end to end (archiving, `--rebuild` against a held file), damage counting, rate-limit windows, cumulative-curve monotonicity, day spans across clock changes, account identity, failure modes, output escaping, the renderer and its three styles (Nocturne's validated palette pinned), the shared time axis the three charts are drawn on, response, turn and tool time with the pace estimate (§5.8), rate-limit events per day with a fork child's replayed copies left out (§5.6), and the API value: the price table loaded offline and refused whole when malformed, the per-response arithmetic, tier and search extraction on both passes, the first turn's inferred tier, a fork child's replayed searches, aborted turns, the price-page parser on a saved copy, the tile and `--prices` (§5.9) |
+| `node scripts/test_page.js` | **65/65** on the page's own embedded script: shared ticks across all three time charts, the rate-limit event bars on their own axis, shared viewport, x-only zoom, drag distance, clamping, the pie recomposing with the range, and the Nocturne scene's solids and stage built from the same marks |
 | `scripts/fetch_vocab.py --verify` | sha256 `446a9538...`, 200,019 ranks, token-identical to stock `o200k_base` |
 | Offline tokenizer | builds and encodes with `socket.socket` hard-blocked in a fresh process |
 | `scripts/diag_fork.py` | the known fork pair matches for exactly **37 records at parent index 95** — an independent witness for the §2.5 rule |

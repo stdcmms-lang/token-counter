@@ -73,9 +73,17 @@ def read_ranks(path):
     return ranks
 
 
-@functools.lru_cache(maxsize=2)
 def load(path=None):
-    """Build the encoding. Cached per process; costs ~0.3s on first call."""
+    """Build the encoding. Cached per process; costs ~0.3s on first call.
+
+    Cached by the file `path` resolves to, not by the argument: ``load()`` and
+    ``load(vendor_path())`` are one vocabulary, and keying on the raw argument built it twice.
+    """
+    return _load(vendor_path(path))
+
+
+@functools.lru_cache(maxsize=2)
+def _load(p):
     try:
         from tiktoken import Encoding
     except ImportError as exc:                      # pragma: no cover - environment issue
@@ -85,7 +93,6 @@ def load(path=None):
             f'(original error: {exc})'
         ) from exc
 
-    p = vendor_path(path)
     if not os.path.isfile(p):
         raise FileNotFoundError(
             f'vendored BPE not found at {p}.\n'
@@ -112,3 +119,7 @@ def load(path=None):
         mergeable_ranks=ranks,
         special_tokens=O200K_SPECIAL,
     )
+
+
+# The tests stand a cleared cache in for a new process, through the public name.
+load.cache_clear = _load.cache_clear

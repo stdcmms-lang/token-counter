@@ -174,7 +174,8 @@ response times and pace estimates, the hour of day, turn time and time per tool 
 The three time charts share one axis, so a day in one is the same x in the others.
 Scrolling, dragging or pinching any of them zooms and pans all three — horizontally only, the value axes do
 not move — and the composition chart recomposes over whatever range is on screen. It works
-the same on a phone; the toolbar above the charts has zoom and reset buttons either way.
+the same on a phone. There are no zoom or reset buttons: a double-click on any of the charts
+returns all three to the full range.
 
 Everything else the run produces — sessions, reconciliation, images, the per-window table and
 the data-quality counters — is in `--json` and the stdout summary, not on the page.

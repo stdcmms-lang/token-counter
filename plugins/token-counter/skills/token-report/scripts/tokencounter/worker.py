@@ -14,6 +14,7 @@ import bisect
 import collections
 import datetime
 import hashlib
+import math
 import os
 import time
 
@@ -176,9 +177,9 @@ def _timing_side(payload):
 
     Narrower than `classify.item_role`, which counts anything it does not recognise as
     input -- right for attributing prompt content, wrong for timing, where an unknown item
-    written while a response streams (a web search the model ran, local bookkeeping) would
-    pass for the request's start.  Only known inputs move the start; unknown items are
-    ignored; anything the model emits (``*_call``) counts as output.
+    written while a response streams (local bookkeeping, say) would pass for the request's
+    start.  Only known inputs move the start; unknown items are ignored; anything the model
+    emits (``*_call``) counts as output.
     """
     t = payload.get('type')
     if t == 'message':
@@ -283,7 +284,7 @@ def note_rate_limits(rl, ts, acc, ctr):
             rs = w.get('resets_in_seconds')
             ra = (t + rs) if (isinstance(rs, (int, float)) and not isinstance(rs, bool)
                               and t is not None) else None
-        if ra is None:
+        if ra is None or not math.isfinite(ra):
             ctr['rate_limit_no_reset'] += 1
             continue
         ra = int(ra)
@@ -490,235 +491,263 @@ def _extract(path, full, vocab=None, num_threads=1):
                 return
 
     for outer, payload, ts, _raw_len in records():
-        if burst_open:
-            rt = epoch(ts)
-            if rt is not None:
-                if burst_end is not None and rt - burst_end > OPENING_BURST_GAP_S:
-                    burst_open = False
-                    # A fork child's opening burst is its parent's replayed history.  A
-                    # search the parent made after its last usage record -- before an
-                    # interruption -- would otherwise land on the child's first response,
-                    # and the parent's own file already counts it.
-                    if res['parent_thread_id']:
-                        ws_pending['explicit'] = ws_pending['legacy'] = 0
-                else:
-                    burst_end = rt if burst_end is None else max(burst_end, rt)
-
-        if outer == 'session_meta':
-            if res['session_id'] is None:
-                res['session_id'] = payload.get('session_id')
-                res['thread_id'] = payload.get('id') or payload.get('session_id')
-                res['started_at'] = ts or payload.get('timestamp')
-                res['cli_version'] = payload.get('cli_version')
-                res['cwd'] = payload.get('cwd')
-                res['originator'] = payload.get('originator')
-                res['context_window'] = payload.get('context_window')
-                res['parent_thread_id'] = (payload.get('parent_thread_id')
-                                           or payload.get('forked_from_id'))
-                res['agent_role'] = payload.get('agent_role') or payload.get('agent_nickname')
-                if payload.get('dynamic_tools'):
-                    ctr['dynamic_tools_files'] = 1
-                if full:
-                    segs, imgs = classify.session_meta(payload)
-                    if segs:
-                        add_item('session_meta', segs, imgs, 'input')
-            else:
-                ctr['second_session_meta'] += 1
-                if payload.get('id') and payload.get('id') != res['thread_id']:
-                    ctr['fork_header'] += 1
-            continue
-
-        if outer == 'turn_context':
-            turn_index += 1
-            res['turn_starts'].append(ts)
-            anchor_ts = ts
-            if _ends_response(outer, payload):
-                req_ts, req_frozen = None, False
-            model = payload.get('model') or model
-            effort = payload.get('effort') or effort
-            if model:
-                res['models'][model] = res['models'].get(model, 0) + 1
-            if effort:
-                res['efforts'][effort] = res['efforts'].get(effort, 0) + 1
-            if not payload.get('root_turn_id'):
-                ctr['turn_context_no_root'] += 1
-            ctr['turn_context'] += 1
-            continue
-
-        if outer == 'world_state':
-            anchor_ts = ts                          # part of the next prompt, like any input
-            if full:
-                segs, imgs = classify.world_state(payload)
-                if segs:
-                    add_item('world_state', segs, imgs, 'input')
-            continue
-
-        if outer == 'compacted':
-            compact_ts = ts
-            ctr['compacted'] += 1
-            if payload.get('latest_token_usage_record'):
-                ctr['compacted_usage_copies'] += 1      # saved state, never charged
-            if full:
-                rh = payload.get('replacement_history')
-                if isinstance(rh, list):
-                    items.append({'kind': 'COMPACT_RESET', 'role': 'input', 'idx': [],
-                                  'opaque': {}, 'img_lo': 0, 'img_hi': 0,
-                                  'turn': turn_index})
-                    pending.append(len(items) - 1)
-                    for el in rh:
-                        if isinstance(el, dict):
-                            segs, imgs = classify.response_item(el)
-                            add_item(el.get('type') or 'message', segs, imgs,
-                                     classify.item_role(el))
-            continue
-
-        if outer == 'token_usage_record':
-            rid = payload.get('response_id')
-            if rid is not None:
-                if rid in seen_rid:
-                    ctr['explicit_dup_response_id'] += 1
-                    continue
-                seen_rid.add(rid)
-            u = payload.get('usage') or {}
-            # A context snapshot is never charged, so searches wait for the next record.
-            ws = 0
-            if _is_model_call(None, u, None, 'explicit'):
-                ws, ws_pending['explicit'] = ws_pending['explicit'], 0
-            rec = {'usage': u, 'ts': ts, 'model': model, 'effort': effort,
-                   'tier': tier, 'web_search': ws,
-                   'response_id': rid, 'i': len(res['explicit']),
-                   'req_ts': _request_start(req_ts, req_frozen, anchor_ts),
-                   'turn': turn_index}
-            req_ts, req_frozen = None, False
-            res['explicit'].append(rec)
-            usage_marks.append(('explicit', rec['i'], list(pending)))
-            pending = []
-            continue
-
-        if outer == 'event_msg':
-            et = payload.get('type')
-            if et == 'thread_settings_applied':
-                got = _service_tier(payload)
-                if got is not None:
-                    tier = got
-                    if first_tier is None:
-                        first_tier = got
-                    ctr['thread_settings'] += 1
-                continue
-            if et == 'turn_aborted':
+        try:
+            if burst_open:
                 rt = epoch(ts)
-                if rt is None:
-                    ctr['turn_abort_no_time'] += 1
+                if rt is not None:
+                    if burst_end is not None and rt - burst_end > OPENING_BURST_GAP_S:
+                        burst_open = False
+                        # A fork child's opening burst is its parent's replayed history.  A
+                        # search the parent made after its last usage record -- before an
+                        # interruption -- would otherwise land on the child's first response,
+                        # and the parent's own file already counts it.
+                        if res['parent_thread_id']:
+                            ws_pending['explicit'] = ws_pending['legacy'] = 0
+                    else:
+                        burst_end = rt if burst_end is None else max(burst_end, rt)
+            # Inside a fork child's opening burst: the parent's history, replayed and restamped.
+            replay = burst_open and bool(res['parent_thread_id'])
+
+            if outer == 'session_meta':
+                if res['session_id'] is None:
+                    res['session_id'] = payload.get('session_id')
+                    res['thread_id'] = payload.get('id') or payload.get('session_id')
+                    res['started_at'] = ts or payload.get('timestamp')
+                    res['cli_version'] = payload.get('cli_version')
+                    res['cwd'] = payload.get('cwd')
+                    res['originator'] = payload.get('originator')
+                    res['context_window'] = payload.get('context_window')
+                    res['parent_thread_id'] = (payload.get('parent_thread_id')
+                                               or payload.get('forked_from_id'))
+                    res['agent_role'] = payload.get('agent_role') or payload.get('agent_nickname')
+                    if payload.get('dynamic_tools'):
+                        ctr['dynamic_tools_files'] = 1
+                    if full:
+                        segs, imgs = classify.session_meta(payload)
+                        if segs:
+                            add_item('session_meta', segs, imgs, 'input')
                 else:
-                    res['turn_aborts'].append(round(rt, 3))
-            if et != 'token_count':
+                    ctr['second_session_meta'] += 1
+                    if payload.get('id') and payload.get('id') != res['thread_id']:
+                        ctr['fork_header'] += 1
+                continue
+
+            if outer == 'turn_context':
+                turn_index += 1
+                res['turn_starts'].append(ts)
+                anchor_ts = ts
                 if _ends_response(outer, payload):
                     req_ts, req_frozen = None, False
+                model = payload.get('model') or model
+                # Per turn, not carried: a turn on a model with no reasoning effort writes it as
+                # null or leaves it out, and the previous turn's effort is not this one's.
+                effort = payload.get('effort')
+                if not isinstance(model, str):
+                    model = None
+                if not isinstance(effort, str) or not effort:
+                    effort = None
+                if model:
+                    res['models'][model] = res['models'].get(model, 0) + 1
+                if effort:
+                    res['efforts'][effort] = res['efforts'].get(effort, 0) + 1
+                if not payload.get('root_turn_id'):
+                    ctr['turn_context_no_root'] += 1
+                ctr['turn_context'] += 1
                 continue
-            # Before the usage checks below, not after: a `token_count` with `info: null`
-            # still carries a rate-limit snapshot, and there are enough of them that
-            # reading limits only on the usage path would lose window boundaries.
-            rl = payload.get('rate_limits')
-            note_rate_limits(rl, ts, rl_acc, ctr)
-            # One event a snapshot, whichever window it names: a refused request is one
-            # refusal even when both windows are full.
-            if isinstance(rl, dict) and rl.get('rate_limit_reached_type'):
-                rt = epoch(ts)
-                if rt is None:
-                    ctr['limit_event_no_time'] += 1
-                else:
-                    res['limit_events'].append(round(rt, 3))
-            info = payload.get('info')
-            if not info:
-                ctr['info_null'] += 1
-                continue
-            last = info.get('last_token_usage')
-            if not last:
-                ctr['info_no_last'] += 1
-                continue
-            total = info.get('total_token_usage') or {}
-            ti = total.get('input_tokens')
-            if prev_total_in is not None and ti is not None and ti < prev_total_in:
-                ctr['cumulative_decrease'] += 1
-            if ti is not None:
-                prev_total_in = ti
-            li = last.get('input_tokens') or 0
-            lo_ = last.get('output_tokens') or 0
-            lt = last.get('total_tokens') or 0
-            if lt != li + lo_:
-                ctr['arith_violation'] += 1
-            state = (tuple(last.get(f) for f in ('input_tokens', 'output_tokens',
-                                                 'total_tokens')),)
-            if state == prev_state:
-                ctr['raw_repeat'] += 1
-            prev_state = state
-            rec = {'last': last, 'total': total, 'ts': ts, 'model': model,
-                   'effort': effort, 'tier': tier, 'web_search': 0,
-                   'i': len(res['legacy']),
-                   'req_ts': _request_start(req_ts, req_frozen, anchor_ts),
-                   'turn': turn_index}
-            # Only a record the ledger can charge ends a response.  A repeat of the previous
-            # state (a rate-limit refresh re-sending the last usage) or a context snapshot
-            # can arrive mid-stream, and clearing the frozen start there would date the next
-            # charged response from whatever input came in between.
-            full_state = _state_of(rec, last)
-            if not (full_state == prev_full
-                    or (li == 0 and lo_ == 0 and lt > 0)):
-                req_ts, req_frozen = None, False
-                rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0
-            prev_full = full_state
-            res['legacy'].append(rec)
-            usage_marks.append(('legacy', rec['i'], list(pending)))
-            pending = []
-            continue
 
-        if outer == 'response_item':
-            t = payload.get('type')
-            if t == 'web_search_call':
-                ws_pending['explicit'] += 1
-                ws_pending['legacy'] += 1
-                ctr['web_search_calls'] += 1
-            # Timing reads items on both passes; it needs only their side and their stamps.
-            side = _timing_side(payload)
-            if side == 'output':
-                if not req_frozen:
-                    req_ts, req_frozen = _request_anchor(anchor_ts, compact_ts), True
-            elif side == 'input':
-                anchor_ts = ts
-            if t in TOOL_CALLS:
-                cid = payload.get('call_id')
-                if isinstance(cid, str) and cid:
-                    name = payload.get('name')
-                    call_at[cid] = (name if isinstance(name, str) and name else t, ts)
-            elif t in TOOL_OUTPUTS:
-                cid = payload.get('call_id')
-                got = call_at.pop(cid, None) if isinstance(cid, str) else None
-                if got is None:
-                    ctr['tool_output_unmatched'] += 1
-                else:
-                    # The call's own time travels with it: a fork child's replayed history
-                    # is stamped with the child's creation time, and only the reader of the
-                    # ledger knows where the child's own work begins (tokencounter.latency).
-                    a, b = epoch(got[1]), epoch(ts)
-                    res['tool_times'].append(
-                        [got[0], None if a is None else round(a, 3),
-                         None if a is None or b is None else round(b - a, 3)])
-            if not full:
+            if outer == 'world_state':
+                anchor_ts = ts                          # part of the next prompt, like any input
+                if full:
+                    segs, imgs = classify.world_state(payload)
+                    if segs:
+                        add_item('world_state', segs, imgs, 'input')
                 continue
-            segs, imgs = classify.response_item(payload)
-            tool = None
-            if t in TOOL_CALLS:
-                tool = payload.get('name')
-                cid = payload.get('call_id')
-                if cid and tool:
-                    call_names[cid] = tool
-            elif t in TOOL_OUTPUTS:
-                tool = call_names.get(payload.get('call_id'))
-            elif t == 'reasoning':
-                for _s in (payload.get('summary') or []):
-                    ctr['reasoning_summaries'] += 1
-            add_item(t or 'other', segs, imgs, classify.item_role(payload), tool)
-            continue
+
+            if outer == 'compacted':
+                compact_ts = ts
+                ctr['compacted'] += 1
+                if payload.get('latest_token_usage_record'):
+                    ctr['compacted_usage_copies'] += 1      # saved state, never charged
+                if full:
+                    rh = payload.get('replacement_history')
+                    if isinstance(rh, list):
+                        items.append({'kind': 'COMPACT_RESET', 'role': 'input', 'idx': [],
+                                      'opaque': {}, 'img_lo': 0, 'img_hi': 0,
+                                      'turn': turn_index})
+                        pending.append(len(items) - 1)
+                        for el in rh:
+                            if isinstance(el, dict):
+                                segs, imgs = classify.response_item(el)
+                                add_item(el.get('type') or 'message', segs, imgs,
+                                         classify.item_role(el))
+                continue
+
+            if outer == 'token_usage_record':
+                rid = payload.get('response_id')
+                if rid is not None:
+                    if rid in seen_rid:
+                        ctr['explicit_dup_response_id'] += 1
+                        continue
+                    seen_rid.add(rid)
+                u = payload.get('usage') or {}
+                # A context snapshot is never charged, so searches wait for the next record, and
+                # it does not end a response: it can arrive mid-stream, as on the legacy stream
+                # below, and clearing the frozen start there would date the next charged
+                # response from whatever input came in between.
+                ws = 0
+                charged_call = _is_model_call(None, u, None, 'explicit')
+                if charged_call:
+                    ws, ws_pending['explicit'] = ws_pending['explicit'], 0
+                rec = {'usage': u, 'ts': ts, 'model': model, 'effort': effort,
+                       'tier': tier, 'web_search': ws,
+                       'response_id': rid, 'i': len(res['explicit']),
+                       'req_ts': _request_start(req_ts, req_frozen, anchor_ts),
+                       'turn': turn_index}
+                if charged_call:
+                    req_ts, req_frozen = None, False
+                res['explicit'].append(rec)
+                usage_marks.append(('explicit', rec['i'], list(pending)))
+                pending = []
+                continue
+
+            if outer == 'event_msg':
+                et = payload.get('type')
+                if et == 'thread_settings_applied':
+                    got = _service_tier(payload)
+                    if got is not None:
+                        tier = got
+                        if first_tier is None:
+                            first_tier = got
+                        ctr['thread_settings'] += 1
+                    continue
+                if et == 'turn_aborted':
+                    rt = epoch(ts)
+                    if rt is None:
+                        ctr['turn_abort_no_time'] += 1
+                    else:
+                        res['turn_aborts'].append(round(rt, 3))
+                if et != 'token_count':
+                    if _ends_response(outer, payload):
+                        req_ts, req_frozen = None, False
+                    continue
+                # Before the usage checks below, not after: a `token_count` with `info: null`
+                # still carries a rate-limit snapshot, and there are enough of them that
+                # reading limits only on the usage path would lose window boundaries.
+                rl = payload.get('rate_limits')
+                if replay:
+                    # The parent's snapshot, restamped with this file's creation time: noting it
+                    # would date an old window's reading now, and open a spurious window when the
+                    # parent is out of range.  The parent's own file has it, correctly dated.
+                    if isinstance(rl, dict):
+                        ctr['rate_limit_replayed'] += 1
+                else:
+                    note_rate_limits(rl, ts, rl_acc, ctr)
+                # One event a snapshot, whichever window it names: a refused request is one
+                # refusal even when both windows are full.
+                if isinstance(rl, dict) and rl.get('rate_limit_reached_type'):
+                    rt = epoch(ts)
+                    if rt is None:
+                        ctr['limit_event_no_time'] += 1
+                    else:
+                        res['limit_events'].append(round(rt, 3))
+                info = payload.get('info')
+                if not info:
+                    ctr['info_null'] += 1
+                    continue
+                last = info.get('last_token_usage')
+                if not last:
+                    ctr['info_no_last'] += 1
+                    continue
+                total = info.get('total_token_usage') or {}
+                ti = total.get('input_tokens')
+                if prev_total_in is not None and ti is not None and ti < prev_total_in:
+                    ctr['cumulative_decrease'] += 1
+                if ti is not None:
+                    prev_total_in = ti
+                li = last.get('input_tokens') or 0
+                lo_ = last.get('output_tokens') or 0
+                lt = last.get('total_tokens') or 0
+                if lt != li + lo_:
+                    ctr['arith_violation'] += 1
+                state = (tuple(last.get(f) for f in ('input_tokens', 'output_tokens',
+                                                     'total_tokens')),)
+                if state == prev_state:
+                    ctr['raw_repeat'] += 1
+                prev_state = state
+                rec = {'last': last, 'total': total, 'ts': ts, 'model': model,
+                       'effort': effort, 'tier': tier, 'web_search': 0,
+                       'i': len(res['legacy']),
+                       'req_ts': _request_start(req_ts, req_frozen, anchor_ts),
+                       'turn': turn_index}
+                # Only a record the ledger can charge ends a response.  A repeat of the previous
+                # state (a rate-limit refresh re-sending the last usage) or a context snapshot
+                # can arrive mid-stream, and clearing the frozen start there would date the next
+                # charged response from whatever input came in between.
+                full_state = _state_of(rec, last)
+                if not (full_state == prev_full
+                        or (li == 0 and lo_ == 0 and lt > 0)):
+                    req_ts, req_frozen = None, False
+                    rec['web_search'], ws_pending['legacy'] = ws_pending['legacy'], 0
+                prev_full = full_state
+                res['legacy'].append(rec)
+                usage_marks.append(('legacy', rec['i'], list(pending)))
+                pending = []
+                continue
+
+            if outer == 'response_item':
+                t = payload.get('type')
+                if t == 'web_search_call':
+                    ws_pending['explicit'] += 1
+                    ws_pending['legacy'] += 1
+                    ctr['web_search_calls'] += 1
+                # Timing reads items on both passes; it needs only their side and their stamps.
+                side = _timing_side(payload)
+                if side == 'output':
+                    if not req_frozen:
+                        req_ts, req_frozen = _request_anchor(anchor_ts, compact_ts), True
+                elif side == 'input':
+                    anchor_ts = ts
+                if t in TOOL_CALLS:
+                    cid = payload.get('call_id')
+                    if isinstance(cid, str) and cid:
+                        name = payload.get('name')
+                        call_at[cid] = (name if isinstance(name, str) and name else t, ts)
+                elif t in TOOL_OUTPUTS:
+                    cid = payload.get('call_id')
+                    got = call_at.pop(cid, None) if isinstance(cid, str) else None
+                    if got is None:
+                        ctr['tool_output_unmatched'] += 1
+                    else:
+                        # The call's own time travels with it: a fork child's replayed history
+                        # is stamped with the child's creation time, and only the reader of the
+                        # ledger knows where the child's own work begins (tokencounter.latency).
+                        a, b = epoch(got[1]), epoch(ts)
+                        res['tool_times'].append(
+                            [got[0], None if a is None else round(a, 3),
+                             None if a is None or b is None else round(b - a, 3)])
+                if not full:
+                    continue
+                segs, imgs = classify.response_item(payload)
+                tool = None
+                if t in TOOL_CALLS:
+                    tool = payload.get('name')
+                    tool = tool if isinstance(tool, str) and tool else None
+                    cid = payload.get('call_id')
+                    if isinstance(cid, str) and cid and tool:
+                        call_names[cid] = tool
+                elif t in TOOL_OUTPUTS:
+                    cid = payload.get('call_id')
+                    tool = call_names.get(cid) if isinstance(cid, str) else None
+                elif t == 'reasoning':
+                    for _s in (payload.get('summary') or []):
+                        ctr['reasoning_summaries'] += 1
+                add_item(t or 'other', segs, imgs, classify.item_role(payload), tool)
+                continue
+        except Exception:                           # noqa: BLE001 - one record, counted
+            # A record of an unexpected shape -- a list where an object belongs, an
+            # unhashable id -- costs that record, not the file: a pool worker that raises
+            # takes the whole run with it.  Lost, so counted, as a line that does not parse is.
+            ctr['malformed_records'] += 1
 
     _backfill_tier(res, first_tier)
     res['rate_limits'] = finish_rate_limits(rl_acc)

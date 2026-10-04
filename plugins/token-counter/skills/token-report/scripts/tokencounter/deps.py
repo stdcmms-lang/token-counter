@@ -18,10 +18,13 @@ degrades as it always has (ARCHITECTURE.md section 4.2).
 import importlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
 import tempfile
+
+from . import rollout
 
 REQUIREMENT = 'tiktoken'
 ENV_OFF = 'TOKEN_COUNTER_NO_INSTALL'
@@ -45,10 +48,42 @@ def roots():
 
     ``report.out_dir()`` picks from this same list, so the directory an install lands in and
     the ones `activate` searches cannot drift apart.
+
+    The fallback is named for this user, and is used only while `private` vouches for it.
+    On Linux the temp directory is ``/tmp``, which every local user can write: a fixed name
+    there is one anyone can create first, and then fill with a ``tiktoken`` for `activate`
+    to import, or with a symlink for the report, the index or the share token to be
+    written through.
     """
-    home = os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')
-    return [os.path.join(home, 'token-counter'),
-            os.path.join(tempfile.gettempdir(), 'token-counter')]
+    getuid = getattr(os, 'getuid', None)
+    name = 'token-counter' if getuid is None else f'token-counter-{getuid()}'
+    return [os.path.join(rollout.codex_home(), 'token-counter'),
+            os.path.join(tempfile.gettempdir(), name)]
+
+
+def private(d, create=False):
+    """`d` when it is a directory that only this user can reach, otherwise ``None``.
+
+    Not a symlink, owned by this user, and closed to the group and to others.  `create`
+    makes it first, 0700, when it does not exist.  Windows has no uid to compare; its temp
+    directory is already the user's own, so there a plain directory is enough.
+    """
+    if create:
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            return None
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    if hasattr(os, 'getuid') and (st.st_uid != os.getuid() or st.st_mode & 0o077):
+        return None
+    return d
 
 
 def lib_dir(root):
@@ -95,7 +130,12 @@ def activate(root=None):
     set, and an older ``regex`` elsewhere on the path must not be mixed into it.  Worker
     processes inherit ``sys.path`` under fork, spawn and forkserver alike.
     """
-    for r in ([root] if root else roots()):
+    if root:
+        search = [root]
+    else:
+        home, tmp = roots()
+        search = [home] + ([tmp] if private(tmp) else [])
+    for r in search:
         d = lib_dir(r)
         if os.path.isdir(os.path.join(d, 'tiktoken')):
             if d not in sys.path:

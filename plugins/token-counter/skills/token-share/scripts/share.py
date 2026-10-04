@@ -30,6 +30,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -40,7 +41,7 @@ sys.path.insert(0, REPORT)
 import report as reportcli  # noqa: E402  -- enforces the Python floor on import
 from tokencounter import analyze, latency, ledger, pricing, render, rollout, worker  # noqa: E402
 
-CLIENT = {'name': 'token-counter', 'version': '1.8.0'}
+CLIENT = {'name': 'token-counter', 'version': '1.8.1'}
 SCHEMA = 1
 DEFAULT_API = 'https://tokenusage.dev/api'
 
@@ -137,12 +138,9 @@ def latency_summary(results, charged, now_s):
     day-level span and aggregates leave: no tool names, and no UTC hour or weekday buckets,
     which the server leaves optional because they say when a sharer works.
     """
-    cutoff = now_s - LATENCY_DAYS * 86400
-    recent = {}
-    for path, rows in charged.items():
-        recent[path] = [r for r in rows
-                        if (worker.epoch(r.get('ts')) or 0) >= cutoff]
-    lat, _ = latency.build(results, recent)
+    # Every row goes in, and `since` leaves the older ones out of the figures: the first
+    # recent response in a file is still floored by the end of the one before it.
+    lat, _ = latency.build(results, charged, since=now_s - LATENCY_DAYS * 86400)
     if not lat.get('available') or not lat.get('daily'):
         return None
     dates = [d['date'] for d in lat['daily']]
@@ -410,13 +408,21 @@ def load_state():
 
 
 def save_state(state):
-    """The token is a credential: written 0600, and never printed."""
+    """The token is a credential: written 0600, and never printed.
+
+    Through a new file of its own (`mkstemp` creates it exclusively, 0600), never a fixed
+    temporary name: opening one of those follows whatever symlink is already there.
+    """
     p = state_path()
-    tmp = p + '.tmp'
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-        json.dump(state, fh, indent=1)
-    os.replace(tmp, p)
+    fd, tmp = tempfile.mkstemp(prefix='.share-', suffix='.tmp', dir=os.path.dirname(p))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(state, fh, indent=1)
+        os.replace(tmp, p)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 def endpoint_state(state, api):
