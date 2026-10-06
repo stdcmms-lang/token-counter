@@ -41,7 +41,7 @@ sys.path.insert(0, REPORT)
 import report as reportcli  # noqa: E402  -- enforces the Python floor on import
 from tokencounter import analyze, latency, ledger, pricing, render, rollout, worker  # noqa: E402
 
-CLIENT = {'name': 'token-counter', 'version': '1.8.1'}
+CLIENT = {'name': 'token-counter', 'version': '1.9.0'}
 SCHEMA = 1
 DEFAULT_API = 'https://tokenusage.dev/api'
 

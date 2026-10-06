@@ -248,7 +248,7 @@ def _downsample(points, limit=MAX_POINTS):
     return keep
 
 
-def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS):
+def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS, usd=None):
     """Reported weekly-limit windows, with locally measured token usage inside each.
 
     Two independent series meet here and are deliberately never combined into one number:
@@ -275,6 +275,12 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS):
     ``cum_points`` row a fifth column holding its running total.  `newest` bounds how many
     of the newest windows are returned (the chart's worth by default); ``None`` returns all
     of them.
+
+    `usd` is ``[(epoch, dollars), ...]``, each charged response's API value, with dollars
+    ``None`` for a response that could not be priced.  Each window gains ``usd`` and
+    ``usd_points``, its running total ``[t, dollars]``, split at the same boundaries as the
+    tokens.  A window none of whose responses was priced has ``usd`` None and no points,
+    rather than a total of $0.
     """
     now = now if now is not None else datetime.datetime.now().timestamp()
     merged = _merge_window_quotes(files)
@@ -365,6 +371,20 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS):
             point += (a['tiktoken_input'],)
         series[i].append(point)
 
+    usd_acc = [0.0 for _ in live]
+    usd_seen = [False for _ in live]
+    usd_series = [[] for _ in live]
+    for t, v in _in_time_order(usd or []):
+        if not keys:
+            break
+        j = bisect.bisect_right(keys, t) - 1
+        if j < 0:
+            continue
+        i = bounds[j][1]
+        usd_acc[i] += v or 0.0
+        usd_seen[i] = usd_seen[i] or v is not None
+        usd_series[i].append((t, usd_acc[i]))
+
     out_windows = []
     for i, c in enumerate(live):
         pts = [[int(p[0])] + list(p[1:]) for p in _bucket_last(series[i])]
@@ -392,6 +412,10 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS):
                            **({'tiktoken_input': a['tiktoken_input']} if counted else {})),
             'pct_points': pct,
             'cum_points': _downsample(pts),
+            'usd': round(usd_acc[i], 6) if usd_seen[i] else None,
+            'usd_points': _downsample([[int(p[0]), round(p[1], 6)]
+                                       for p in _bucket_last(usd_series[i])])
+                          if usd_seen[i] else [],
         })
 
     idle = [c for c in clusters if c['idle']]
@@ -695,6 +719,7 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
         quality.setdefault(_k, 0)
     # Charged responses on the absolute timeline, for the per-window cumulative curve.
     resp_ts = []
+    resp_usd = []
     # Input is shown as tiktoken counted it wherever a response has a reconstructed prompt
     # (§5.7); output, cached and the limit stay Codex's.  Both are accumulated, because
     # whether any response was counted is only known at the end, and share.py and the JSON
@@ -790,6 +815,7 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
             if usd is not None and not (usd or api.priced > priced_before):
                 usd = None                  # unpriced, and no search fee either
             resp_ts.append((worker.epoch(r.get('ts')), inp, cch, out, tk))
+            resp_usd.append((resp_ts[-1][0], usd))
             totals['responses'] += 1
             totals['input'] += inp
             totals['cached'] += cch
@@ -908,7 +934,7 @@ def analyze(files, charged, counters, scope=None, focus=None, extra_quality=None
         'generated_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
         'scope': scope or {},
         'account': account or {'available': False, 'reason': 'not requested'},
-        'rate_limits': rate_limit_windows(files, resp_ts),
+        'rate_limits': rate_limit_windows(files, resp_ts, usd=resp_usd),
         'limit_events': lim,
         # What the recorded usage would cost at OpenAI's API list prices (tokencounter.pricing).
         'api_value': api.model(files),

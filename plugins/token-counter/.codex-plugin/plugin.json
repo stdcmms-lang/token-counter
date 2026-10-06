@@ -1,6 +1,6 @@
 {
   "name": "token-counter",
-  "version": "1.8.1",
+  "version": "1.9.0",
   "description": "Independently tokenize your Codex session history and report cached vs uncached input as a local HTML dashboard; optionally share the totals to the tokenusage.dev leaderboard.",
   "author": {
     "name": "hao.he@giga.ai"

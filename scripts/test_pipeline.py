@@ -2274,6 +2274,19 @@ def test_rate_limit_windows():
           w0['peak_pct'] == 90.0 and w0['late_peak'] == 90.0,
           f"peak={w0['peak_pct']} late_peak={w0['late_peak']}")
 
+    # The chart draws each window's API value.  An unpriced response adds nothing to a
+    # window that has a price, and a window with no priced response has no dollars at all,
+    # never a $0 that reads as free.
+    priced = analyze.rate_limit_windows(
+        data, [], now=t1 + 3600,
+        usd=[(w0['reset_at'] + 60, 1.25), (w0['reset_at'] + 120, None),
+             (w0['reset_at'] + 180, 0.5), (w1['reset_at'] + 60, None)])['windows']
+    check('API value is accumulated per window, and an unpriced window has none',
+          priced[0]['usd'] == 1.75 and priced[0]['usd_points'][-1][1] == 1.75
+          and priced[1]['usd'] is None and priced[1]['usd_points'] == [],
+          f"{priced[0]['usd']} {priced[0]['usd_points']} / "
+          f"{priced[1]['usd']} {priced[1]['usd_points']}")
+
     # The weekly window sat in `secondary` behind a 5-hour `primary` in older CLI builds.
     d2, *_ = _rl_corpus(slot='secondary')
     data2 = {p: worker.process(p) for p in rollout.discover(d2)}

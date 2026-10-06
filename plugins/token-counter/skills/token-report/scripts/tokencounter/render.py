@@ -286,6 +286,12 @@ const big = n => n==null ? '--'
   : Math.abs(n)>=1e9 ? (n/1e9).toFixed(2)+'B'
   : Math.abs(n)>=1e6 ? (n/1e6).toFixed(1)+'M'
   : Math.abs(n)>=1e3 ? (n/1e3).toFixed(1)+'K' : String(n);
+/** Dollars as render.usd writes them: cents under a thousand, whole dollars, then K and M.
+ *  `whole` drops the cents throughout, for an axis whose top is $100 or more. */
+const usd = (x, whole) => x==null ? '--'
+  : Math.abs(x)>=1e6 ? '$'+(x/1e6).toFixed(2)+'M'
+  : Math.abs(x)>=1e5 ? '$'+(x/1e3).toFixed(1)+'K'
+  : Math.abs(x)>=1e3 ? '$'+Math.round(x).toLocaleString('en-US') : '$'+x.toFixed(whole ? 0 : 2);
 const when = t => new Date(t*1000).toLocaleString([], {month:'short', day:'numeric',
                                                       hour:'2-digit', minute:'2-digit'});
 const day = t => new Date(t*1000).toLocaleDateString([], {month:'short', day:'numeric'});
@@ -404,26 +410,24 @@ function axis(h, top, bot, tk, grid = true){
   return s;
 }
 
-// ---- chart 1: cumulative tokens per weekly limit window ------------------------------
+// ---- chart 1: cumulative API value per weekly limit window ---------------------------
 const RL = D.rate_limits || {};
 const WINS = RL.windows || [];
 // The window the limit chart draws: the weekly one, or the longest the logs quote without it.
 const LIMIT = (RL.name || 'weekly') + ' limit';
-// cum_points are [t, cumulative input, cumulative uncached, cumulative output], and a fifth
-// column, cumulative input counted with tiktoken, when the report counted it: the curve then
-// draws that input, beside Codex's output.  Input and output are summed rather than drawn
-// apart: output is under 1% of input, so a second curve would sit flat on the axis and say
-// nothing.
+// The curve is a window's API value, usd_points [t, cumulative dollars]: tokens of different
+// models are priced differently, so a token count does not say what a week was worth.
+// No price table, no dollars: the windows then carry usd null and the value axis is blank.
+const USD = WINS.some(w => w.usd != null);
 const TK = D.input_source === 'tiktoken';
 const INPUT = TK ? 'input' : 'recorded input';
-const pick = p => (p.length > 4 ? p[4] : p[1]) + p[3];
-/** A window's input, as the curve draws it. */
+/** A window's input, as the tooltip states it. */
 const winInput = w => (TK && w.tokens.tiktoken_input != null)
   ? `input ${big(w.tokens.tiktoken_input)} (tiktoken)` : `recorded input ${big(w.tokens.input)}`;
 // Fixed over the corpus, never over the viewport: zoom moves the time axis and leaves the
 // value axis alone, so a curve keeps its height while the window slides under it.
 let VMAX = 0;
-WINS.forEach(w => (w.cum_points||[]).forEach(p => { VMAX = Math.max(VMAX, pick(p)); }));
+WINS.forEach(w => (w.usd_points||[]).forEach(p => { VMAX = Math.max(VMAX, p[1]); }));
 VMAX = VMAX || 1;
 
 function drawRL(tk){
@@ -439,14 +443,14 @@ function drawRL(tk){
   const yp = p => H-B - (p/100)*(H-B-T);
 
   let s = `<svg viewBox="0 0 ${W} ${H}" data-h="${H}" data-t="${T}" data-b="${B}" role="img" `+
-          `aria-label="cumulative tokens per ${LIMIT} window">`;
+          `aria-label="cumulative API value per ${LIMIT} window">`;
   s += `<defs><clipPath id="tcclip-rl"><rect x="${L}" y="0" width="${PLOT}" height="${H}"/>`+
        `</clipPath></defs>`;
   // horizontal guides + left axis (measured) + right axis (reported)
   [0,.25,.5,.75,1].forEach(f=>{
     const yy = y(VMAX*f);
     s += `<line x1="${L}" y1="${yy.toFixed(1)}" x2="${W-RM}" y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="1"/>`;
-    s += `<text x="${L-8}" y="${(yy+4).toFixed(1)}" text-anchor="end" fill="var(--dim)" font-size="11">${big(Math.round(VMAX*f))}</text>`;
+    if(USD) s += `<text x="${L-8}" y="${(yy+4).toFixed(1)}" text-anchor="end" fill="var(--dim)" font-size="11">${usd(VMAX*f, VMAX >= 100)}</text>`;
     s += `<text x="${W-RM+8}" y="${(yp(100*f)+4).toFixed(1)}" fill="var(--warn)" font-size="11">${Math.round(100*f)}%</text>`;
   });
   s += axis(H, T, B, tk);
@@ -458,7 +462,7 @@ function drawRL(tk){
   // label is drawn only where there is room for it.  The boundary line is always drawn.
   let lastLbl = -1e9;
   WINS.forEach((w, wi)=>{
-    const pts = w.cum_points||[], pcs = w.pct_points||[];
+    const pts = w.cum_points||[], pcs = w.pct_points||[], ups = w.usd_points||[];
     const start = w.reset_at!=null ? w.reset_at : (pts.length?pts[0][0]:null);
     if(start==null) return;
     let hi = start;
@@ -472,23 +476,32 @@ function drawRL(tk){
       lastLbl = X(start);
       s += `<text x="${(X(start)+3).toFixed(1)}" y="${T+10}" fill="var(--dim)" font-size="10">${esc(day(start))}</text>`;
     }
-    if(pts.length){
-      const line = [[X(start), y(0)]].concat(pts.map(p=>[X(p[0]), y(pick(p))]));
-      mk.push({t:'area', pts:line, base:y(0), c:'--uncached', a:.16, win:wi},
-              {t:'line', pts:line, w:1.8, c:'--uncached', win:wi});
-      const d = [`M ${X(start).toFixed(1)} ${y(0).toFixed(1)}`]
-        .concat(pts.map(p=>`L ${X(p[0]).toFixed(1)} ${y(pick(p)).toFixed(1)}`));
-      const last = pts[pts.length-1];
-      s += `<path d="${d.join(' ')} L ${X(last[0]).toFixed(1)} ${y(0).toFixed(1)} Z" `+
-           `fill="var(--uncached)" fill-opacity=".16" class="mk"/>`;
-      s += `<path d="${d.join(' ')}" fill="none" stroke="var(--uncached)" stroke-width="1.8" class="mk">`+
-           `<title>window opened ${esc(when(start))}\nreset quoted ${esc(w.resets_at_iso||'--')}\n`+
+    const tip = `<title>window opened ${esc(when(start))}\nreset quoted ${esc(w.resets_at_iso||'--')}\n`+
            `peak reported ${w.peak_pct==null?'--':w.peak_pct+'%'}\n`+
+           `API value ${usd(w.usd)}\n`+
            `${winInput(w)} over ${w.tokens.responses} responses\n`+
            `uncached ${big(w.tokens.uncached)} | output ${big(w.tokens.output)}`+
            (TK ? ' (recorded by Codex)' : '')+
            (w.late_points ? `\n${w.late_points} later reading(s) not drawn: the next window `+
-                            `had already opened` : '')+`</title></path>`;
+                            `had already opened` : '')+`</title>`;
+    if(ups.length){
+      const line = [[X(start), y(0)]].concat(ups.map(p=>[X(p[0]), y(p[1])]));
+      mk.push({t:'area', pts:line, base:y(0), c:'--uncached', a:.16, win:wi},
+              {t:'line', pts:line, w:1.8, c:'--uncached', win:wi});
+      const d = [`M ${X(start).toFixed(1)} ${y(0).toFixed(1)}`]
+        .concat(ups.map(p=>`L ${X(p[0]).toFixed(1)} ${y(p[1]).toFixed(1)}`));
+      const last = ups[ups.length-1];
+      s += `<path d="${d.join(' ')} L ${X(last[0]).toFixed(1)} ${y(0).toFixed(1)} Z" `+
+           `fill="var(--uncached)" fill-opacity=".16" class="mk"/>`;
+      s += `<path d="${d.join(' ')}" fill="none" stroke="var(--uncached)" stroke-width="1.8" class="mk">`+
+           `${tip}</path>`;
+    } else if(pts.length){
+      // Nothing in this window could be priced: no curve, rather than one claiming $0.  It
+      // keeps its tooltip, and a flat mark the scene hangs its reset and hover target on.
+      const x1 = X(pts[pts.length-1][0]);
+      mk.push({t:'area', pts:[[X(start), y(0)], [x1, y(0)]], base:y(0), c:'--uncached', a:.16, win:wi});
+      s += `<rect x="${X(start).toFixed(1)}" y="${T}" width="${Math.max(0, x1-X(start)).toFixed(1)}" `+
+           `height="${H-B-T}" fill="transparent">${tip}</rect>`;
     }
     if(pcs.length){
       const d = pcs.map((p,i)=>`${i?'L':'M'} ${X(p[0]).toFixed(1)} ${yp(p[1]).toFixed(1)}`);
@@ -1908,14 +1921,14 @@ const N3 = (()=>{
     const G = Geo(), W = [], glass = [], hits = [], PW = info.pw || N3PW;
     const [px, py, pw, ph] = rec.plot, H = WIN_H, zb = -FIN/2 - .45;
     const at = p => [(p[0] - px)/pw, (py + ph - p[1])/ph];
-    const lg = legendLines([{s: 'cumulative tokens', c: '--uncached'}, {s: LIMIT, c: '--warn'}],
+    const lg = legendLines([{s: 'cumulative API value', c: '--uncached'}, {s: LIMIT, c: '--warn'}],
                            0, PW, cx.measure);
     let bx = stone(G, cx, -2.3, PW + 1.5, -1.5, 1.35, lg.rows);
     legendOn(G, W, cx, lg, 1.35);
     for(const f of [0, .25, .5, .75, 1]){
       if(f) box(G, 0, f*H - .012, zb - .015, PW, f*H + .012, zb + .015, cx.col('--line'), -1, .5);
       const y = Math.max(.08, f*H - .1);                    // the zero sits on the stone, not in it
-      W.push(word(big(Math.round(info.vmax*f)), .3, -.3, y, zb, {al: 'r', c: '--dim'}));
+      if(USD) W.push(word(usd(info.vmax*f, info.vmax >= 100), .3, -.3, y, zb, {al: 'r', c: '--dim'}));
       W.push(word(Math.round(100*f) + '%', .3, PW + .3, y, zb, {c: '--warn'}));
     }
     let lastLbl = -1e9;
@@ -3075,7 +3088,7 @@ void main(){
       const w = WINS[hit.id];
       if(!w) return null;
       const t0 = w.reset_at != null ? w.reset_at : ((w.cum_points || [])[0] || [null])[0];
-      return [at(`window opened ${t0 == null ? '--' : when(t0)}  ·  peak reported ${w.peak_pct == null ? '--' : w.peak_pct + '%'}`, 0, '--fg'),
+      return [at(`window opened ${t0 == null ? '--' : when(t0)}  ·  API value ${usd(w.usd)}  ·  peak reported ${w.peak_pct == null ? '--' : w.peak_pct + '%'}`, 0, '--fg'),
               at(`${winInput(w)} over ${w.tokens.responses.toLocaleString()} responses  ·  uncached ${big(w.tokens.uncached)}`, 1, '--dim')];
     }
     if(ex.key === 'latency'){
@@ -3781,7 +3794,7 @@ def render(model, public=False, style=None):
         rl_chart = f"""<div class="panel">
   <div class="chart" id="rlchart"></div>
   <div class="legend">
-    <span><i style="background:var(--uncached)"></i>cumulative tokens</span>
+    <span><i style="background:var(--uncached)"></i>cumulative API value</span>
     <span><i style="background:var(--warn)"></i>{limit} limit</span>
   </div>
 </div>"""
@@ -3802,7 +3815,7 @@ def render(model, public=False, style=None):
             'windows': [{k: w[k] for k in
                          ('index', 'reset_at', 'reset_at_iso', 'resets_at', 'resets_at_iso',
                           'peak_pct', 'last_pct', 'tokens', 'pct_points', 'cum_points',
-                          'late_points')}
+                          'usd', 'usd_points', 'late_points')}
                         for w in (rl.get('windows') or [])],
         },
         'cats': {
