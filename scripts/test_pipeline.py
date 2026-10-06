@@ -3065,20 +3065,11 @@ def test_api_value_headline():
     page = render.render(model)
     tiles = page[page.index('class="tiles"'):page.index('</div>\n\n')]
     check('the API value is a headline tile, worded as a counterfactual',
-          f'<div class="k">API value</div><div class="v">{render.usd(av["usd"])}</div>' in tiles
-          and 'if billed at API list prices of Jan 2, 2026' in tiles
-          and '1 response unpriced' in tiles
-          and f'up to {render.usd(av["usd_high"])} if untiered responses ran in Fast mode'
-          in tiles, tiles[:700])
-    undated = render.render(dict(model, api_value=dict(av, prices={})))
-    check('a table with no date says so on the tile',
-          'if billed at API list prices of an unknown date' in undated)
+          f'<div class="k">API value</div><div class="v">{render.usd(av["usd"])}</div>'
+          '<div class="n">if billed at API price</div>' in tiles, tiles[:700])
     check('dollars are formatted to fit a tile',
           [render.usd(x) for x in (0.4, 12.345, 1234.5, 123_456, 2_345_678)]
           == ['$0.40', '$12.35', '$1,234', '$123.5K', '$2.35M'])
-    hostile = render.render(dict(model, api_value=dict(av, prices=dict(
-        av['prices'], as_of='<img src=x onerror=alert(1)>'))))
-    check('a hostile price-table date is escaped', '<img src=x' not in hostile)
 
     lines = cli.api_summary(av)
     check('stdout says the figure is not a bill, and what it left out',

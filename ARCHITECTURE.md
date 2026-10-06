@@ -1104,7 +1104,7 @@ and the constants used, in `method`.
 
 What the charged responses (§2.2) would cost if each were sent to the OpenAI API at its
 published list price. Not what anyone paid: a ChatGPT plan is not billed per token, and the
-page says "if billed at API list prices" under the figure.
+page says "if billed at API price" under the figure.
 
 **Per response, never from totals** (`tokencounter.pricing.price`), because the rate depends
 on the response:
@@ -1368,7 +1368,7 @@ reconciliation, images, the window table, the data-quality counters — is repor
 `--json` and the stdout summary, not here (rev 12).
 
 1. Tiles — input (counted with tiktoken, §5.7), output, cache hit, the API value (§5.9;
-   only when something was priced, noting how many responses were not), sessions, the
+   only when something was priced), sessions, the
    longest session, the median response time (§5.8), and the weekly limit as the server's
    own reported percentage -- or, once that window has reset with no reading since, how long
    ago it reset. Logs that quote no weekly window get the longest one they do, named for its

@@ -20,7 +20,6 @@ a chart's value axis never changes, so heights stay comparable at every zoom lev
 Every figure derived from inference rather than measurement carries a visible marker
 (ARCHITECTURE.md section 7).
 """
-import datetime
 import html
 import json
 import math
@@ -3375,35 +3374,16 @@ def usd(x):
     return f'${x:,.2f}'
 
 
-def _as_of(day):
-    """``2026-10-04`` -> ``Oct 4, 2026``; anything else as it came, escaped."""
-    if day is None or day == '':
-        return 'an unknown date'
-    try:
-        d = datetime.date.fromisoformat(str(day))
-    except ValueError:
-        return esc(str(day))
-    return f'{d.strftime("%b")} {d.day}, {d.year}'
-
-
 def api_tile(av):
     """The API value headline: what the recorded usage would cost at API list prices.
 
-    Worded as a counterfactual on the page itself ("if billed at API list prices"), since a
-    plan is not billed per token, and it says what it leaves out: responses it could not
-    price.  None when nothing was priced; `--json` and stdout say why.
+    Worded as a counterfactual on the page itself, since a plan is not billed per token.
+    What the figure leaves out -- unpriced responses, the Fast-mode upper bound, the price
+    table's date -- is on stdout and in `--json`.  None when nothing was priced.
     """
     if not (av or {}).get('available'):
         return None
-    note = f"if billed at API list prices of {_as_of((av.get('prices') or {}).get('as_of'))}"
-    if av.get('unpriced'):
-        note += f" &middot; {av['unpriced']:,} response{'' if av['unpriced'] == 1 else 's'} unpriced"
-    # The tier is unknown for a file with no settings snapshot; say what Fast would make it,
-    # when that moves the figure by more than rounding.
-    hi = av.get('usd_high')
-    if hi is not None and hi - av['usd'] >= max(0.01, 0.005 * av['usd']):
-        note += f" &middot; up to {usd(hi)} if untiered responses ran in Fast mode"
-    return tile('API value', usd(av['usd']), note)
+    return tile('API value', usd(av['usd']), 'if billed at API price')
 
 
 def tile(k, v, note=''):

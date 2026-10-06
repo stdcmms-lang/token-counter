@@ -171,8 +171,8 @@ the page words it as one. It is priced **per response**, from what Codex recorde
 - **the processing tier** Codex requested. Fast mode sends `priority`, which costs 2× or
   more. Codex records the thread's tier in the rollout, but never for a thread's first turn,
   which takes the tier recorded next and is counted as inferred. A thread with no record
-  at all, such as a one-turn `codex exec` run, is priced at standard. Beside it is what
-  those responses would cost in Fast mode;
+  at all, such as a one-turn `codex exec` run, is priced at standard. The terminal line
+  gives what those responses would cost in Fast mode;
 - **the prompt size.** Above 272K input tokens, models with long-context rates charge them
   for the whole request;
 - **OpenAI's input split.** Ordinary input, cached reads and cache writes each have their
@@ -196,7 +196,7 @@ python scripts/fetch_prices.py           # re-vendor from developers.openai.com/
 python scripts/fetch_prices.py --check   # how the vendored table differs from the live pages
 ```
 
-The table's date is on the tile. Codex models that the pricing page no longer lists, such as
+The table's date is on the terminal line. Codex models that the pricing page no longer lists, such as
 `gpt-5-codex`, `gpt-5.1-codex*` and `gpt-5.2-codex`, are priced from their own model pages.
 Those pages publish standard rates only. `--prices table.json` prices the usage with any
 table in the same format.
