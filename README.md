@@ -136,6 +136,10 @@ time the limit resets. Those resets are not on a seven-day grid — a window rea
 replaced, inside a single rollout file a minute later, by a fresh one resetting seven days
 from *that* instant — so boundaries are taken from where the reported percentage drops.
 
+To follow public Codex reset announcements, use the [Codex reset tracker](https://tokenusage.dev/resets).
+It tracks @thsottiaux's posts and offers text or email alerts. Check your Codex account
+for your personal reset times.
+
 The limit chart, the daily chart and the response-time chart are drawn on **one time
 axis**, and scrolling, dragging or pinching any one zooms and pans all three — horizontally
 only, so heights stay comparable — while the composition chart recomposes over whatever

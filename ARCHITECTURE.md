@@ -837,6 +837,11 @@ figure in the system that is *reported* rather than *measured*: nothing here der
 content. It is kept in its own structure and labelled as such on the page so it can never be
 mistaken for something this tool counted.
 
+Public Codex reset announcements are tracked separately by the
+[Codex reset tracker](https://tokenusage.dev/resets), which follows @thsottiaux's posts.
+Announcement timestamps describe source posts; the account windows below come from the
+rate-limit snapshots in the user's own logs.
+
 **Structure, verified by `scripts/verify_schema.py`:**
 
 | Claim | Observed |
