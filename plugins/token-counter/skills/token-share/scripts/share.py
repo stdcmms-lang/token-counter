@@ -93,8 +93,8 @@ def limit_windows(results, responses, now_s):
     server reported for it, beside the tokens measured here in the same span.
 
     The two series are sent side by side and never combined, as in the report (ARCHITECTURE
-    §5.6): this script asserts no tokens-per-percent rate. The server estimates one per plan
-    from many sharers' windows, and says how.
+    §5.6): this script asserts no tokens-per-percent rate. What tokenusage.dev derives from
+    many sharers' windows is its own, and it documents how.
 
     `responses` is ``[(epoch, input, cached, output), ...]``, the same charged, clamped rows
     the days are counted from, so a window can never hold more than the days do.

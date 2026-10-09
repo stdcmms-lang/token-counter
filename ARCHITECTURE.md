@@ -1306,9 +1306,9 @@ Since 1.2.0 the payload also carries every consumed weekly rate-limit window (up
 newest kept), as `rate_limit_windows` reconstructs it (§5.6): its start, the `plan_type` and
 the first and peak `used_percent` the server reported, and the tokens the ledger attributes
 to it. The two series travel side by side, as on the report's chart; `share.py` still
-asserts no tokens-per-percent rate. tokenusage.dev estimates one per plan from many sharers'
-recent windows and publishes how. The windows are built from the same clamped ledger rows
-as the days, so a window never holds more than the days do, which the server checks.
+asserts no tokens-per-percent rate. What tokenusage.dev derives from many sharers' windows is
+its own, and it documents how. The windows are built from the same clamped ledger rows as
+the days, so a window never holds more than the days do, which the server checks.
 
 The payload also carries `latency`, in the shape the server's contract defines (`from`/`to`,
 `responses`, `turns`, up to 50 `groups`): `latency.build` (§5.8) over the ledger rows of the

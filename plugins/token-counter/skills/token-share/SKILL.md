@@ -59,8 +59,8 @@ Sent: per-day counts (responses, recorded input, cached input, output, reasoning
 started); for each month the top sessions by active time and by tokens, each as a one-way
 hash of its id, start and end times, active time, token counts and the model name; and for
 each weekly rate-limit window, its start, the plan type and the percentages used that Codex
-logged in its rate-limit snapshots, and the tokens counted in it. tokenusage.dev uses the
-windows to estimate how many tokens each plan's weekly limit holds. Also, over the last 30 days of responses: how many were timed, and their median and p90
+logged in its rate-limit snapshots, and the tokens counted in it. tokenusage.dev analyses the
+windows across sharers. Also, over the last 30 days of responses: how many were timed, and their median and p90
 response time and turn time in seconds, in total and for each model and reasoning effort
 (no per-request times, no tool names, and no hour-of-day or weekday breakdown). And the API
 value token-report computes: what the usage would cost at OpenAI's API list prices, per day

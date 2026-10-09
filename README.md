@@ -111,7 +111,7 @@ the leaderboard's. Sent: per-day responses, recorded input, cached input, output
 and reasoning tokens, plus each month's top sessions by active time and by tokens (a one-way
 hash of the session id, start and end times, active time, counts and model name), plus each
 weekly rate-limit window (its start, the plan and percentages Codex logged for it, and the
-tokens counted in it; tokenusage.dev estimates each plan's weekly limit from these), plus
+tokens counted in it, which tokenusage.dev analyses across sharers), plus
 the [API value](#api-value) per day, per session and in total (tokenusage.dev ignores it
 for now: its schema drops fields it does not know). Never
 sent: prompts, outputs, tool results, file contents or paths, session titles, or anything
