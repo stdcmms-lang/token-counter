@@ -1252,9 +1252,9 @@ in a `tokencounter/` package, with `report.py` as the only top-level script.
 Install:
 
 ```
-codex plugin marketplace add jack-beanstalk-2022/token-counter   # published
+codex plugin marketplace add stdcmms-lang/token-counter   # published
 codex plugin marketplace add .                                  # or this checkout
-codex plugin add token-counter@jack-beanstalk-2022
+codex plugin add token-counter@stdcmms-lang
 ```
 
 `codex plugin add` **copies** the plugin into `~/.codex/plugins/cache/`, so editing the
@@ -2056,7 +2056,7 @@ wrong:
 
 ## 11. Status
 
-Built, installed and verified as `token-counter@jack-beanstalk-2022` on Codex CLI
+Built, installed and verified as `token-counter@stdcmms-lang` on Codex CLI
 0.155.1.
 
 | Check | Result |
@@ -2071,7 +2071,7 @@ Built, installed and verified as `token-counter@jack-beanstalk-2022` on Codex CL
 | `scripts/ref_bpe.py` | pure-Python BPE reproduces the vendored tokenizer **byte for byte** |
 | Self-containment | the rendered report contains no `http://` or `https://` reference at all |
 | `scripts/verify_install.py` | **17 files identical** — the installed plugin is this code, not an earlier copy of it. It compares the copy cached under the marketplace the manifest names: an earlier version scanned every marketplace and took the last alphabetically, so the cache orphaned by the `@local-dev` rename became the copy verified |
-| Installed run | executes from `~/.codex/plugins/cache/jack-beanstalk-2022/token-counter/1.0.0/` |
+| Installed run | executes from `~/.codex/plugins/cache/stdcmms-lang/token-counter/1.0.0/` |
 
 Not built, and deliberately: incremental byte-offset tailing (§3.2), a reconstructed bill
 (the API value is list price for recorded usage, §5.9), fetching prices at run time, and any
