@@ -10,14 +10,16 @@
 
 The token-report skill sends nothing anywhere; its one network call installs tiktoken from
 PyPI when it is missing. This script is the one thing that sends, and it sends only when
-run with --yes. What it sends is daily token counts, a handful of
+run with --yes. What it sends is daily token counts, also by service tier, a handful of
 per-session summaries -- counts, times and a model name -- and, per weekly rate-limit window,
-the plan and percentage the server reported beside the tokens counted in it, over the last
-month the median and p90 response and turn time, and what the usage would cost at OpenAI's API
-list prices, per day and per session. Beside the
-numbers it publishes the token-report page itself, rendered for the public, so the link it
-prints opens the same page the user has locally. Never prompts, file contents, paths, session
-titles, or anything from auth.json. See the SKILL.md next to this file.
+the plan and percentage the server reported beside the tokens counted in it, also by model
+and tier; over the last month the median and p90 response and turn time, by model, effort
+and tier, and the plan those responses fell under; and what the usage would cost at OpenAI's
+API list prices, per day and per session. A tier is Fast or Ultrafast only when Codex
+recorded that setting; anything else, no recorded tier included, counts as Standard. Beside
+the numbers it publishes the token-report page itself, rendered for the public, so the link
+it prints opens the same page the user has locally. Never prompts, file contents, paths,
+session titles, or anything from auth.json. See token-share's SKILL.md, one directory up.
 """
 import argparse
 import base64
@@ -41,7 +43,7 @@ sys.path.insert(0, REPORT)
 import report as reportcli  # noqa: E402  -- enforces the Python floor on import
 from tokencounter import analyze, latency, ledger, pricing, render, rollout, worker  # noqa: E402
 
-CLIENT = {'name': 'token-counter', 'version': '1.9.1'}
+CLIENT = {'name': 'token-counter', 'version': '1.10.0'}
 SCHEMA = 1
 DEFAULT_API = 'https://tokenusage.dev/api'
 
@@ -58,6 +60,8 @@ SESSIONS_PER_MONTH = 10
 # Weekly rate-limit windows sent, newest kept: two years of weeks. The server's per-plan
 # estimate only reads recent ones; older windows are history, not evidence of today's limits.
 WINDOWS_MAX = 104
+WINDOW_SPLIT_ROWS_MAX = 50
+WINDOW_SPLIT_ROWS_TOTAL_MAX = 1000
 
 # The server refuses anything dated before Codex shipped. The oldest window's start can be
 # inferred from its quoted reset, seven days before it, so it could land earlier than the
@@ -68,6 +72,7 @@ EARLIEST_START = '2025-04-01T00:00:00Z'
 # effort groups: the server refuses a span over 92 days and more than 50 groups.
 LATENCY_DAYS = 30
 LATENCY_GROUPS_MAX = 50
+LATENCY_TIER_GROUPS_MAX = 50
 
 
 def _iso(epoch_s):
@@ -88,7 +93,7 @@ def _pct(v):
     return round(min(100.0, max(0.0, float(v))), 2)
 
 
-def limit_windows(results, responses, now_s):
+def limit_windows(results, responses, now_s, split=None, notes=None):
     """Each consumed weekly rate-limit window, oldest first: the plan and the percentages the
     server reported for it, beside the tokens measured here in the same span.
 
@@ -99,7 +104,7 @@ def limit_windows(results, responses, now_s):
     `responses` is ``[(epoch, input, cached, output), ...]``, the same charged, clamped rows
     the days are counted from, so a window can never hold more than the days do.
     """
-    rl = analyze.rate_limit_windows(results, responses, now=now_s, newest=None)
+    rl = analyze.rate_limit_windows(results, responses, now=now_s, newest=None, split=split)
     if not rl.get('available') or not rl.get('weekly'):
         return []
     out = []
@@ -127,37 +132,70 @@ def limit_windows(results, responses, now_s):
             'cached': t['cached'],
             'output': t['output'],
         })
-    return out[-WINDOWS_MAX:]
+        if 'split' in w:
+            out[-1]['split'] = w['split']
+    out = out[-WINDOWS_MAX:]
+    for w in out:
+        if len(w.get('split', [])) > WINDOW_SPLIT_ROWS_MAX:
+            del w['split']
+            if notes is not None:
+                notes['window_split_overflow'] += 1
+    rows = sum(len(w.get('split', [])) for w in out)
+    for w in out:
+        if rows <= WINDOW_SPLIT_ROWS_TOTAL_MAX:
+            break
+        if w.get('split'):
+            rows -= len(w.pop('split'))
+            if notes is not None:
+                notes['window_split_budget'] += 1
+    return out
 
 
-def latency_summary(results, charged, now_s):
+def _latency_plan_windows(windows):
+    """Sorted recorded intervals, ending at the next start or the quoted duration."""
+    ordered = sorted(((worker.epoch(w['start']), w) for w in windows), key=lambda x: x[0])
+    intervals = []
+    for i, (start, w) in enumerate(ordered):
+        stop = start + w['window_minutes'] * 60
+        if i + 1 < len(ordered):
+            stop = min(stop, ordered[i + 1][0])
+        intervals.append((start, stop, w.get('plan')))
+    return intervals
+
+
+def _wire_group(g):
+    fit = g.get('fit') or {}
+    row = {
+        'model': (g['model'] or 'unknown')[:80],
+        'effort': (g['effort'] or 'unknown')[:40],
+        'n': g['n'],
+        'median_s': g['median_s'],
+        'p90_s': g['p90_s'],
+        'overhead_s': fit.get('overhead_s'),
+        'output_tps': fit.get('output_tps'),
+        'above_share': g.get('above_share'),
+    }
+    if 'tier' in g:
+        row['tier'] = g['tier']
+    return row
+
+
+def latency_summary(results, charged, now_s, windows=None):
     """Response and turn times over the last LATENCY_DAYS days, in the shape the server's
     `latency` takes (docs/share-protocol.md in tokenusage.dev), or None when nothing was timed.
 
     Timed by token-report's own `latency.build`, so the figures are the report's. Only a
     day-level span and aggregates leave: no tool names, and no UTC hour or weekday buckets,
-    which the server leaves optional because they say when a sharer works.
+    which say when a sharer works.
     """
     # Every row goes in, and `since` leaves the older ones out of the figures: the first
     # recent response in a file is still floored by the end of the one before it.
-    lat, _ = latency.build(results, charged, since=now_s - LATENCY_DAYS * 86400)
+    lat, _ = latency.build(results, charged, since=now_s - LATENCY_DAYS * 86400,
+                           tier_groups=True, plan_windows=_latency_plan_windows(windows or []))
     if not lat.get('available') or not lat.get('daily'):
         return None
     dates = [d['date'] for d in lat['daily']]
     turns = lat['turns']
-    groups = []
-    for g in lat['groups'][:LATENCY_GROUPS_MAX]:
-        fit = g.get('fit') or {}
-        groups.append({
-            'model': (g['model'] or 'unknown')[:80],
-            'effort': (g['effort'] or 'unknown')[:40],
-            'n': g['n'],
-            'median_s': g['median_s'],
-            'p90_s': g['p90_s'],
-            'overhead_s': fit.get('overhead_s'),
-            'output_tps': fit.get('output_tps'),
-            'above_share': g.get('above_share'),
-        })
     r = lat['responses']
     return {
         'from': min(dates),
@@ -166,7 +204,9 @@ def latency_summary(results, charged, now_s):
         'turns': None if not turns['n'] else {
             'n': turns['n'], 'median_s': turns['median_s'], 'p90_s': turns['p90_s'],
             'model_share': turns['model_share']},
-        'groups': groups,
+        'groups': [_wire_group(g) for g in lat['groups'][:LATENCY_GROUPS_MAX]],
+        'tier_groups': [_wire_group(g) for g in lat['tier_groups'][:LATENCY_TIER_GROUPS_MAX]],
+        'plan': lat['plan'],
     }
 
 
@@ -218,15 +258,16 @@ def build_payload(results, charged, handle=None, now=None, prices=None):
 
     The API value -- `api_usd` on each day and session, and `api_value` beside them -- is
     priced exactly as the report prices it (`analyze.ApiValue`), from the vendored table
-    unless `prices` (what `pricing.load` returns) says otherwise. tokenusage.dev does not
-    read these fields yet; its schema strips keys it does not know, so they cost a share
-    nothing until it does. A day or session with nothing valued -- no priced response and
-    no search fee -- sends null, not a 0 that reads as free.
+    unless `prices` (what `pricing.load` returns) says otherwise. A day or session with
+    nothing valued -- no priced response and no search fee -- sends null, not a 0 that
+    reads as free.
     """
     notes = collections.Counter()
     days = collections.defaultdict(collections.Counter)
+    day_tiers = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
     sessions = {}
     timeline = []
+    split_timeline = []
     api = analyze.ApiValue(pricing.load() if prices is None else prices)
     day_usd = collections.defaultdict(float)
     day_valued = collections.Counter()
@@ -258,6 +299,16 @@ def build_payload(results, charged, handle=None, now=None, prices=None):
                 continue
             e = worker.epoch(ts)
             timeline.append((e, inp, cch, out))
+            tier = pricing.tier_class(r.get('tier'))
+            split_timeline.append((e, (r.get('model') or 'unknown')[:80], tier, inp, cch, out))
+            if r.get('tier') is None:
+                notes['tier_unrecorded'] += 1
+            td = day_tiers[d][tier]
+            td['responses'] += 1
+            td['input'] += inp
+            td['cached'] += cch
+            td['output'] += out
+            td['reasoning'] += rsn
             before = api.priced
             usd = api.add(r)
             # Valued: priced, or carrying a search fee. A day with neither sends null.
@@ -329,12 +380,15 @@ def build_payload(results, charged, handle=None, now=None, prices=None):
         'generated_at': _iso(now_s),
         'days': [dict(date=d, responses=v['responses'], input=v['input'], cached=v['cached'],
                       output=v['output'], reasoning=v['reasoning'], sessions=v['sessions'],
-                      api_usd=_usd(day_usd[d]) if api.on and day_valued[d] else None)
+                      api_usd=_usd(day_usd[d]) if api.on and day_valued[d] else None,
+                      tiers={tier: {k: day_tiers[d][tier][k]
+                                    for k in ('responses', 'input', 'cached', 'output', 'reasoning')}
+                             for tier in pricing.TIER_CLASSES if day_tiers[d][tier]['responses']})
                  for d, v in sorted(days.items()) if v['responses']],
         'sessions': sorted(keep.values(), key=lambda x: (x['start'], x['id'])),
-        'windows': limit_windows(results, timeline, now_s),
+        'windows': limit_windows(results, timeline, now_s, split=split_timeline, notes=notes),
     }
-    lat = latency_summary(results, charged, now_s)
+    lat = latency_summary(results, charged, now_s, windows=payload['windows'])
     if lat:
         payload['latency'] = lat
     av = api_value_summary(api, results)
@@ -505,8 +559,7 @@ def _describe_api_value(av):
     if not av:
         return 'api value    not computed (no price table)'
     return (f"api value    ${av['usd']:,.2f} at OpenAI API list prices of {av['prices_as_of']} "
-            f"({av['priced']:,} of {av['responses']:,} responses priced); "
-            f"tokenusage.dev does not show it yet")
+            f"({av['priced']:,} of {av['responses']:,} responses priced)")
 
 
 def describe(payload, notes, handle, api):
@@ -530,6 +583,8 @@ def describe(payload, notes, handle, api):
         _describe_windows(payload.get('windows') or []),
         _describe_latency(payload.get('latency')),
         _describe_api_value(payload.get('api_value')),
+        f"tier record  {notes['tier_unrecorded']:,} dated shared responses had no recorded tier; "
+        'counted as Standard',
         '',
         'month        tokens      sessions  longest session',
     ]
@@ -543,18 +598,24 @@ def describe(payload, notes, handle, api):
                      f"{_dur(longest[k]) if k in longest else '--'}")
     lines += [
         '',
-        'sent: per-day token counts; per-session start/end times, active time, token counts',
-        'and model name, under a one-way hash of the session id; and per weekly limit window,',
-        'its start, the plan and percentage used that Codex logged, and the tokens counted in it;',
-        'and, over the last month, the median and p90 response and turn time, in total and per model;',
-        'and the API list-price value of the usage, per day, per session and in total.',
+        'sent: per-day token counts, also by service tier; per-session start/end times, active',
+        'time, token counts and model name, under a one-way hash of the session id; per weekly',
+        'limit window, its start, the plan and percentage used that Codex logged, and the tokens',
+        'counted in it, also by model and tier; over the last month, the median and p90 response',
+        'and turn time, in total, per model and effort, and per model, effort and tier, and the',
+        'plan those responses fell under; and the API list-price value of the usage, per day, per',
+        'session and in total.',
         'never sent: prompts, outputs, file contents or paths, session titles, your',
         'account or email.',
     ]
     for k, label in (('clamped_cached', 'responses had cached > input (clamped)'),
                      ('clamped_reasoning', 'responses had reasoning > output (clamped)'),
                      ('undated_responses', 'responses had no usable timestamp (skipped)'),
-                     ('untimed_sessions', 'sessions had no usable timestamps (not summarised)')):
+                     ('untimed_sessions', 'sessions had no usable timestamps (not summarised)'),
+                     ('window_split_overflow',
+                      'weekly windows had over 50 model/tier rows (split not sent)'),
+                     ('window_split_budget',
+                      'older weekly windows were over the 1,000 split-row budget (split not sent)')):
         if notes.get(k):
             lines.append(f'note: {notes[k]:,} {label}')
     return '\n'.join(lines)

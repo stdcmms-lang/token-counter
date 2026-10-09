@@ -248,7 +248,17 @@ def _downsample(points, limit=MAX_POINTS):
     return keep
 
 
-def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS, usd=None):
+def _split_rows(by_key):
+    """Complete model/tier counts, in wire-model and canonical tier order."""
+    return [dict(model=model, tier=tier, responses=c['responses'], input=c['input'],
+                 cached=c['cached'], output=c['output'])
+            for (model, tier), c in sorted(
+                by_key.items(), key=lambda kv: (kv[0][0], pricing.TIER_CLASSES.index(kv[0][1])))
+            if c['responses']]
+
+
+def rate_limit_windows(files, responses, now=None,
+                       newest=MAX_CHART_WINDOWS, usd=None, split=None):
     """Reported weekly-limit windows, with locally measured token usage inside each.
 
     Two independent series meet here and are deliberately never combined into one number:
@@ -281,6 +291,9 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS, usd
     ``usd_points``, its running total ``[t, dollars]``, split at the same boundaries as the
     tokens.  A window none of whose responses was priced has ``usd`` None and no points,
     rather than a total of $0.
+
+    `split`, when supplied, is ``[(epoch, model, tier_class, input, cached, output), ...]``
+    from the same rows. It adds complete model/tier counts, without changing other fields.
     """
     now = now if now is not None else datetime.datetime.now().timestamp()
     merged = _merge_window_quotes(files)
@@ -371,6 +384,20 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS, usd
             point += (a['tiktoken_input'],)
         series[i].append(point)
 
+    split_acc = [collections.defaultdict(collections.Counter) for _ in live]
+    for t, model, tier, inp, cch, out in _in_time_order(split or []):
+        if not keys:
+            break
+        j = bisect.bisect_right(keys, t) - 1
+        if j < 0:
+            continue
+        i = bounds[j][1]
+        a = split_acc[i][((model or 'unknown')[:80], tier)]
+        a['responses'] += 1
+        a['input'] += inp
+        a['cached'] += cch
+        a['output'] += out
+
     usd_acc = [0.0 for _ in live]
     usd_seen = [False for _ in live]
     usd_series = [[] for _ in live]
@@ -417,6 +444,8 @@ def rate_limit_windows(files, responses, now=None, newest=MAX_CHART_WINDOWS, usd
                                        for p in _bucket_last(usd_series[i])])
                           if usd_seen[i] else [],
         })
+        if split is not None:
+            out_windows[-1]['split'] = _split_rows(split_acc[i])
 
     idle = [c for c in clusters if c['idle']]
     latest_idle = max(idle, key=lambda c: c['last_ts'] or 0) if idle else None

@@ -47,17 +47,20 @@ def run(fn):
     with contextlib.redirect_stdout(buf):
         try:
             fn()
-        except Exception as exc:                      # a crash is also a failure
+        except Exception as exc:                      # reported, never evidence of a caught mutation
             return [('raised ' + exc.__class__.__name__, False, str(exc)[:100])]
     return list(tp.RESULTS)
 
 
 CASES = []
+NAMED_ASSERTIONS = {}
 
 
-def case(name, target):
+def case(name, target, assertion=None):
     def deco(fn):
         CASES.append((name, target, fn))
+        if assertion is not None:
+            NAMED_ASSERTIONS[name] = assertion
         return fn
     return deco
 
@@ -884,20 +887,134 @@ def _fixed_tmp_name():
     return lambda: setattr(share, 'save_state', orig)
 
 
+def _sharing_classifier(*edits):
+    """Keep every consumer on the same mutated classifier and canonical class order."""
+    changed = _module_with(pricing, *edits)
+    orig = pricing.tier_class, pricing.TIER_CLASSES
+    pricing.tier_class, pricing.TIER_CLASSES = changed.tier_class, changed.TIER_CLASSES
+    def undo():
+        pricing.tier_class, pricing.TIER_CLASSES = orig
+    return undo
+
+
+@case('sharing classifies an absent raw tier as unrecorded again',
+      lambda: _share_test(lambda ts: ts.test_tier_partitions()),
+      assertion='F4 Standard partition includes both absent-tier rows')
+def _share_absent_tier():
+    return _sharing_classifier(
+        ("TIER_CLASSES = ('standard', 'fast', 'ultrafast')\n",
+         "TIER_CLASSES = ('standard', 'fast', 'ultrafast', 'unrecorded')\n"),
+        ("def tier_class(raw):\n    name = tier_name(raw)\n",
+         "def tier_class(raw):\n    if raw is None:\n        return 'unrecorded'\n"
+         "    name = tier_name(raw)\n"))
+
+
+@case('sharing classifies Flex as Fast',
+      lambda: _share_test(lambda ts: ts.test_tier_partitions()),
+      assertion='F4 Flex contributes to Standard')
+def _share_flex_fast():
+    return _sharing_classifier((
+        "def tier_class(raw):\n    name = tier_name(raw)\n",
+        "def tier_class(raw):\n    name = tier_name(raw)\n    if name == 'flex':\n"
+        "        return 'fast'\n"))
+
+
+@case('sharing classifies Ultrafast as Fast',
+      lambda: _share_test(lambda ts: ts.test_tier_partitions()),
+      assertion='F4 has a distinct Ultrafast partition')
+def _share_ultrafast_fast():
+    return _sharing_classifier((
+        "def tier_class(raw):\n    name = tier_name(raw)\n",
+        "def tier_class(raw):\n    name = tier_name(raw)\n    if name == 'ultrafast':\n"
+        "        return 'fast'\n"))
+
+
+@case('model/tier split assigns the exact-boundary response to the old window',
+      lambda: _share_test(lambda ts: ts.test_tier_window_boundaries()),
+      assertion='split exact-boundary row belongs to the new window')
+def _split_boundary_left():
+    old = ("    for t, model, tier, inp, cch, out in _in_time_order(split or []):\n"
+           "        if not keys:\n"
+           "            break\n"
+           "        j = bisect.bisect_right(keys, t) - 1\n")
+    changed = _module_with(analyze, (old, old.replace('bisect_right', 'bisect_left')))
+    orig = analyze.rate_limit_windows
+    analyze.rate_limit_windows = changed.rate_limit_windows
+    return lambda: setattr(analyze, 'rate_limit_windows', orig)
+
+
+@case('model/tier split discards model identity',
+      lambda: _share_test(lambda ts: ts.test_tier_partitions()),
+      assertion='F4 has four exact model/tier split rows')
+def _split_no_model():
+    changed = _module_with(analyze, (
+        "        a = split_acc[i][((model or 'unknown')[:80], tier)]\n",
+        "        a = split_acc[i][('unknown', tier)]\n"))
+    orig = analyze.rate_limit_windows
+    analyze.rate_limit_windows = changed.rate_limit_windows
+    return lambda: setattr(analyze, 'rate_limit_windows', orig)
+
+
+@case('tier timing rows reuse the mixed fit',
+      lambda: tp.test_latency_tier_fits_are_independent(),
+      assertion='tier fits have Standard/Fast overheads 10/2')
+def _tier_reuses_mixed_fit():
+    return _swap('latency', _module_with(latency, (
+        "        tier_fits = _fit_groups(samples, by_tier)\n",
+        "        tier_fits = {g: fits[(g[0], g[1])] for g in by_tier\n"
+        "                     if (g[0], g[1]) in fits}\n")))
+
+
+@case('overflow truncates a model/tier split instead of omitting it',
+      lambda: _share_test(lambda ts: ts.test_split_limits()),
+      assertion='51-row split is absent and original totals are retained')
+def _split_truncated():
+    import test_share as ts
+    orig = ts.share
+    ts.share = _module_with(orig, (
+        "            del w['split']\n",
+        "            w['split'] = w['split'][:WINDOW_SPLIT_ROWS_MAX]\n"))
+    return lambda: setattr(ts, 'share', orig)
+
+
+@case('a two-plan timing summary takes the latest plan',
+      lambda: _share_test(lambda ts: ts.test_latency_plan_context()),
+      assertion='two-plan latency context is null')
+def _latency_latest_plan():
+    changed = _module_with(latency, (
+        "        lat['plan'] = plan if plan is not None and all(p == plan for p in sample_plans) else None\n",
+        "        lat['plan'] = sample_plans[-1]\n"))
+    orig = latency.build
+    latency.build = changed.build
+    return lambda: setattr(latency, 'build', orig)
+
+
 def main():
     print(f'{len(CASES)} mutations\n')
     bad = 0
     for name, target, build in CASES:
+        baseline = run(target)
+        before = [n for n, ok, _ in baseline if not ok]
+        named = NAMED_ASSERTIONS.get(name)
+        if before or not baseline or (named and not any(n == named for n, _, _ in baseline)):
+            bad += 1
+            print(f'[FAIL] {name}\n        unmutated target did not pass: {before or "no named assertions"}')
+            continue
         undo = build()                 # applies the mutation, returns its undo
-        results = run(target)
-        undo()
+        try:
+            results = run(target)
+        finally:
+            undo()
         failed = [n for n, ok, _ in results if not ok]
-        if failed:
-            print(f'[PASS] {name}\n        caught by: {failed[0]}')
+        raised = [n for n in failed if n.startswith('raised ')]
+        if failed and not raised and (named is None or named in failed):
+            print(f'[PASS] {name}\n        caught by: {named or failed[0]}')
         else:
             bad += 1
-            print(f'[FAIL] {name}\n        NOTHING FAILED -- {len(results)} assertions all '
-                  f'passed with the fix reverted')
+            reason = (f'exception is not evidence: {raised}' if raised else
+                      f'named assertion did not fail: {named}' if named else
+                      f'NOTHING FAILED -- {len(results)} assertions all passed with the fix reverted')
+            print(f'[FAIL] {name}\n        {reason}')
     print(f'\n{len(CASES) - bad}/{len(CASES)} mutations caught')
     return 1 if bad else 0
 

@@ -60,13 +60,19 @@ started); for each month the top sessions by active time and by tokens, each as 
 hash of its id, start and end times, active time, token counts and the model name; and for
 each weekly rate-limit window, its start, the plan type and the percentages used that Codex
 logged in its rate-limit snapshots, and the tokens counted in it. tokenusage.dev analyses the
-windows across sharers. Also, over the last 30 days of responses: how many were timed, and their median and p90
+windows across sharers and documents its own methods. Also, over the last 30 days of responses: how many were timed, and their median and p90
 response time and turn time in seconds, in total and for each model and reasoning effort
 (no per-request times, no tool names, and no hour-of-day or weekday breakdown). And the API
 value token-report computes: what the usage would cost at OpenAI's API list prices, per day
 (`api_usd`), per summarised session, and in total with the price table's date and how many
-responses could be priced (`api_value`). tokenusage.dev does not show it yet; its server
-drops fields it does not know, so sending it changes nothing there until it does.
+responses could be priced (`api_value`).
+
+Since 1.10.0 a share also sends each day's counts by service tier (Standard, Fast,
+Ultrafast), each weekly window's counts by model and tier when available, response times
+by model, effort and tier, and the plan the timed responses fell under, when all can be
+attributed to one recorded plan. Fast and Ultrafast mean Codex recorded that setting;
+anything else, including no recorded tier, counts as Standard. No per-request records,
+tool names, UTC hours or weekdays are sent.
 
 Also sent, unless `--no-report`: the report page, rendered by token-report with `--public`.
 It carries the charts' data (daily input by model, the cumulative token curve and

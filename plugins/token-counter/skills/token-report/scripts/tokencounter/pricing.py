@@ -39,6 +39,7 @@ DEFAULT_PRICES = os.path.join(_PLUGIN_ROOT, 'assets', 'vendor', 'openai_prices.j
 # sentinel for "no tier requested"; ``priority`` is what Fast mode sends.
 TIER_OF = {'default': 'standard', 'auto': 'standard', 'standard': 'standard',
            'priority': 'fast', 'fast': 'fast', 'flex': 'flex', 'ultrafast': 'ultrafast'}
+TIER_CLASSES = ('standard', 'fast', 'ultrafast')
 
 RATE_KEYS = ('input', 'cached_input', 'cache_write', 'output')
 _DATED = re.compile(r'-\d{4}-\d{2}-\d{2}$')
@@ -135,6 +136,11 @@ def tier_name(service_tier):
     if service_tier is None:
         return 'standard'
     return TIER_OF.get(str(service_tier).strip().lower())
+
+
+def tier_class(raw):
+    name = tier_name(raw)
+    return name if name in ('fast', 'ultrafast') else 'standard'
 
 
 def price(table, row):
