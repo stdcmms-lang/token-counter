@@ -1514,6 +1514,8 @@ def test_input_counted_with_tiktoken():
           rc == 0 and t['input_source'] == 'tiktoken' and t['tiktoken_input'] > 0
           and t['tiktoken_input'] == m['residual']['reconstructed']
           and t['tiktoken_input'] != t['input'], str(t))
+    if t['input_source'] != 'tiktoken':
+        return                          # failed assertion above; absent counted fields cannot be tested
     check('output, cached and the cache hit are still what Codex recorded',
           (t['input'], t['cached'], t['output'], t['reasoning'], t['cache_hit'])
           == (to['input'], to['cached'], to['output'], to['reasoning'], to['cache_hit'])
@@ -1799,6 +1801,13 @@ def test_replayed_history_is_not_timed():
           f"{dict(counters3)} {dict(q3)} {lat3['responses']}")
     check('... nor is its tool call', ex3.get('n') == 2 and q3['tool_replayed'] == 1,
           f"{dict(q3)} {lat3['tools']}")
+    for label, scoped, rows, old, old_q in [('excluded', data, charged, lat, q),
+                                          ('charged', data, charged2, lat2, q2),
+                                          ('ambiguous', data3, charged3, lat3, q3)]:
+        extra, extra_q = latency.build(scoped, rows, tz=datetime.timezone.utc, tier_groups=True)
+        check(f'{label} replay: additional tier grouping preserves samples and quality counters',
+              {k: v for k, v in extra.items() if k != 'tier_groups'} == old and extra_q == old_q
+              and sum(g['n'] for g in extra['tier_groups']) == old['responses']['n'], str(extra))
 
 
 def _timed(recs):
@@ -1966,6 +1975,55 @@ def test_pace_split():
     f = latency.floor_fit(sparse)
     check('one response with uncached input does not set the input rate', f is not None
           and f['c'] == 0 and abs(1 / f['b'] - 50) < 2, str(f))
+
+
+def test_latency_tier_fits_are_independent():
+    def row(i, tier, duration):
+        req = LAT_T0 + 60 * i
+        iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
+        return {'model': 'm', 'effort': 'high', 'tier': tier, 'req_ts': iso(req),
+                'ts': iso(req + duration), 'usage': {'input_tokens': 100,
+                                                   'cached_input_tokens': 20, 'output_tokens': 10}}
+    files = {'a': {'turn_starts': [], 'tool_times': []}}
+    rows = [row(i, 'default', 10) for i in range(40)]
+    rows += [row(i, 'priority', 2) for i in range(40, 80)]
+    default, q = latency.build(files, {'a': rows}, tz=datetime.timezone.utc)
+    extra, eq = latency.build(files, {'a': rows}, tz=datetime.timezone.utc, tier_groups=True,
+                              plan_windows=[(LAT_T0, LAT_T0 + 86400, 'prolite')])
+    tiers = {g['tier']: g for g in extra['tier_groups']}
+    check('tier fits have Standard/Fast overheads 10/2',
+          tiers.get('standard', {}).get('fit', {}).get('overhead_s') == 10
+          and tiers.get('fast', {}).get('fit', {}).get('overhead_s') == 2, str(tiers))
+    check('mixed timing remains median 6 and p90 10',
+          extra['responses']['median_s'] == 6 and extra['responses']['p90_s'] == 10
+          and extra['groups'][0]['median_s'] == 6 and extra['groups'][0]['p90_s'] == 10)
+    check('each independent tier fit has 40 samples, zero token slopes and no above-line time',
+          all(g['fit'] == {'overhead_s': duration, 'output_tps': None,
+                           'uncached_input_tps': None, 'samples': 40}
+              and g['n'] == 40 and g['median_s'] == g['p90_s'] == duration
+              and g['above_s'] == g['above_share'] == g['median_above_s'] == 0
+              for tier, duration in (('standard', 10), ('fast', 2)) for g in [tiers[tier]]))
+    check('tier groups and plan context change no existing report fields or quality counters',
+          {k: v for k, v in extra.items() if k not in ('tier_groups', 'plan')} == default
+          and eq == q and 'tier_groups' not in default and 'plan' not in default
+          and extra['plan'] == 'prolite')
+    ultra = [row(i, 'ultrafast', 1) for i in range(40)]
+    u, _ = latency.build(files, {'a': ultra}, tz=datetime.timezone.utc, tier_groups=True)
+    check('a separate 40-response Ultrafast group fits its own one-second overhead',
+          u['tier_groups'][0]['tier'] == 'ultrafast'
+          and u['tier_groups'][0]['fit'] == {'overhead_s': 1, 'output_tps': None,
+                                           'uncached_input_tps': None, 'samples': 40}
+          and u['tier_groups'][0]['above_share'] == 0)
+    few = rows[:39] + rows[40:79]
+    small, _ = latency.build(files, {'a': few}, tier_groups=True)
+    check('tier fits require their own 40 samples even when the mixed fit has enough',
+          small['groups'][0]['fit'] is not None
+          and all(g['fit'] is None and g['above_share'] is None for g in small['tier_groups']))
+    many = [row(i, 'default', 10) for i in range(latency.FIT_MAX + 1)]
+    capped, _ = latency.build(files, {'a': many}, tier_groups=True)
+    check('tier fits keep all accepted responses but fit at most 4,000 samples',
+          capped['tier_groups'][0]['n'] == latency.FIT_MAX + 1
+          and capped['tier_groups'][0]['fit']['samples'] == latency.FIT_MAX)
 
 
 def test_latency_caps_and_counters():
@@ -2897,6 +2955,27 @@ def test_tier_and_searches_extracted():
               got.get('rollout-b.jsonl') == [(None, 1)], str(got))
         check(f'{label}: on the legacy stream, searches land on the charged record',
               got.get('rollout-c.jsonl') == [(None, 1)], str(got))
+        classes = {f: [pricing.tier_class(r.get('tier')) for r in rows]
+                   for f, rows in charged.items()}
+        check(f'{label}: sharing classifies A as Fast, Fast, Standard and B/C as Standard',
+              classes == {'rollout-a.jsonl': ['fast', 'fast', 'standard'],
+                          'rollout-b.jsonl': ['standard'], 'rollout-c.jsonl': ['standard']},
+              str(classes))
+
+
+def test_sharing_tier_classes():
+    check('sharing has exactly the three canonical classes in order',
+          pricing.TIER_CLASSES == ('standard', 'fast', 'ultrafast'))
+    for raw, want in [(None, 'standard'), ('', 'standard'), ('  \t', 'standard'),
+                      ('default', 'standard'), ('auto', 'standard'), ('standard', 'standard'),
+                      (' DEFAULT ', 'standard'), (' Auto ', 'standard'), (' StAnDaRd ', 'standard'),
+                      ('priority', 'fast'), ('fast', 'fast'), (' PrIoRiTy\t', 'fast'),
+                      (' FAST ', 'fast'), ('ultrafast', 'ultrafast'), (' UlTrAfAsT ', 'ultrafast'),
+                      ('flex', 'standard'), (' FLEX ', 'standard'), ('scale', 'standard'),
+                      ('unrecorded', 'standard'), ('other', 'standard'), (1, 'standard'),
+                      (False, 'standard'), ({}, 'standard')]:
+        check(f'sharing tier {raw!r} classifies as {want}', pricing.tier_class(raw) == want)
+    check('API pricing still names an absent raw tier Standard', pricing.tier_name(None) == 'standard')
 
 
 def test_replayed_search_not_charged_twice():
@@ -3594,6 +3673,7 @@ def main():
     test_replayed_history_is_not_timed()
     test_request_start_edge_cases()
     test_pace_split()
+    test_latency_tier_fits_are_independent()
     test_latency_caps_and_counters()
     test_latency_render()
     test_latency_chart()
@@ -3606,6 +3686,7 @@ def main():
     test_price_table()
     test_pricing_math()
     test_tier_and_searches_extracted()
+    test_sharing_tier_classes()
     test_replayed_search_not_charged_twice()
     test_fetch_prices_parser()
     test_interrupted_turns_counted()

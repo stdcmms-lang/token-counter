@@ -19,11 +19,12 @@ Only charged ledger rows are timed, so a repeated or context-snapshot record nev
 a sample; a replayed row the ledger charges anyway (an ambiguous one-record match, or every
 match under ``--no-replay-exclusion``) is flagged by the ledger and left out here.
 """
+import bisect
 import collections
 import datetime
 import operator
 
-from . import worker
+from . import pricing, worker
 
 # A response longer than this has a start that is not its request's: an anchor from before a
 # sleep, or a record written late.  Excluded and counted, never clipped.
@@ -209,7 +210,57 @@ def _local(t, tz):
         return None
 
 
-def build(files, charged, tz=None, since=None):
+def _fit_groups(samples, by_group):
+    fits = {}
+    for g, idx in by_group.items():
+        if len(idx) < FIT_MIN:
+            continue
+        picked = _evenly(sorted(idx, key=lambda i: samples[i][0]), FIT_MAX)
+        f = floor_fit([samples[i][1:4] for i in picked])
+        if f is not None:
+            fits[g] = f
+    return fits
+
+
+def _group_rows(samples, by_group, fits):
+    groups = []
+    for g, idx in by_group.items():
+        f = fits.get(g)
+        if f is None:
+            estimates = {'above_s': None, 'above_share': None, 'median_above_s': None}
+        else:
+            ab = [max(0.0, samples[i][1] - (f['a'] + f['b'] * samples[i][2]
+                                           + f['c'] * samples[i][3])) for i in idx]
+            t = sum(samples[i][1] for i in idx)
+            estimates = {'above_s': _r(sum(ab)),
+                         'above_share': _r(sum(ab) / t, 4) if t else None,
+                         'median_above_s': _r(_pct(sorted(ab), .5))}
+        row = dict(_summary([samples[i][1] for i in idx]), model=g[0], effort=g[1],
+                   output=sum(samples[i][2] for i in idx), **estimates)
+        if len(g) == 3:
+            row['tier'] = g[2]
+        row['fit'] = None if f is None else {
+            'overhead_s': _r(f['a']),
+            'output_tps': _r(1 / f['b'], 1) if f['b'] > 0 else None,
+            'uncached_input_tps': _r(1 / f['c'], 0) if f['c'] > 0 else None,
+            'samples': min(len(idx), FIT_MAX),
+        }
+        groups.append(row)
+    groups.sort(key=lambda r: -r['total_s'])
+    return groups
+
+
+def _plan_at(end_s, plan_windows):
+    """Recorded plan at completion, within sorted half-open window intervals."""
+    i = bisect.bisect_right(plan_windows, (end_s, float('inf'))) - 1
+    if i < 0:
+        return None
+    start, stop, plan = plan_windows[i]
+    return plan if start <= end_s < stop else None
+
+
+def build(files, charged, tz=None, since=None, *,
+          tier_groups=False, plan_windows=None):
     """``(latency model, data-quality counters)`` for the files in scope.
 
     `files` path -> FileResult, `charged` path -> the ledger's charged rows, in file order.
@@ -217,9 +268,14 @@ def build(files, charged, tz=None, since=None):
     is the machine's own, as everywhere else in the report.  `since`, in epoch seconds,
     leaves out responses that ended before it -- after they have served as the floor of the
     next one's start, which dropping their rows beforehand would lose.
+
+    Sharing can request independent tier groups and recorded-window plan context. Neither
+    changes the mixed fits or report estimates. Context uses every accepted sample's end.
     """
     q = collections.Counter()
     samples = []                        # (start, seconds, out, uncached, group, path, turn)
+    by_tier = collections.defaultdict(list)
+    sample_plans = []
     turn_end = {}                       # (path, turn) -> latest response end
     tools = collections.defaultdict(list)
 
@@ -263,6 +319,11 @@ def build(files, charged, tz=None, since=None):
             unc = max(0, (u.get('input_tokens') or 0) - (u.get('cached_input_tokens') or 0))
             group = (r.get('model') or 'unknown', r.get('effort') or 'unknown')
             samples.append((start, d, out, unc, group, path, r.get('turn')))
+            if tier_groups:
+                tier_key = (group[0][:80], group[1][:40], pricing.tier_class(r.get('tier')))
+                by_tier[tier_key].append(len(samples) - 1)
+            if plan_windows is not None:
+                sample_plans.append(_plan_at(end, plan_windows))
             key = (path, r.get('turn'))
             turn_end[key] = max(turn_end.get(key, end), end)
 
@@ -295,17 +356,9 @@ def build(files, charged, tz=None, since=None):
     by_group = collections.defaultdict(list)          # group -> indices into `samples`
     for i, s in enumerate(samples):
         by_group[s[4]].append(i)
-    fits = {}
-    for g, idx in by_group.items():
-        if len(idx) < FIT_MIN:
-            continue
-        picked = _evenly(sorted(idx, key=lambda i: samples[i][0]), FIT_MAX)
-        f = floor_fit([samples[i][1:4] for i in picked])
-        if f is not None:
-            fits[g] = f
+    fits = _fit_groups(samples, by_group)
 
     # Time above the line, per response; None where its group has no line.
-    above_of = []
     work = above = unfit = 0.0
     local_of = {}                      # quarter-hour bucket -> (local hour, local day)
     hours = collections.defaultdict(lambda: ([], []))
@@ -319,7 +372,6 @@ def build(files, charged, tz=None, since=None):
             ab = max(0.0, d - (f['a'] + f['b'] * out + f['c'] * unc))
             work += d - ab
             above += ab
-        above_of.append(ab)
         # One conversion per quarter hour, not per response: every zone in use offsets UTC
         # by a whole number of quarter hours, and changes its offset on that grid too, so
         # everything in one UTC quarter hour shares one local hour and one local day.
@@ -334,29 +386,7 @@ def build(files, charged, tz=None, since=None):
                 if ab is not None:
                     bucket[k][1].append(ab)
 
-    def split(idx):
-        fitted = [i for i in idx if above_of[i] is not None]
-        if not fitted:
-            # No line, so no estimate: unavailable, never a measured zero.
-            return {'above_s': None, 'above_share': None, 'median_above_s': None}
-        ab = [above_of[i] for i in fitted]
-        t = sum(samples[i][1] for i in fitted)
-        return {'above_s': _r(sum(ab)), 'above_share': _r(sum(ab) / t, 4) if t else None,
-                'median_above_s': _r(_pct(sorted(ab), .5))}
-
-    groups = []
-    for g, idx in by_group.items():
-        f = fits.get(g)
-        row = dict(_summary([samples[i][1] for i in idx]), model=g[0], effort=g[1],
-                   output=sum(samples[i][2] for i in idx), **split(idx))
-        row['fit'] = None if f is None else {
-            'overhead_s': _r(f['a']),
-            'output_tps': _r(1 / f['b'], 1) if f['b'] > 0 else None,
-            'uncached_input_tps': _r(1 / f['c'], 0) if f['c'] > 0 else None,
-            'samples': min(len(idx), FIT_MAX),
-        }
-        groups.append(row)
-    groups.sort(key=lambda r: -r['total_s'])
+    groups = _group_rows(samples, by_group, fits)
 
     # -- turns: from the turn opening to its last response ---------------------------------
     model_in_turn = collections.Counter()
@@ -411,4 +441,10 @@ def build(files, charged, tz=None, since=None):
                    'response_cap_s': RESPONSE_CAP_S, 'tool_cap_s': TOOL_CAP_S,
                    'turn_cap_s': TURN_CAP_S},
     }
+    if tier_groups:
+        tier_fits = _fit_groups(samples, by_tier)
+        lat['tier_groups'] = _group_rows(samples, by_tier, tier_fits)
+    if plan_windows is not None:
+        plan = sample_plans[0]
+        lat['plan'] = plan if plan is not None and all(p == plan for p in sample_plans) else None
     return lat, q

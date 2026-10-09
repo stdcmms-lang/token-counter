@@ -3,6 +3,7 @@
 Run with ``python scripts/test_share.py``. No network: the server is a stub on localhost.
 """
 import contextlib
+import copy
 import datetime
 import gzip
 import base64
@@ -14,13 +15,14 @@ import stat
 import sys
 import tempfile
 import threading
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHARE = os.path.join(REPO, 'plugins', 'token-counter', 'skills', 'token-share', 'scripts')
 sys.path.insert(0, SHARE)
 
 import share  # noqa: E402
-from tokencounter import analyze, ledger, pricing, rollout, worker  # noqa: E402
+from tokencounter import analyze, latency, ledger, pricing, rollout, worker  # noqa: E402
 
 RESULTS = []
 SECRET_PROMPT = 'PLEASE-NEVER-UPLOAD-THIS-PROMPT'
@@ -144,7 +146,7 @@ def test_nothing_private_is_sent():
           set(p) == {'schema', 'client', 'generated_at', 'days', 'sessions', 'windows', 'handle',
                      'api_value'}
           and all(set(d) == {'date', 'responses', 'input', 'cached', 'output', 'reasoning',
-                             'sessions', 'api_usd'} for d in p['days'])
+                             'sessions', 'api_usd', 'tiers'} for d in p['days'])
           and all(set(x) == {'id', 'day', 'start', 'end', 'active_s', 'responses', 'input',
                              'cached', 'output', 'reasoning', 'model', 'api_usd'}
                   for x in p['sessions'])
@@ -157,7 +159,8 @@ def test_nothing_private_is_sent():
     *_, w, _ = _build(_corpus_file(_limit_records()))
     check('only the documented keys are sent per limit window',
           w['windows'] and all(set(x) == {'start', 'window_minutes', 'plan', 'first_pct',
-                                          'peak_pct', 'responses', 'input', 'cached', 'output'}
+                                          'peak_pct', 'responses', 'input', 'cached', 'output',
+                                          'split'}
                                for x in w['windows']),
           json.dumps(w['windows'])[:400])
 
@@ -200,9 +203,12 @@ def test_latency():
           and lat['responses'] == {'n': 5, 'median_s': 6.0, 'p90_s': 9.2}, str(lat))
     check('turns is null when no turn was timed', lat.get('turns') is None, str(lat))
     check('only the documented keys are sent for latency',
-          set(lat) == {'from', 'to', 'responses', 'turns', 'groups'}
+          set(lat) == {'from', 'to', 'responses', 'turns', 'groups', 'tier_groups', 'plan'}
           and all(set(g) == {'model', 'effort', 'n', 'median_s', 'p90_s', 'overhead_s',
-                             'output_tps', 'above_share'} for g in lat['groups']), str(lat))
+                             'output_tps', 'above_share'} for g in lat['groups'])
+          and all(set(g) == {'model', 'effort', 'tier', 'n', 'median_s', 'p90_s',
+                             'overhead_s', 'output_tps', 'above_share'}
+                  for g in lat['tier_groups']), str(lat))
     check('groups split the timed responses, one per model and effort',
           [(g['model'], g['effort'], g['n']) for g in lat['groups']]
           == [('unknown', 'unknown', 5)], str(lat['groups']))
@@ -394,6 +400,337 @@ def test_limit_windows():
 
     *_, p, _ = _build(_corpus(CORPUS))
     check('logs without rate limits send an empty list', p['windows'] == [])
+
+
+# ---------------------------------------------------------------------------- service tiers
+
+F4_NOW = datetime.datetime(2026, 9, 28, 12, tzinfo=datetime.timezone.utc)
+F4_START = worker.epoch('2026-09-10T10:00:00Z')
+COUNT_KEYS = ('responses', 'input', 'cached', 'output', 'reasoning')
+F4_TIERS = {
+    'standard': dict(zip(COUNT_KEYS, (5, 1300, 140, 130, 29))),
+    'fast': dict(zip(COUNT_KEYS, (2, 400, 250, 40, 25))),
+    'ultrafast': dict(zip(COUNT_KEYS, (1, 300, 100, 30, 7))),
+}
+F4_SPLIT = [
+    dict(model='m', tier='standard', responses=4, input=1000, cached=40, output=100),
+    dict(model='m', tier='fast', responses=2, input=400, cached=250, output=40),
+    dict(model='n', tier='standard', responses=1, input=300, cached=100, output=30),
+    dict(model='n', tier='ultrafast', responses=1, input=300, cached=100, output=30),
+]
+
+
+def _quote(start, plan='prolite', peak=20, last=None):
+    return {'window_minutes': 10080, 'resets_at': start + WEEK, 'slot': 'primary',
+            'plan_type': plan, 'limit_id': 'codex', 'first_ts': start,
+            'last_ts': start + 600 if last is None else last, 'first_pct': 0,
+            'last_pct': peak, 'max_pct': peak, 'min_pct': 0, 'n': 2, 'reached': 0,
+            'points': [[start, 0], [start + 600 if last is None else last, peak]]}
+
+
+def _f4():
+    files, charged = {}, {}
+    raw = [('m', 'default', 100, 20, 10, 2, 6),
+           ('m', 'default', 100, 20, 10, 2, 10),
+           ('m', 'priority', 200, 50, 20, 5, 2),
+           ('m', 'priority', 200, 250, 20, 25, 4),
+           ('n', 'flex', 300, 100, 30, 7, 8),
+           ('n', 'ultrafast', 300, 100, 30, 7, 12),
+           ('m', None, 400, 0, 40, 9, 14),
+           ('m', None, 400, 0, 40, 9, 16)]
+    for i, (model, tier, inp, cached, out, reasoning, duration) in enumerate(raw):
+        path = f'f4-{i // 2}'
+        files.setdefault(path, {'session_id': path, 'date': '2026-09-10', 'turn_starts': [],
+                                'tool_times': []})
+        req = F4_START + 60 * i
+        charged.setdefault(path, []).append({
+            'model': model, 'effort': 'high', 'tier': tier, 'tier_inferred': i == 2,
+            'req_ts': share._iso(req), 'ts': share._iso(req + duration), 'turn': None,
+            'replayed': False, 'usage': {'input_tokens': inp, 'cached_input_tokens': cached,
+                                       'output_tokens': out, 'reasoning_output_tokens': reasoning}})
+    files['f4-0']['rate_limits'] = [_quote(F4_START)]
+    return files, charged
+
+
+@contextlib.contextmanager
+def _fixture_utc():
+    """Pin local day and timing conversions on Windows as well as POSIX."""
+    def day(ts, fallback=None):
+        epoch = worker.epoch(ts)
+        return (datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).date().isoformat()
+                if epoch is not None else fallback)
+    with mock.patch.object(analyze, '_day', day), mock.patch.object(
+            latency, '_local', lambda t, tz: datetime.datetime.fromtimestamp(t, datetime.timezone.utc)):
+        yield
+
+
+def _f4_latency():
+    def group(model, tier, n, median, p90):
+        g = dict(model=model, effort='high', n=n, median_s=median, p90_s=p90,
+                 overhead_s=None, output_tps=None, above_share=None)
+        if tier is not None:
+            g['tier'] = tier
+        return g
+    return {'from': '2026-09-10', 'to': '2026-09-10', 'plan': 'prolite',
+            'responses': {'n': 8, 'median_s': 9, 'p90_s': 14.6}, 'turns': None,
+            'groups': [group('m', None, 6, 8, 15), group('n', None, 2, 10, 11.6)],
+            'tier_groups': [group('m', 'standard', 4, 12, 15.4),
+                            group('n', 'ultrafast', 1, 12, 12),
+                            group('n', 'standard', 1, 8, 8), group('m', 'fast', 2, 3, 3.8)]}
+
+
+def test_tier_partitions():
+    files, charged = _f4()
+    rates = {'input': 1, 'cached_input': .5, 'output': 2, 'cache_write': None}
+    table = {'models': {m: {t: rates for t in ('standard', 'fast', 'flex', 'ultrafast')}
+                        for m in ('m', 'n')}, 'long_context_threshold': 272000,
+             'unit_tokens': 1000000, 'as_of': '2026-09-28', 'source': 'fixture', 'path': 'fixture'}
+    for prices in ((None, 'disabled'), (table, None)):
+        with _fixture_utc():
+            p, notes = share.build_payload(files, charged, handle='ada', now=F4_NOW, prices=prices)
+        d, w = p['days'][0], p['windows'][0]
+        tiers = d['tiers']
+        check('F4 Standard partition includes both absent-tier rows',
+              tiers.get('standard') == F4_TIERS['standard'], str(tiers))
+        check('F4 Flex contributes to Standard', F4_SPLIT[2] in w['split'], str(w['split']))
+        check('F4 has a distinct Ultrafast partition',
+              tiers.get('ultrafast') == F4_TIERS['ultrafast'], str(tiers))
+        check('F4 has four exact model/tier split rows', w['split'] == F4_SPLIT, str(w['split']))
+        check('F4 day contains the complete three-class partition', tiers == F4_TIERS, str(tiers))
+        check('F4 ordinary day counts and clamps match the fixture',
+              {k: d[k] for k in COUNT_KEYS} == dict(zip(COUNT_KEYS, (8, 2000, 490, 200, 61)))
+              and d['date'] == '2026-09-10' and d['sessions'] == 4
+              and notes['clamped_cached'] == notes['clamped_reasoning'] == 1, str((d, notes)))
+        check('F4 day partitions equal every parent count, including zero fields',
+              all(sum(t[k] for t in tiers.values()) == d[k] for k in COUNT_KEYS)
+              and all(set(t) == set(COUNT_KEYS) for t in tiers.values()))
+        check('F4 window totals, percentages and plan match the fixture',
+              {k: v for k, v in w.items() if k != 'split'} == {
+                  'start': '2026-09-10T10:00:00Z', 'window_minutes': 10080, 'plan': 'prolite',
+                  'first_pct': 0, 'peak_pct': 20, 'responses': 8, 'input': 2000,
+                  'cached': 490, 'output': 200}, str(w))
+        check('F4 split sums exactly to its window in all four fields',
+              all(sum(t[k] for t in w['split']) == w[k] for k in COUNT_KEYS[:-1]))
+        wanted_sessions = []
+        for i, (start, end, active, inp, cached, out, reasoning, model) in enumerate([
+                ('10:00:06', '10:01:10', 64, 200, 40, 20, 4, 'm'),
+                ('10:02:02', '10:03:04', 62, 400, 250, 40, 25, 'm'),
+                ('10:04:08', '10:05:12', 64, 600, 200, 60, 14, 'n'),
+                ('10:06:14', '10:07:16', 62, 800, 0, 80, 18, 'm')]):
+            wanted_sessions.append(dict(id=share.session_hash(f'f4-{i}'), day='2026-09-10',
+                                        start=f'2026-09-10T{start}Z', end=f'2026-09-10T{end}Z',
+                                        active_s=active, responses=2, input=inp, cached=cached,
+                                        output=out, reasoning=reasoning, model=model))
+        check('F4 has all four exact session summaries and active times 64,62,64,62',
+              [{k: v for k, v in s.items() if k != 'api_usd'} for s in p['sessions']]
+              == wanted_sessions, str(p['sessions']))
+        check('F4 local unrecorded count covers all dated shared responses',
+              notes['tier_unrecorded'] == 2 and 'tier_unrecorded' not in d)
+        check('F4 timing summaries and independent null fits match exactly',
+              p['latency'] == _f4_latency(), str(p['latency']))
+        check('F4 schema, version, generation time and handle are exact',
+              (p['schema'], p['client'], p['generated_at'], p['handle']) ==
+              (1, {'name': 'token-counter', 'version': '1.10.0'}, '2026-09-28T12:00:00Z', 'ada'))
+        if prices[0] is None:
+            check('unpriced F4 omits API value and sends null day and session values',
+                  'api_value' not in p and d['api_usd'] is None
+                  and all(s['api_usd'] is None for s in p['sessions']))
+        else:
+            check('F4 API-value tier counts keep their pricing meanings',
+                  p['api_value']['tiers'] == {'standard': 4, 'fast': 2, 'flex': 1, 'ultrafast': 1}
+                  and p['api_value']['tier_unrecorded'] == 2
+                  and p['api_value']['tier_inferred'] == 1, str(p['api_value']))
+        text = share.describe(p, notes, 'ada', share.DEFAULT_API)
+        check('the F4 dry run always discloses absent tiers counted as Standard',
+              'tier record  2 dated shared responses had no recorded tier; counted as Standard' in text)
+
+    # Dated rows without timestamps remain in both day series; undated ones enter neither.
+    extra = {'date': '2026-09-11', 'session_id': 'untimed'}
+    row = {'tier': None, 'usage': {}}
+    with _fixture_utc():
+        p, notes = share.build_payload({'a': extra, 'b': {}}, {'a': [row], 'b': [row]},
+                                       now=F4_NOW, prices=(None, 'disabled'))
+    check('untimed dated rows partition with zero fields; undated rows are excluded',
+          p['days'] == [{'date': '2026-09-11', 'responses': 1, 'input': 0, 'cached': 0,
+                         'output': 0, 'reasoning': 0, 'sessions': 1, 'api_usd': None,
+                         'tiers': {'standard': dict(zip(COUNT_KEYS, (1, 0, 0, 0, 0)))}}]
+          and notes['tier_unrecorded'] == 1 and notes['undated_responses'] == 1
+          and not p['windows'] and 'latency' not in p, str((p, notes)))
+
+
+def test_tier_window_boundaries():
+    files, charged = _f4()
+    t0, t1 = F4_START, F4_START + 4 * 3600
+    files['f4-0']['rate_limits'] = [_quote(t0, peak=40, last=t1 - 3600),
+                                    _quote(t1, peak=5, last=t1 + 3600)]
+    tokens, splits = [], []
+    for i, r in enumerate(r for rows in charged.values() for r in rows):
+        u = r['usage']
+        inp, out = u['input_tokens'], u['output_tokens']
+        cached = min(inp, u['cached_input_tokens'])
+        tokens.append((t0 + i * 3600, inp, cached, out))
+        splits.append((t0 + i * 3600, r['model'], pricing.tier_class(r['tier']), inp, cached, out))
+    tokens += [(t0 - 1, 999, 999, 999), (None, 999, 999, 999)]
+    splits += [(t0 - 1, 'old', 'fast', 999, 999, 999), (None, 'untimed', 'fast', 999, 999, 999)]
+    tokens.reverse()
+    splits.reverse()
+    dollars = [(t, 1.0) for t, *_ in tokens]
+    old = analyze.rate_limit_windows(files, tokens, now=F4_NOW.timestamp(), newest=None, usd=dollars)
+    new = analyze.rate_limit_windows(files, tokens, now=F4_NOW.timestamp(), newest=None,
+                                     usd=dollars, split=splits)
+    a, b = new['windows']
+    first = [dict(F4_SPLIT[0], responses=2, input=200, cached=40, output=20), F4_SPLIT[1]]
+    second = [dict(F4_SPLIT[0], responses=2, input=800, cached=0, output=80), *F4_SPLIT[2:]]
+    check('split exact-boundary row belongs to the new window',
+          a['split'] == first and b['split'] == second, str([a['split'], b['split']]))
+    check('reversed timelines, pre-window and untimed rows preserve both window totals',
+          [tuple(w['tokens'][k] for k in COUNT_KEYS[:-1]) for w in (a, b)]
+          == [(4, 600, 290, 60), (4, 1400, 200, 140)])
+    stripped = copy.deepcopy(new)
+    for w in [*stripped['windows'], stripped['current']]:
+        if w:
+            w.pop('split', None)
+    check('split=None preserves every old analyzer field, token curve and dollar attribution',
+          stripped == old and all('split' not in w for w in old['windows']))
+    sent = share.limit_windows(files, tokens, F4_NOW.timestamp(), split=splits)
+    check('sharing keeps the two complete boundary splits',
+          [w['split'] for w in sent] == [first, second])
+
+
+def _split_fixture(models_by_window):
+    files = {'a': {'session_id': 'splits', 'date': '2026-09-10', 'rate_limits': []}}
+    rows = []
+    for i, models in enumerate(models_by_window):
+        start = F4_START + i * 4 * 3600
+        files['a']['rate_limits'].append(_quote(start))
+        for j, model in enumerate(models):
+            rows.append({'ts': share._iso(start + j + 1), 'model': model, 'tier': 'default',
+                         'usage': {'input_tokens': 10 + j, 'cached_input_tokens': j,
+                                   'output_tokens': 2, 'reasoning_output_tokens': 1}})
+    p, notes = share.build_payload(files, {'a': rows}, now=F4_NOW, prices=(None, 'disabled'))
+    timeline = [(worker.epoch(r['ts']), r['usage']['input_tokens'], r['usage']['cached_input_tokens'],
+                 r['usage']['output_tokens']) for r in rows]
+    old = share.limit_windows(files, timeline, F4_NOW.timestamp())
+    return p, notes, old
+
+
+def test_split_limits():
+    fifty = [f'm{j:02d}' for j in range(50)]
+    for n in (50, 51):
+        p, notes, old = _split_fixture([[f'm{j:02d}' for j in range(n)]])
+        w = p['windows'][0]
+        if n == 50:
+            check('50 distinct pairs retain a complete window split', len(w.get('split', [])) == 50)
+        else:
+            check('51-row split is absent and original totals are retained',
+                  'split' not in w and w == old[0] and notes['window_split_overflow'] == 1, str(w))
+        check(f'{n} pairs: split limits preserve windows, percentages and ordinary counts',
+              [{k: v for k, v in w.items() if k != 'split'} for w in p['windows']] == old
+              and sum(w['responses'] for w in p['windows']) == sum(d['responses'] for d in p['days']))
+        if n == 51:
+            check('per-window overflow has its exact dry-run note',
+                  'note: 1 weekly windows had over 50 model/tier rows (split not sent)'
+                  in share.describe(p, notes, None, share.DEFAULT_API))
+    for n in (20, 21):
+        p, notes, old = _split_fixture([fifty] * n)
+        windows = p['windows']
+        check(f'{n} windows: newest twenty complete splits fit the 1,000-row budget',
+              sum(len(w.get('split', [])) for w in windows) == 1000
+              and all(len(w.get('split', [])) == 50 for w in windows[-20:])
+              and ('split' in windows[0]) == (n == 20)
+              and notes['window_split_budget'] == n - 20, str(notes))
+        check(f'{n} windows: budget omission preserves all selected windows and ordinary fields',
+              [{k: v for k, v in w.items() if k != 'split'} for w in windows] == old
+              and sum(w['responses'] for w in windows) == sum(d['responses'] for d in p['days']))
+        if n == 21:
+            check('total split overflow has its exact dry-run note',
+                  'note: 1 older weekly windows were over the 1,000 split-row budget (split not sent)'
+                  in share.describe(p, notes, None, share.DEFAULT_API))
+    p, notes, _ = _split_fixture([fifty[:49] + ['x' * 80 + 'a', 'x' * 80 + 'b']])
+    split = p['windows'][0].get('split', [])
+    check('model truncation collisions coalesce before counting the 50-row bound',
+          len(split) == 50 and next((r['responses'] for r in split if r['model'] == 'x' * 80), 0) == 2
+          and notes['window_split_overflow'] == 0)
+    p, _, _ = _split_fixture([['', None]])
+    check('empty and absent models become one unknown split key',
+          p['windows'][0]['split'] == [dict(model='unknown', tier='standard', responses=2,
+                                          input=21, cached=1, output=4)])
+    p, notes, old = _split_fixture([fifty + ['overflow']] + [['m']] * 104)
+    check('newest-104 selection happens before split bounds and overflow notes',
+          len(p['windows']) == 104 and notes['window_split_overflow'] == 0
+          and all(len(w['split']) == 1 for w in p['windows'])
+          and [{k: v for k, v in w.items() if k != 'split'} for w in p['windows']] == old)
+    p, notes, _ = _split_fixture([fifty + ['overflow']] + [fifty] * 20)
+    check('per-window omission happens before total-budget counting',
+          notes['window_split_overflow'] == 1 and notes['window_split_budget'] == 0
+          and sum(len(w.get('split', [])) for w in p['windows']) == 1000)
+
+
+def test_latency_plan_context():
+    from tokencounter import account
+    files, charged = _f4()
+    with _fixture_utc(), mock.patch.object(account, 'read', return_value={'plan': 'wrong'}) as lookup:
+        p, _ = share.build_payload(files, charged, now=F4_NOW, prices=(None, 'disabled'))
+        check('F4 timing plan context is prolite', p['latency']['plan'] == 'prolite')
+        t0, t1 = F4_START, F4_START + 3600
+        windows = [{'start': share._iso(t1), 'window_minutes': 10080, 'plan': 'pro'},
+                   {'start': share._iso(t0), 'window_minutes': 10080, 'plan': 'prolite'}]
+        base = {'model': 'm', 'effort': 'high', 'usage': {'input_tokens': 10, 'output_tokens': 1}}
+        rows = [dict(base, req_ts=share._iso(t0 + 10), ts=share._iso(t0 + 20), tier='default'),
+                dict(base, req_ts=share._iso(t1 - 2), ts=share._iso(t1), tier='priority')]
+        lat = share.latency_summary({'a': {}}, {'a': rows}, F4_NOW.timestamp(), windows=windows)
+        check('two-plan latency context is null', lat['plan'] is None, str(lat))
+        check('two-plan timing groups and mixed 6/9.2 summary are retained',
+              lat['responses'] == {'n': 2, 'median_s': 6, 'p90_s': 9.2}
+              and lat['groups'][0]['n'] == 2 and sum(g['n'] for g in lat['tier_groups']) == 2)
+        intervals = share._latency_plan_windows(windows)
+        check('plan intervals are sorted and clipped at the next stored start',
+              intervals == [(t0, t1, 'prolite'), (t1, t1 + WEEK, 'pro')])
+        lat = share.latency_summary({'a': {}}, {'a': rows[1:]}, F4_NOW.timestamp(), windows=windows)
+        check('completion exactly at a new interval start uses the new plan', lat['plan'] == 'pro')
+        check('a completion at an interval stop without a successor has no plan',
+              latency._plan_at(t1 + WEEK, intervals) is None)
+        for label, ws in [('missing plan', [dict(windows[0], plan=None), windows[1]]),
+                          ('no interval', []), ('omitted intervals', None),
+                          ('outside interval', [dict(windows[1], window_minutes=1)])]:
+            lat = share.latency_summary({'a': {}}, {'a': rows}, F4_NOW.timestamp(), windows=ws)
+            check(f'{label}: the whole timing summary has null plan context', lat['plan'] is None)
+        gap = share._latency_plan_windows([dict(windows[1], window_minutes=30), windows[0]])
+        check('a quoted duration ends an interval before the next start, leaving the gap unknown',
+              gap[0] == (t0, t0 + 1800, 'prolite') and latency._plan_at(t0 + 2000, gap) is None)
+        excluded = [dict(base, ts=share._iso(t1 + 1), req_ts=None),
+                    dict(base, ts=share._iso(t1 + 2), req_ts=share._iso(t1), replayed=True),
+                    dict(base, ts=share._iso(t1 + 4000), req_ts=share._iso(t1 + 10))]
+        lat = share.latency_summary({'a': {}, 'b': {}}, {'a': rows[:1], 'b': excluded},
+                                    F4_NOW.timestamp(), windows=windows)
+        check('untimed, replayed and over-cap responses do not change timing plan context',
+              lat['plan'] == 'prolite' and lat['responses']['n'] == 1
+              and sum(g['n'] for g in lat['tier_groups']) == 1, str(lat))
+        check('timing plan context never looks up account information', lookup.call_count == 0)
+
+
+def test_tier_group_limits():
+    files = {'a': {}}
+    rows = []
+    # One mixed key has all three tiers; 50 other mixed keys give 51 mixed / 53 tier rows.
+    for i in range(53):
+        model = 'm00' if i < 3 else f'm{i - 2:02d}'
+        req = F4_START + i * 120
+        rows.append(dict(model=model, effort='high', tier=pricing.TIER_CLASSES[i % 3],
+                         req_ts=share._iso(req), ts=share._iso(req + i + 1), usage={}))
+    full, _ = latency.build(files, {'a': rows}, tier_groups=True)
+    wire = share.latency_summary(files, {'a': rows}, F4_NOW.timestamp())
+    check('mixed and tier arrays have independent 50-row caps in total-time order',
+          len(full['groups']) == 51 and len(full['tier_groups']) == 53
+          and wire['groups'] == [share._wire_group(g) for g in full['groups'][:50]]
+          and wire['tier_groups'] == [share._wire_group(g) for g in full['tier_groups'][:50]])
+    long_rows = [dict(rows[i], model='x' * 80 + suffix, effort='e' * 40 + suffix, tier='default')
+                 for i, suffix in enumerate(('a', 'b'))]
+    long, _ = latency.build(files, {'a': long_rows}, tier_groups=True)
+    check('tier keys bound model and effort before grouping collisions',
+          len(long['tier_groups']) == 1 and long['tier_groups'][0]['n'] == 2
+          and long['tier_groups'][0]['model'] == 'x' * 80
+          and long['tier_groups'][0]['effort'] == 'e' * 40)
 
 
 # ---------------------------------------------------------------------------- transport
@@ -604,6 +941,8 @@ def test_latency_floor_across_cutoff():
     r = (lat or {}).get('responses') or {}
     check('a response just inside the month is timed from the previous response\'s end',
           r.get('n') == 1 and r.get('median_s') == 25.0, str(lat))
+    check('the tier group keeps the same previous-response floor across the cutoff',
+          lat['tier_groups'][0]['n'] == 1 and lat['tier_groups'][0]['median_s'] == 25.0)
 
 
 def test_state_write_ignores_a_planted_temp_file():
@@ -648,6 +987,11 @@ def main():
     test_api_value()
     test_transport()
     test_latency_floor_across_cutoff()
+    test_tier_partitions()
+    test_tier_window_boundaries()
+    test_split_limits()
+    test_latency_plan_context()
+    test_tier_group_limits()
     test_state_write_ignores_a_planted_temp_file()
     bad = sum(1 for _, ok, _ in RESULTS if not ok)
     print(f'\n{len(RESULTS) - bad}/{len(RESULTS)} passed')

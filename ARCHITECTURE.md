@@ -942,6 +942,12 @@ the ledger's replay match: a stall of over 50 ms in the middle of a replay would
 later copies through, and a refusal back within 50 ms of the child's first record would be
 dropped. Neither has been measured. A file with no declared parent never loses an event.
 
+**Split by model and tier, for sharing.** Given `split`, `rate_limit_windows` also counts
+each window's responses by model and service-tier class (`pricing.tier_class`, §5.9). They
+are attributed by the same boundaries and the same `bisect_right` as the window's totals, so
+a window's split rows always add up to its totals. The report does not ask for it; only
+`share.py` does (§6.1).
+
 ---
 
 ### 5.7 Input counted with tiktoken
@@ -1100,6 +1106,13 @@ under development and is off by default; Codex does not write the event to the r
 to OpenTelemetry metrics and a trace-level log line. Reading it would make a log file a
 second source for the report's figures (§2), so it is not read.
 
+**Tier groups and plan, for sharing.** With `tier_groups=True`, `build` also groups the
+same samples by model, effort and service-tier class, each group with its own fit, so a Fast
+group's line is never the Standard group's. With `plan_windows`, sorted `(start, stop, plan)`
+intervals, it also returns `plan`: the plan every timed response ended under, or None when
+any ended outside a window, under no recorded plan, or under another plan. Neither changes
+the mixed groups, their fits or anything the report shows; only `share.py` asks for them.
+
 **Cost.** About 1.3–2.4 s, depending on the machine, for a synthetic ledger of 136,500
 responses in eight model and effort groups, of which the fits are 0.05–0.1 s each. The JSON carries all of it under
 `latency`: `responses`, `groups[]` (with `fit`), `hours[]`, `daily[]`, `turns`, `tools[]`
@@ -1138,6 +1151,11 @@ on the response:
   `serviceTierForTurn` applies to the turn's copy only) and the tier the server actually
   *served*, which is in `response.completed`; Codex does not persist that. A tier with no
   published rate for the model is unpriced.
+  Sharing also folds the tiers into three classes with `pricing.tier_class`: Fast for
+  `priority` or `fast`, Ultrafast for `ultrafast`, and Standard for everything else, Flex,
+  unfamiliar values and no recorded tier included. The
+  share's dry run counts every shared response with no recorded tier; `tier_unrecorded`
+  here counts only the priced ones.
 - **Prompt size** — above the long-context threshold (272K input tokens, read off the
   pricing page) a model with long-context rates is charged them for the whole request. At
   exactly the threshold it is short context ("Short context: ≤272K"). A tier with no
@@ -1347,11 +1365,16 @@ Since 1.8.0 the payload also carries the API value (§5.9), priced by the same
 `analyze.ApiValue` as the report: `api_usd` on each day and each session (null where nothing
 was valued — no priced response and no search fee — never a 0 that reads as free), and a top-level `api_value` with the total, the
 price table's date, priced and unpriced counts, tiers, the Fast upper bound and aborted
-turns. tokenusage.dev
-does not read these yet: its `SharePayloadSchema` (zod) strips keys it does not know rather
-than rejecting them, which was checked by parsing a `--out` payload with the server's own
-schema. They cost a share nothing until the server reads them, and the published page shows
-the tile either way.
+turns.
+
+Since 1.10.0 each day also carries `tiers`, its counts by service-tier class (§5.9), with
+only the classes that have responses; each window carries `split`, its counts by model and
+class (§5.6); and `latency` carries `tier_groups`, up to 50 groups by model, effort and class
+with their own fits, and `plan`, the plan every timed response ended under, else null
+(§5.8). A split is sent whole or not at all: a window with over 50 rows sends none, and
+when all the splits together exceed 1,000 rows the oldest windows' splits are left out until
+they fit. The window totals are sent either way. The dry run says how many shared responses
+had no recorded tier and so count as Standard, and how many splits were left out.
 
 It is dry-run by default and sends only with `--yes`. A damaged record with cached > input
 or reasoning > output is clamped and counted rather than failing the share, because the

@@ -111,12 +111,18 @@ the leaderboard's. Sent: per-day responses, recorded input, cached input, output
 and reasoning tokens, plus each month's top sessions by active time and by tokens (a one-way
 hash of the session id, start and end times, active time, counts and model name), plus each
 weekly rate-limit window (its start, the plan and percentages Codex logged for it, and the
-tokens counted in it, which tokenusage.dev analyses across sharers), plus
-the [API value](#api-value) per day, per session and in total (tokenusage.dev ignores it
-for now: its schema drops fields it does not know). Never
+tokens counted in it; tokenusage.dev analyses these across sharers and documents its
+own methods), plus the [API value](#api-value) per day, per session and in total. Never
 sent: prompts, outputs, tool results, file contents or paths, session titles, or anything
 from `auth.json`. `--out payload.json` writes the exact payload for you to read without
 sending it.
+
+Since 1.10.0 a share also sends each day's counts by service tier (Standard, Fast,
+Ultrafast), each weekly window's counts by model and tier when available, response times
+by model, effort and tier, and the plan the timed responses fell under, when all can be
+attributed to one recorded plan. Fast and Ultrafast mean Codex recorded that setting;
+anything else, including no recorded tier, counts as Standard. No per-request records,
+tool names, UTC hours or weekdays are sent.
 
 The first share returns a token, kept in `~/.codex/token-counter/share.json` (mode 0600); it
 is what lets you update or delete your numbers later. The leaderboard is public and every
