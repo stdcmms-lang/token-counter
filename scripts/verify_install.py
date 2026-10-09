@@ -35,7 +35,7 @@ def installed_root():
 
     Scanning every marketplace and taking the last hit, as an earlier version did, verifies
     an arbitrary copy: renaming the marketplace orphans the old cache directory, and
-    `local-dev` sorts after `jack-beanstalk-2022`, so the abandoned copy became the one
+    `local-dev` sorts after the earlier marketplace name, so the abandoned copy became the one
     checked -- reporting 9 differing files against a fresh install. The manifest names the
     marketplace this repository publishes, so that is the copy compared; any other is
     reported and ignored.

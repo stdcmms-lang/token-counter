@@ -19,8 +19,8 @@ link you can send, and only when you ask it to and confirm with `--yes`. See [Sh
 ## Install
 
 ```
-codex plugin marketplace add jack-beanstalk-2022/token-counter
-codex plugin add token-counter@jack-beanstalk-2022
+codex plugin marketplace add stdcmms-lang/token-counter
+codex plugin add token-counter@stdcmms-lang
 ```
 
 The `o200k_base` vocabulary ships in this repository, so there is nothing to download for it.
@@ -54,9 +54,9 @@ To install from a local checkout instead — developing, or reading the code bef
 it — point the marketplace at the clone:
 
 ```
-git clone https://github.com/jack-beanstalk-2022/token-counter
+git clone https://github.com/stdcmms-lang/token-counter
 codex plugin marketplace add ./token-counter
-codex plugin add token-counter@jack-beanstalk-2022
+codex plugin add token-counter@stdcmms-lang
 ```
 
 ### Desktop app
@@ -66,16 +66,16 @@ to add one, so the marketplace has to be made known to it first. Either register
 CLI:
 
 ```
-codex plugin marketplace add jack-beanstalk-2022/token-counter
+codex plugin marketplace add stdcmms-lang/token-counter
 ```
 
 or clone this repository and open it as a project: the app picks up
 `.agents/plugins/marketplace.json` from a project's root without being told. Then restart the
-app, open **Plugins**, choose the **jack-beanstalk-2022** source and install **Token Counter**.
+app, open **Plugins**, choose the **stdcmms-lang** source and install **Token Counter**.
 Once the marketplace is known, this link opens the same install flow:
 
 ```
-codex://plugins/install/token-counter?marketplace=jack-beanstalk-2022
+codex://plugins/install/token-counter?marketplace=stdcmms-lang
 ```
 
 Start a new chat afterwards; skills load only in chats begun after the install. The skills run

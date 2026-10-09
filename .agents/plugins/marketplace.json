@@ -1,7 +1,7 @@
 {
-  "name": "jack-beanstalk-2022",
+  "name": "stdcmms-lang",
   "interface": {
-    "displayName": "jack-beanstalk-2022"
+    "displayName": "stdcmms-lang"
   },
   "plugins": [
     {
