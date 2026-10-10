@@ -1,0 +1,5 @@
+# Frozen fixtures and server snapshots are compared by SHA-256 of their bytes, so they must
+# check out byte-for-byte (LF) on every platform, whatever core.autocrlf says.
+scripts/fixtures/codex_2aebba1/** -text
+scripts/server_contract/schema.ts -text
+scripts/server_contract/validate.ts -text
