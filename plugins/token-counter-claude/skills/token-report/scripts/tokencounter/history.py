@@ -555,6 +555,9 @@ def merge_response_copy(previous, incoming) -> tuple:
                 if not any(_block_evidence(b) == _block_evidence(block) for b in revisions):
                     revisions.append(copy.deepcopy(block))
                 changed = True
+            # A stable extraction may revise derived inventory rules. Content is not
+            # captured revision evidence, and replacing it must not quarantine usage.
+            old['content'] = copy.deepcopy(block.get('content', []))
             continue
         new = copy.deepcopy(block)
         # Keep retained physical evidence intact. The list is the durable order used
@@ -1005,7 +1008,7 @@ class History:
             # Preserve both versions. The original stable identity is in the value.
             key = key + ':' + digest
         inserted = self.db.execute('INSERT OR IGNORE INTO facts VALUES(?,?,?,?,?)', (kind, key, source_id, blob, digest)).rowcount
-        if conflicting and inserted:
+        if conflicting and inserted and kind != 'content':
             bump(self.counters, 'history_conflicting_revisions')
 
     def _append_facts(self, kind, source_id, values, loaded, retained, calls):
@@ -1025,7 +1028,8 @@ class History:
                 continue
             if previous:
                 key += ':' + digest
-                bump(self.counters, 'history_conflicting_revisions')
+                if kind != 'content':
+                    bump(self.counters, 'history_conflicting_revisions')
             entry = {'source_id': source_id, 'fact_key': key, 'value': safe}
             if kind == 'links':
                 entry['_safe_value'] = safe

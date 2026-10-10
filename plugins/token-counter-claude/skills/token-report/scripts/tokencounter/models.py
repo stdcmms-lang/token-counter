@@ -52,7 +52,6 @@ COUNTER_SCOPES = {
         'cost_state_count_mismatches', 'usage_report_cost_crosschecks', 'cost_check_invalid',
         'optional_metadata_invalid', 'undated_responses', 'calendar_context_changed',
         'damage_outside_window',
-        # Round 5 owns these components; extraction does not count them yet.
         'composition_unknown_blocks', 'composition_unknown_attachments',
         'composition_unkeyed_items', 'composition_invalid_unicode',
         'composition_external_tool_results_unread', 'composition_snapshot_copies',
@@ -60,6 +59,22 @@ COUNTER_SCOPES = {
         'images_unsupported_source', 'images_transformations_unknown',
         'prompt_growth_negative', 'prompt_growth_compaction_skipped',
         'prompt_growth_model_change_skipped',
+    ),
+    'pricing': (
+        'unpriced_responses', 'unpriced_input', 'unpriced_output', 'unpriced_model',
+        'unpriced_speed', 'unpriced_geography', 'unsupported_fast_setting',
+        'speed_unrecorded', 'price_cache_ttl_assumed', 'price_geography_default_global',
+        'search_count_unrecorded', 'price_search_failure_ambiguous',
+        'price_partial_responses', 'price_table_unavailable', 'price_table_invalid',
+    ),
+    'timing': (
+        'latency_replayed', 'latency_no_end', 'latency_no_start', 'latency_nonpositive',
+        'latency_over_cap', 'latency_samples', 'tool_without_response', 'tool_no_time',
+        'tool_replayed', 'tool_nonpositive', 'tool_over_cap', 'tool_calls_timed',
+        'turn_no_start', 'turn_over_cap', 'latency_partial_response',
+        'latency_copy_timestamp_unverified', 'latency_parent_chain_ambiguous',
+        'latency_subagent_prompt_missing', 'latency_unknown_speed',
+        'logged_turn_over_cap', 'latency_groups_omitted', 'latency_tier_groups_omitted',
     ),
     # These diagnostics are needed by extraction now. Attribution, clustering, timing
     # aggregation and state counters arrive with their implementing rounds.
@@ -74,6 +89,7 @@ COUNTER_SCOPES = {
         'account_subscription_date_missing', 'account_unavailable', 'account_invalid',
         'account_field_invalid', 'logged_turn_invalid', 'logged_turn_unmatched',
         'tool_unmatched_call', 'tool_unmatched_result', 'tool_identity_conflict',
+        'windows_unavailable',
     ),
     'history': (
         'history_unavailable', 'history_integrity_failed', 'history_commit_failed',
@@ -106,6 +122,44 @@ class Usage(TypedDict):
     output_tokens: int
     reasoning_output_tokens: Optional[int]
     total_tokens: int
+
+
+class Counts(TypedDict):
+    responses: int
+    input: int
+    cached: int
+    output: int
+    reasoning: int
+
+
+class ImageFact(TypedDict):
+    width: Optional[int]
+    height: Optional[int]
+    source_kind: Literal['base64', 'url', 'file', 'unknown']
+    transformations_known: bool
+    model: Optional[str]
+    estimated_visual_tokens: Optional[int]
+    method: Optional[str]
+
+
+class ContentFact(TypedDict):
+    item_key: str
+    family_id: Optional[str]
+    category: str
+    ts: Optional[str]
+    utf8_bytes: Optional[int]
+    body_digest: Optional[str]
+    snapshot: bool
+    image: Optional[ImageFact]
+
+
+class RowPrice(TypedDict):
+    tokens_usd: Optional[float]
+    tokens_usd_high: Optional[float]
+    web_search_usd: float
+    web_search_calls: int
+    unpriced_reason: Optional[str]
+    counters: Dict[str, int]
 
 
 class SourceInfo(TypedDict):
@@ -167,7 +221,7 @@ class BlockFact(TypedDict):
     api_block_index: Optional[int]
     ts: Optional[str]
     usage: Optional[ClaudeUsageFact]
-    content: List[dict]             # composition facts arrive in Round 5
+    content: List[ContentFact]
     tool_starts: List[ToolStart]
     # Freeze these content-free anchors at the first block, before a streaming tool
     # result can move them. They survive caching without retaining user records.
@@ -316,7 +370,7 @@ class FileResult(SourceInfo):
     links: List[LineageLink]
     limits: List[LimitReading]
     events: List[LimitEvent]
-    content: List[dict]
+    content: List[ContentFact]
     tool_starts: List[ToolStart]
     tool_results: List[ToolResult]
     turns: List[TurnFact]
@@ -371,7 +425,7 @@ class LedgerResult(TypedDict):
     families: Dict[str, FamilySummary]
     limits: List[LimitReading]
     events: List[LimitEvent]
-    content: List[dict]
+    content: List[ContentFact]
     tools: List[ToolInterval]
     turns: List[TurnFact]
     compactions: List[CompactionFact]
@@ -392,3 +446,30 @@ class Paths(TypedDict):
     shared_report_path: Path
     share_state_path: Path
     explicit_sessions_root: bool
+
+
+class ReportModel(TypedDict):
+    schema: int
+    client: str
+    generated_at: str
+    scope: dict
+    totals: dict
+    daily: List[dict]
+    models: List[dict]
+    sessions: List[dict]
+    categories: List[dict]
+    cat_series: List[list]
+    cat_bucket_s: int
+    rate_limits: dict
+    limit_events: dict
+    latency: dict
+    api_value: dict
+    quality: dict
+    coverage: CoverageResult
+    account: dict
+    logged_turns: dict
+    crosschecks: dict
+    reconciliation: dict
+    resend_cost: dict
+    amplification: dict
+    cache_leads: dict

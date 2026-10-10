@@ -507,9 +507,9 @@ def test_unknown_shape_counted() -> None:
                           'timestamp': '2026-09-10T00:00:22Z'})
     with corpus(case) as (result, files, _root):
         expect('unknown record counted', (totals(result), count(result, 'unknown_record_types')), ((2, 255, 18), 1))
-        # Unknown content blocks/attachments are composition diagnostics in Round 5.
-        expect('Round 3 content empty', (result['content'], files[0]['content'],
-                                        any(k.startswith('composition_') for k in result['counters'])), ([], [], False))
+    with corpus(case, metrics_only=True) as (result, files, _root):
+        expect('metrics-only content empty', (result['content'], files[0]['content'],
+                                             any(k.startswith('composition_') for k in result['counters'])), ([], [], False))
 
 
 def test_filter_after_dedup() -> None:
@@ -749,7 +749,15 @@ def test_timestamps_damage_and_modes() -> None:
     with corpus(_b()) as (full, files, _root):
         metrics_files = [worker.extract(f['path'], metrics_only=True) for f in files]
         metrics = ledger.build(metrics_files)
-        expect('metrics preserves all noncontent facts', metrics, full)
+        def noncontent(value):
+            value = copy.deepcopy(value)
+            value['content'] = []
+            value.pop('_live_content_keys', None)
+            value.pop('_live_snapshot_keys', None)
+            value['counters'] = {k: v for k, v in value['counters'].items()
+                                 if not k.startswith(('composition_', 'images_'))}
+            return value
+        expect('metrics preserves all noncontent facts', noncontent(metrics), noncontent(full))
         path = Path(files[0]['path'])
         with path.open('ab') as fh:
             fh.write(b'[]\n{invalid}\n')

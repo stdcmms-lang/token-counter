@@ -419,7 +419,8 @@ def _blank(path, metrics_only):
 
 
 def _extract_once(path, metrics_only):
-    result, copies, nodes = _blank(path, metrics_only), {}, {}
+    from . import composition
+    result, copies, nodes, contexts = _blank(path, metrics_only), {}, {}, {}
     counters = result['counters']
     before = rollout.stat_key(path)
     result['size'], result['mtime_ns'] = before
@@ -440,9 +441,23 @@ def _extract_once(path, metrics_only):
             uuid, parent = _string(record.get('uuid')), _string(record.get('parentUuid'))
             record_key = _digest(['uuid', uuid]) if uuid else _digest([source_id, line])
             state = dict(nodes.get(parent) or {'anchor': None, 'compact': None, 'turn': None})
+            content_facts = []
+            if not metrics_only:
+                content_facts, content_counters = composition.measure_record(
+                    record, dict(source_id=source_id), line)
+                for name, count in content_counters.items():
+                    bump(counters, name, count)
+                if kind != 'assistant':
+                    result['content'].extend(content_facts)
+                    # Associate prompt-side images only when their next own response
+                    # actually records a served model. A prior response may use another.
+                    pending = list(state.get('images') or [])
+                    pending.extend((f['image'], set()) for f in content_facts if f['image'] is not None)
+                    state['images'] = pending
             side = _prompt_side(record)
             if side == 'summary':
                 state['compact'] = ts
+                state['context_segment'] = record_key
             elif not inherited and side in ('turn', 'input'):
                 state['anchor'] = ts
                 if side == 'turn':
@@ -487,6 +502,26 @@ def _extract_once(path, metrics_only):
                     model, raw_model, _context = _model_name(_served_model(record))
                     copy = copies.get(key)
                     if copy is None:
+                        context_flags = []
+                        if (not excluded and state.get('seen_response')
+                                and state.get('context_segment') != state.get('response_context')):
+                            context_flags.append('prompt_growth_compaction_skipped')
+                        contexts[key] = state.get('context_segment')
+                        if not excluded:
+                            for image, served in state.get('images') or []:
+                                served.add(model)
+                                old_known = image['model'] is not None
+                                composition.assign_image_model(image, model if len(served) == 1 else None)
+                                new_known = image['model'] is not None
+                                if old_known and not new_known:
+                                    bump(counters, 'images_unknown_model')
+                                elif new_known and not old_known:
+                                    remaining = counters.get('images_unknown_model', 0) - 1
+                                    if remaining > 0:
+                                        counters['images_unknown_model'] = remaining
+                                    else:
+                                        counters.pop('images_unknown_model', None)
+                            state['images'] = []
                         copy = copies[key] = {
                             'response_key': key, 'source_id': source_id,
                             'session_id': result['session_id'],
@@ -496,7 +531,7 @@ def _extract_once(path, metrics_only):
                             'advisor_model': None,
                             'effort': None, 'per_turn_effort': None, 'aborted': False,
                             'truncated': False, 'stop_reason': None, 'terminal_record_key': None,
-                            'partial': False, 'timestamp_quality': 'unknown', 'quality_flags': [],
+                            'partial': False, 'timestamp_quality': 'unknown', 'quality_flags': context_flags,
                         }
                     flags = copy['quality_flags']
                     requested = record.get('requestedModel')
@@ -543,7 +578,7 @@ def _extract_once(path, metrics_only):
                         copy['blocks'].append({'record_key': record_key, 'uuid': uuid,
                                                'parent_uuid': parent, 'physical_line': line,
                                                'api_block_index': index, 'ts': ts, 'usage': usage,
-                                               'content': [], 'tool_starts': starts,
+                                               'content': content_facts, 'tool_starts': starts,
                                                'req_ts': anchor, 'turn': block_turn})
                         result['tool_starts'].extend(starts)
                         state['calls'] = dict(state.get('calls') or {})
@@ -552,7 +587,15 @@ def _extract_once(path, metrics_only):
                         copy['aborted'] = copy['aborted'] or record.get('isAbortedMidStream') is True
                         copy['truncated'] = copy['truncated'] or record.get('truncatedAfterOutput') is True
                         copy['partial'] = _partial(copy['aborted'], copy['truncated'])
+                        if isinstance(content, list) and any(
+                                isinstance(b, dict) and b.get('type') == 'web_search_tool_result'
+                                and isinstance(b.get('content'), dict)
+                                and b['content'].get('type') == 'web_search_tool_result_error'
+                                for b in content):
+                            flags.append('price_search_failure_ambiguous')
                         if usage is not None:
+                            state['seen_response'] = True
+                            state['response_context'] = contexts[key]
                             copy['terminal_record_key'] = record_key
                             stop = message.get('stop_reason')
                             copy['stop_reason'] = stop if stop in ('tool_use', 'end_turn', 'max_tokens',
@@ -654,8 +697,18 @@ def _extract_once(path, metrics_only):
     result['stable_read'] = before == after and result['prefix_hash'] == rollout.prefix_hash(path)
     if not result['stable_read']:
         bump(counters, 'file_changed_during_read')
-    # Content measurement is Round 5. Both modes leave content empty and count nothing
-    # for composition; metrics_only already preserves every non-content fact.
+    # Prompt growth is a recorded-count diagnostic, independent of inventory mode.
+    growth_rows = []
+    for response in result['responses']:
+        blocks = [b for b in response['blocks'] if b['usage'] is not None]
+        if blocks and not any(f in response['quality_flags'] for f in (
+                'synthetic_records', 'api_error_records', 'response_model_conflict')):
+            u = blocks[-1]['usage']
+            growth_rows.append({'ts': blocks[-1]['ts'], 'model': response['raw_model'],
+                                'quality_flags': response['quality_flags'],
+                                'usage': {'input_tokens': u['base_input'] + u['creation'] + u['reads']}})
+    for name, count in composition.prompt_growth(growth_rows, result['compactions']).items():
+        bump(counters, name, count)
     return result
 
 

@@ -316,11 +316,13 @@ def _response_row(owner, attribution, counters, day_spans=None):
     usage = terminal['usage']
     model, raw_model, context = _model_name(owner['raw_model'])
     flags = set(owner['quality_flags']) | set(usage['invalid_optional_fields'])
+    if not usage['searches']:
+        flags.discard('price_search_failure_ambiguous')
     effort, effort_reason = _effort(owner['effort'], owner['per_turn_effort'])
     if effort_reason:
         flags.add(effort_reason)
     for name in sorted(flags):
-        if name != 'response_replay_timestamp_unverified':
+        if name not in ('response_replay_timestamp_unverified', 'prompt_growth_compaction_skipped'):
             bump(counters, name)
     if owner['partial']:
         bump(counters, 'partial_responses')
@@ -345,6 +347,10 @@ def _response_row(owner, attribution, counters, day_spans=None):
         day, start, end = None, None, None
         bump(counters, 'undated_responses')
     req_ts = _timing_anchor(owner)
+    if (owner['agent_id'] is not None and req_ts is None and not owner['partial']
+            and owner['timestamp_quality'] == 'original'):
+        flags.add('latency_subagent_prompt_missing')
+        bump(counters, 'latency_subagent_prompt_missing')
     whole_input = usage['base_input'] + usage['creation'] + usage['reads']
     return {
         'response_key': owner['response_key'], 'source_id': owner['source_id'],
@@ -492,6 +498,9 @@ def _tools(results, owners, attribution, counters):
         stream = attribution[owner['source_id']]['stream_id']
         for block in owner['blocks']:
             for fact in block['tool_starts']:
+                if owner['timestamp_quality'] != 'original':
+                    bump(counters, 'tool_replayed')
+                    continue
                 key = (stream, fact['tool_key'])
                 if key in starts:
                     bump(counters, 'auxiliary_fact_copies')
@@ -647,6 +656,13 @@ def _historical_results(live, history, counters):
 def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerResult:
     """Canonicalize every source before any caller applies date or session filters."""
     results = list(results.values()) if isinstance(results, dict) else list(results)
+    live_content = [(r['source_id'], f) for r in results if r['stable_read']
+                    for f in r['content'] + [f for c in r['responses'] for b in c['blocks'] for f in b['content']]]
+    live_events = {f['event_key']: True for r in results if r['stable_read'] for f in r['events']}
+    live_starts = {f['tool_key'] for r in results if r['stable_read'] for f in r['tool_starts']}
+    live_tool_results = {f['tool_key'] for r in results if r['stable_read'] for f in r['tool_results']}
+    live_logged = {f['logged_record_key']: True for r in results if r['stable_read']
+                   for f in r['turns'] if f['logged_record_key'] is not None}
     counters = {}
     state, calendars, live_keys = None, {}, set()
     if history is not None:
@@ -655,7 +671,9 @@ def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerRes
         account_snapshots = list({_digest(s): s for s in account_snapshots}.values())
     recomputed = {'limit_events', 'limit_readings', 'limit_429_assumed_all_models',
                   'limit_events_undated', 'limit_event_invalid_timestamp',
-                  'compaction_boundaries', 'compaction_usage_unavailable'}
+                  'compaction_boundaries', 'compaction_usage_unavailable',
+                  'prompt_growth_negative', 'prompt_growth_compaction_skipped',
+                  'prompt_growth_model_change_skipped'}
     for result in results:
         for name, count in result['counters'].items():
             if name not in recomputed:
@@ -738,15 +756,39 @@ def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerRes
                 bump(counters, 'compaction_usage_unavailable')
     checks = _unique_facts([f for r in results for f in r['cost_checks']], 'record_key', attribution, counters)
     _cost_diagnostics(checks, rows, counters)
+    from . import composition
+    content = []
+    for source in sorted(results, key=lambda r: _source_rank(attribution[r['source_id']])):
+        family = attribution[source['source_id']]['family_id']
+        content.extend(dict(f, family_id=family) for f in composition.latest_items(source['content']))
+    for owner in owners:
+        family = attribution[owner['source_id']]['family_id']
+        content.extend(dict(f, family_id=family) for b in owner['blocks'] for f in b['content'])
+    content, content_counters = composition.combine(content, {})
+    for name, count in content_counters.items():
+        bump(counters, name, count)
+    for stream, stream_rows in by_stream.items():
+        boundaries = [f for r in results if attribution[r['source_id']]['stream_id'] == stream
+                      for f in r['compactions']]
+        for name, count in composition.prompt_growth(stream_rows, boundaries).items():
+            bump(counters, name, count)
     result = {
         'rows': rows, 'by_stream': dict(by_stream),
         'families': {family: _family_summary(family, family_rows, attribution)
                      for family, family_rows in sorted(families.items())},
-        'limits': limits, 'events': events, 'content': [],
+        'limits': limits, 'events': events, 'content': content,
         'tools': _tools(results, owners, attribution, counters),
         'turns': turns, 'compactions': compactions,
         'cost_checks': checks, 'account_snapshots': copylib.deepcopy(list(account_snapshots)),
         'counters': counters,
+        '_live_content_keys': {f['item_key']: True for _sid, f in live_content},
+        '_live_snapshot_keys': [[attribution[sid]['family_id'], f['category'], f['body_digest']]
+                                for sid, f in live_content if f['snapshot'] and f['body_digest'] is not None],
+        '_live_event_keys': live_events,
+        '_live_tool_keys': {key: True for key in live_starts & live_tool_results},
+        '_live_logged_keys': live_logged,
+        '_source_families': {sid: {k: info[k] for k in ('session_id', 'family_id', 'stream_id')}
+                             for sid, info in attribution.items()},
         'coverage': {'history_available': False, 'history_committed': False, 'token_bound': False,
                      'calendar_completeness': 'unknown', 'captured_responses': len(rows),
                      'archived_responses': 0, 'safe_months': [], 'withheld_months': {},

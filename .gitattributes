@@ -3,3 +3,4 @@
 scripts/fixtures/codex_2aebba1/** -text
 scripts/server_contract/schema.ts -text
 scripts/server_contract/validate.ts -text
+scripts/fixtures/anthropic_pricing.md -text

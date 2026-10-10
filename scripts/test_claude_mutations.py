@@ -639,12 +639,219 @@ def _retention_main():
     return 1 if bad else 0
 
 
+PRICING_MANIFEST = {}
+
+
+def pricing_pair(test, function, mutation, assertion):
+    def decorate(factory):
+        PRICING_MANIFEST[test] = {'function': function, 'mutation': mutation,
+                                  'assertion': assertion, 'factory': factory}
+        return factory
+    return decorate
+
+
+def _price_edit(original, edit):
+    def changed(row, prices):
+        row = copy.deepcopy(row)
+        edit(row)
+        return original(row, prices)
+    return changed
+
+
+@pricing_pair('test_price_table_finite_rates', 'pricing._table_ok', 'accept an invalid table whole', 'finite rates reject whole table')
+def _prices_allow_invalid(original):
+    return lambda table: True
+
+
+@pricing_pair('test_unavailable_table_keeps_recorded_search_counts', 'pricing.price_row',
+              'drop observed search count with an unavailable table',
+              'missing table keeps observed calls without fallback rates')
+def _prices_unavailable_drops_calls(original):
+    return _price_edit(original, lambda row: row.update(web_search_requests=0))
+
+
+@pricing_pair('test_fast_R1', 'pricing.price_row', 'ignore recorded Fast speed', 'Fast R1 tokens')
+@pricing_pair('test_fast_us_R1', 'pricing.price_row', 'ignore Fast while retaining US', 'Fast US R1 tokens')
+def _prices_fast_as_standard(original):
+    return _price_edit(original, lambda row: row.update(speed='standard'))
+
+
+@pricing_pair('test_us_R1', 'pricing.price_row', 'ignore explicit US multiplier', 'US R1 tokens')
+def _prices_us_as_global(original):
+    return _price_edit(original, lambda row: row.update(inference_geo='global'))
+
+
+@pricing_pair('test_haiku_threshold', 'pricing.price_row', 'make low prompt threshold exclusive', 'Haiku threshold inclusive low band')
+def _prices_threshold_exclusive(original):
+    def edit(row):
+        if row['usage']['input_tokens'] == 100000:
+            row['usage']['input_tokens'] += 1
+    return _price_edit(original, edit)
+
+
+@pricing_pair('test_haiku_threshold_includes_reads', 'pricing.price_row', 'choose band from base input alone', 'Haiku threshold includes reads')
+def _prices_threshold_base_only(original):
+    return _price_edit(original, lambda row: row['usage'].update(input_tokens=row['base_input_tokens']))
+
+
+@pricing_pair('test_thinking_not_added', 'pricing.price_row', 'bill thinking as extra output', 'thinking is already output')
+def _prices_bill_thinking(original):
+    return _price_edit(original, lambda row: row['usage'].update(
+        output_tokens=row['usage']['output_tokens'] + (row['usage']['reasoning_output_tokens'] or 0)))
+
+
+@pricing_pair('test_web_fetch_zero_fee', 'pricing.price_row', 'bill fetch like search', 'fetch fee zero')
+def _prices_bill_fetch(original):
+    def changed(row, prices):
+        value = original(row, prices)
+        value['web_search_usd'] += (row['web_fetch_requests'] or 0) * .01
+        return value
+    return changed
+
+
+@pricing_pair('test_missing_search_default_zero', 'pricing.price_row', 'invent one unrecorded search', 'missing search zero fee')
+def _prices_missing_search(original):
+    return _price_edit(original, lambda row: row.update(web_search_requests=1))
+
+
+@pricing_pair('test_unknown_ttl_assumed_5m', 'pricing.price_row', 'make unknown TTL high use five minutes', 'unknown TTL high all one hour')
+def _prices_unknown_ttl_exact(original):
+    return _price_edit(original, lambda row: row.update(cache_write_5m=row['cache_creation_input_tokens'],
+                                                       cache_write_1h=0, cache_ttl_complete=True))
+
+
+@pricing_pair('test_missing_speed_standard_price_only', 'pricing.price_row', 'default absent speed to Fast', 'missing speed Standard default')
+def _prices_missing_speed_fast(original):
+    return _price_edit(original, lambda row: row.update(speed='fast'))
+
+
+@pricing_pair('test_missing_speed_and_ttl_high', 'pricing.price_row', 'omit Fast adjustment from joint high', 'missing speed TTL joint high')
+def _prices_joint_high_standard(original):
+    return _price_edit(original, lambda row: row.update(speed='standard'))
+
+
+@pricing_pair('test_not_available_geo_global', 'pricing.price_row', 'default unavailable geography to US', 'unavailable geography global')
+@pricing_pair('test_missing_geo_global', 'pricing.price_row', 'default missing geography to US', 'missing geography global')
+def _prices_default_geo_us(original):
+    return _price_edit(original, lambda row: row.update(inference_geo='us'))
+
+
+@pricing_pair('test_unknown_geo_unpriced', 'pricing.price_row', 'price unknown geography globally', 'unknown geography unpriced')
+def _prices_unknown_geo_global(original):
+    return _price_edit(original, lambda row: row.update(inference_geo='global'))
+
+
+@pricing_pair('test_opus46_fast_fallback', 'pricing.price_row', 'double the documented Standard fallback', 'Opus 46 Fast falls back to Standard')
+def _prices_opus46_fast(original):
+    def changed(row, prices):
+        value = original(row, prices)
+        if row['model'] == 'claude-opus-4-6' and row['speed'] == 'fast':
+            value['tokens_usd'] *= 2
+            value['tokens_usd_high'] *= 2
+        return value
+    return changed
+
+
+@pricing_pair('test_opus47_fast_unpriced', 'pricing.price_row', 'accept unsupported Fast at Standard price', 'Opus 47 Fast unpriced')
+def _prices_opus47_fast(original):
+    return _price_edit(original, lambda row: row.update(speed='standard'))
+
+
+@pricing_pair('test_web_search_error_no_invented_fee', 'pricing.price_row', 'bill failed search evidence without a count', 'search errors do not invent fee')
+def _prices_bill_failed_search(original):
+    return _price_edit(original, lambda row: row.update(web_search_requests=row.get('web_search_failures', 0)))
+
+
+def _evaluate_pricing(suite, entry, factory=None):
+    def run():
+        suite.RESULTS.clear()
+        try:
+            with suite.offline():
+                getattr(suite, entry['test'])()
+        except BaseException as exc:
+            return list(suite.RESULTS), exc.__class__.__name__
+        return list(suite.RESULTS), None
+
+    before, error = run()
+    named = entry['assertion']
+    if error or not before or any(not ok for _n, ok, _d in before) or not any(n == named for n, _ok, _d in before):
+        return False, 'invalid mutation: baseline did not pass its designated assertion'
+    module_name, function_name = entry['function'].split('.')
+    module = {'pricing': suite.pricing}[module_name]
+    original = getattr(module, function_name)
+    state = {'calls': 0, 'error': None}
+    try:
+        mutation = (factory or entry['factory'])(original)
+    except BaseException as exc:
+        return False, 'invalid mutation: setup ' + exc.__class__.__name__
+
+    def instrumented(*args, **kwargs):
+        state['calls'] += 1
+        try:
+            return mutation(*args, **kwargs)
+        except BaseException as exc:
+            state['error'] = exc.__class__.__name__
+            raise
+
+    setattr(module, function_name, instrumented)
+    try:
+        after, error = run()
+    finally:
+        setattr(module, function_name, original)
+    if state['error'] or error:
+        return False, 'invalid mutation: exception ' + (state['error'] or error)
+    if not state['calls']:
+        return False, 'invalid mutation: decision did not execute'
+    if not any(n == named and not ok for n, ok, _d in after):
+        return False, 'invalid mutation: designated assertion did not fail'
+    return True, 'caught by: ' + named
+
+
+def _pricing_main():
+    spec = importlib.util.spec_from_file_location('test_claude_pricing', str(Path(__file__).with_name('test_claude_pricing.py')))
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    missing = set(suite.PRICING_DECISIONS) - set(PRICING_MANIFEST)
+    if missing:
+        print('[FAIL] missing pricing mutation pairs: ' + ', '.join(sorted(missing)))
+        return 1
+    entries = {name: dict(entry, test=name) for name, entry in PRICING_MANIFEST.items()}
+    witness = entries['test_fast_R1']
+    for exception in (RuntimeError, ImportError):
+        def factory(original):
+            def crash(*args, **kwargs):
+                raise exception('invented mutation failure')
+            return crash
+        ok, reason = _evaluate_pricing(suite, witness, factory)
+        if ok or 'invalid mutation: exception ' not in reason:
+            print('[FAIL] pricing mutation exception self-test')
+            return 1
+    noop, _ = _evaluate_pricing(suite, witness, lambda original: original)
+    unrelated, _ = _evaluate_pricing(suite, witness,
+                                    lambda original: lambda row, prices: dict(original(row, prices), web_search_usd=0))
+    if noop or unrelated:
+        print('[FAIL] pricing mutation sensitivity self-test')
+        return 1
+    print('[PASS] crashes, import errors, no-ops and unrelated failures are invalid mutations')
+    bad = 0
+    for name, entry in sorted(entries.items()):
+        ok, reason = _evaluate_pricing(suite, entry)
+        bad += int(not ok)
+        print('[%s] %s -> %s -> %s\n        %s' %
+              ('PASS' if ok else 'FAIL', name, entry['function'], entry['mutation'], reason))
+    print('\n%d/%d pricing mutations caught' % (len(entries) - bad, len(entries)))
+    return 1 if bad else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--section', choices=('ledger', 'retention'), default='ledger')
+    parser.add_argument('--section', choices=('ledger', 'retention', 'pricing'), default='ledger')
     args = parser.parse_args(argv)
     if args.section == 'retention':
         return _retention_main()
+    if args.section == 'pricing':
+        return _pricing_main()
     missing = set(tests.LEDGER_TESTS) - set(MANIFEST)
     if missing:
         print('[FAIL] missing ledger mutation pairs: ' + ', '.join(sorted(missing)))
