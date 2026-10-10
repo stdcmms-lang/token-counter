@@ -13,6 +13,8 @@ the sharing layer. An existing binding must have a receipt in this history.
 """
 import base64
 import copy
+import functools
+import gc
 import hashlib
 import json
 import math
@@ -22,8 +24,8 @@ import time
 import uuid
 import zlib
 
-from .models import COUNTER_NAMES, FACT_CODEC, CoverageResult, bump
-from .worker import _digest, _model_name, epoch
+from .models import COUNTER_NAMES, FACT_CODEC, CoverageResult, LedgerResult, bump
+from .worker import _digest, _model_name as _raw_model_name, epoch
 
 SCHEMA_VERSION = 1
 ACTIVE_STATUSES = ('prepared', 'confirmed', 'unknown')
@@ -35,6 +37,27 @@ CALENDAR_FIELDS = ('local_day', 'day_start', 'day_end', 'calendar_signature')
 SNAPSHOT_FIELDS = ('observed_at', 'organization_type', 'rate_limit_tier', 'current_plan', 'subscription_created_at')
 FACT_KINDS = ('links', 'limits', 'events', 'content', 'tool_starts', 'tool_results',
               'turns', 'compactions', 'cost_checks')
+# Row granularity is independent of schema/codec 1. Old single-fact rows remain readable.
+FACT_LIST_KEY = 'source-list'
+USAGE_FIELDS = ('base_input', 'creation', 'reads', 'output', 'thinking', 'write_5m',
+                'write_1h', 'searches', 'fetches', 'speed', 'service_tier', 'inference_geo',
+                'iterations_count', 'iterations_agree', 'valid_ttl', 'invalid_optional_fields')
+METADATA_FIELDS = ('raw_model', 'requested_model', 'advisor_model', 'effort', 'per_turn_effort',
+                   'aborted', 'truncated', 'stop_reason')
+COPY_FIELDS = ('response_key', 'source_id', 'effort', 'per_turn_effort', 'aborted', 'truncated',
+               'stop_reason', 'terminal_record_key', 'partial', 'timestamp_quality', 'raw_model',
+               'requested_model', 'advisor_model', 'quality_flags', '_history_codec',
+               'history_merged', 'conflicting')
+BLOCK_FIELDS = ('record_key', 'physical_line', 'api_block_index', 'ts', 'req_ts', 'turn', 'uuid', 'parent_uuid')
+COPY_DATA_FIELDS = tuple(k for k in COPY_FIELDS if k not in (
+    'response_key', 'source_id', '_history_codec'))
+COPY_BOOL_FIELDS = ('aborted', 'truncated', 'partial', 'history_merged', 'conflicting')
+COPY_VALUE_FIELDS = tuple(k for k in COPY_DATA_FIELDS if k not in COPY_BOOL_FIELDS)
+COPY_LOCAL_FIELDS = frozenset(('session_id', 'agent_id', '_history_sha256'))
+COPY_STORED_FIELDS = frozenset(COPY_FIELDS) | {'blocks', 'revisions', 'metadata_revisions'}
+# The one positional response layout ever written. A plain dictionary blob is the
+# round-4 layout and is read as it is.
+COPY_COLUMNS = 5
 DDL = """
 CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE sources(
@@ -89,7 +112,14 @@ def _json_bytes(value):
 
 def _pack(value):
     raw = _json_bytes(value)
-    return zlib.compress(raw, 6), hashlib.sha256(raw).hexdigest()
+    blob = zlib.compress(raw, 6)
+    if len(raw) < 4096:
+        # Short independent streams sometimes compress better with fewer lazy
+        # matches. Both encode the identical canonical bytes and checked digest.
+        compact = zlib.compress(raw, 4)
+        if len(compact) < len(blob):
+            blob = compact
+    return blob, hashlib.sha256(raw).hexdigest()
 
 
 def _checked_digest(raw, expected):
@@ -117,20 +147,30 @@ def _now(value):
 
 
 def _fields(value, names):
-    return {name: copy.deepcopy(value.get(name)) for name in names}
+    # The allow-lists select scalars. Callers rebuild the few nested measurements
+    # explicitly, rather than recursively copying every scalar in every block.
+    return {name: value.get(name) for name in names}
 
 
+@functools.lru_cache(maxsize=1 << 18)
 def _identifier(value, kind):
     return _digest([kind, value]) if value is not None else None
+
+
+_cached_model_name = functools.lru_cache(maxsize=1024)(_raw_model_name)
+
+
+def _model_name(value):
+    return _cached_model_name(value) if isinstance(value, str) else _raw_model_name(value)
 
 
 def _safe_usage(usage):
     if usage is None:
         return None
-    return _fields(usage, ('base_input', 'creation', 'reads', 'output', 'thinking',
-                          'write_5m', 'write_1h', 'searches', 'fetches', 'speed',
-                          'service_tier', 'inference_geo', 'iterations_count',
-                          'iterations_agree', 'valid_ttl', 'invalid_optional_fields'))
+    out = _fields(usage, USAGE_FIELDS)
+    if out['invalid_optional_fields'] is not None:
+        out['invalid_optional_fields'] = list(out['invalid_optional_fields'])
+    return out
 
 
 def _safe_content(fact):
@@ -153,6 +193,34 @@ def _safe_tool(fact, *, stored=False):
         result['parent_uuid'] = (fact.get('parent_uuid') if stored else
                                  _identifier(fact.get('parent_uuid'), 'uuid'))
     return result
+
+
+def _tool_matches(fact, previous, *, stored=False):
+    """Compare the scalar tool allow-list without allocating a sanitized fact."""
+    named, recorded = 'name' in fact, 'record_key' in fact
+    if (len(previous) != 4 + int(named) + 2 * int(recorded) or
+            named != ('name' in previous) or recorded != ('record_key' in previous)):
+        return False
+    for field in ('tool_key', 'stream_id', 'ts', 'call_id'):
+        if field not in previous:
+            return False
+        value = fact.get(field)
+        if field == 'call_id' and not stored:
+            value = _identifier(value, 'call')
+        if type(value) is not type(previous[field]) or value != previous[field]:
+            return False
+    if named and previous['name'] is not None:
+        return False
+    if recorded:
+        for field in ('record_key', 'parent_uuid'):
+            if field not in previous:
+                return False
+            value = fact.get(field)
+            if field == 'parent_uuid' and not stored:
+                value = _identifier(value, 'uuid')
+            if type(value) is not type(previous[field]) or value != previous[field]:
+                return False
+    return True
 
 
 def _safe_block(block, stored=False):
@@ -191,8 +259,212 @@ def _safe_copy(value):
 
 
 def _restore_copy(value, source):
-    return dict(copy.deepcopy(value), session_id=source['session_id'],
+    return dict(value, session_id=source['session_id'],
                 agent_id=source['thread_id'] if source['kind'] == 'subagent' else None)
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _wire_hash(value):
+    if isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value):
+        return '~' + base64.b64encode(bytes.fromhex(value)).decode('ascii')
+    return value
+
+
+@functools.lru_cache(maxsize=1 << 19)
+def _read_hash(value):
+    if isinstance(value, str) and len(value) == 45 and value.startswith('~'):
+        raw = base64.b64decode(value[1:], validate=True)
+        if len(raw) != 32:
+            raise ValueError('invalid stored identifier')
+        return raw.hex()
+    return value
+
+
+def _copy_payload(value, calls=None):
+    """Lossless positional JSON for the same allow-listed fields, still schema 1.
+
+    Separate response blobs cannot share zlib's dictionary. Fixed columns avoid
+    repeating that dictionary in every response; old dictionary blobs still decode.
+    """
+    if value['_history_codec'] != FACT_CODEC:
+        raise ValueError('uncaptured response encoding')
+
+    def tool(f):
+        retained = calls is not None and f['call_id'] is not None and calls.get((value['source_id'], f['tool_key'])) == (
+            f['call_id'], f['stream_id'])
+        return [_wire_hash(f['tool_key']), [] if retained else _wire_hash(f['call_id']), f['ts'],
+                [] if retained else _wire_hash(f['stream_id']),
+                'name' in f, [_wire_hash(f['record_key']), _wire_hash(f['parent_uuid'])] if 'record_key' in f else None]
+
+    def block(b):
+        metadata = b['response_metadata']
+        delta = (None if metadata is None else [[i, metadata.get(k)] for i, k in enumerate(METADATA_FIELDS)
+                                               if not _same_data(metadata.get(k), value.get(k))])
+        return [[_wire_hash(b.get(k)) if k in ('record_key', 'uuid', 'parent_uuid') else b.get(k) for k in BLOCK_FIELDS],
+                None if b['usage'] is None else [b['usage'].get(k) for k in USAGE_FIELDS],
+                b['content'], [tool(f) for f in b['tool_starts']],
+                delta]
+    if any(type(value[k]) is not bool for k in COPY_BOOL_FIELDS):
+        raise ValueError('invalid captured response flags')
+    flags = sum(1 << i for i, k in enumerate(COPY_BOOL_FIELDS) if value[k])
+    return [COPY_COLUMNS,
+            [flags] + [_wire_hash(value.get(k)) if k == 'terminal_record_key' else value.get(k) for k in COPY_VALUE_FIELDS],
+            [block(b) for b in value['blocks']], [block(b) for b in value['revisions']],
+            [[r.get(k) for k in METADATA_FIELDS] for r in value['metadata_revisions']]]
+
+
+def _expand_copy(value, response_key=None, source_id=None, calls=None):
+    """The inverse of _copy_payload; a round-4 dictionary blob is returned as it is."""
+    if not isinstance(value, list):
+        return value
+    if len(value) != 5 or value[0] != COPY_COLUMNS:
+        raise ValueError('unsupported response columns')
+    _layout, header, blocks, revisions, metadata_revisions = value
+
+    def fields(names, values):
+        if not isinstance(values, list) or len(names) != len(values):
+            raise ValueError('invalid response columns')
+        return dict(zip(names, values))
+
+    def tool(f):
+        if len(f) != 6:
+            raise ValueError('invalid tool columns')
+        key = _read_hash(f[0])
+        if f[1] == [] and f[3] == []:
+            call, stream = calls[(source_id, key)]
+        else:
+            call, stream = _read_hash(f[1]), _read_hash(f[3])
+        out = dict(tool_key=key, call_id=call, ts=f[2], stream_id=stream)
+        if f[4]:
+            out['name'] = None
+        if f[5] is not None:
+            if len(f[5]) != 2:
+                raise ValueError('invalid tool columns')
+            out.update(record_key=_read_hash(f[5][0]), parent_uuid=_read_hash(f[5][1]))
+        return out
+
+    def block(b):
+        if len(b) != 5:
+            raise ValueError('invalid block columns')
+        scalars = fields(BLOCK_FIELDS, b[0])
+        for name in ('record_key', 'uuid', 'parent_uuid'):
+            scalars[name] = _read_hash(scalars[name])
+        metadata = None
+        if b[4] is not None:
+            metadata = dict(envelope)
+            for index, item in b[4]:
+                if type(index) is not int or not 0 <= index < len(METADATA_FIELDS):
+                    raise ValueError('invalid envelope columns')
+                metadata[METADATA_FIELDS[index]] = item
+        return dict(scalars, usage=None if b[1] is None else fields(USAGE_FIELDS, b[1]),
+                    content=b[2], tool_starts=[tool(f) for f in b[3]],
+                    response_metadata=metadata)
+
+    if not isinstance(header, list) or len(header) != len(COPY_VALUE_FIELDS) + 1:
+        raise ValueError('invalid response columns')
+    flags = header[0]
+    if type(flags) is not int or not 0 <= flags < (1 << len(COPY_BOOL_FIELDS)):
+        raise ValueError('invalid response flags')
+    scalars = fields(COPY_VALUE_FIELDS, header[1:])
+    scalars.update({k: bool(flags & (1 << i)) for i, k in enumerate(COPY_BOOL_FIELDS)})
+    scalars.update(response_key=response_key, source_id=source_id, _history_codec=FACT_CODEC)
+    scalars['terminal_record_key'] = _read_hash(scalars['terminal_record_key'])
+    envelope = {k: scalars.get(k) for k in METADATA_FIELDS}
+    return dict(scalars, blocks=[block(b) for b in blocks],
+                revisions=[block(b) for b in revisions],
+                metadata_revisions=[fields(METADATA_FIELDS, r) for r in metadata_revisions])
+
+
+def _same_copy(safe, previous):
+    keys = safe.keys() - COPY_LOCAL_FIELDS
+    return (previous.keys() - COPY_LOCAL_FIELDS == keys and
+            all(_same_data(previous[k], safe[k]) for k in keys))
+
+
+def _same_data(a, b):
+    """JSON identity includes scalar types (1 and 1.0 have different digests)."""
+    if a is b:
+        return True
+    kind = type(a)
+    if kind is not type(b) or a != b:
+        return False
+    if kind is dict:
+        return all(_same_data(value, b[key]) for key, value in a.items())
+    if kind is list:
+        return all(_same_data(x, y) for x, y in zip(a, b))
+    return True
+
+
+def _copy_matches(value, previous):
+    """Compare the safe projection without allocating another tree or digesting it."""
+    if previous.keys() - COPY_LOCAL_FIELDS != COPY_STORED_FIELDS or not previous['history_merged']:
+        return False
+    if value.get('revisions') or previous['revisions'] or value.get('metadata_revisions') or previous['metadata_revisions']:
+        return False
+    for field in COPY_FIELDS:
+        if field in ('raw_model', 'requested_model', 'advisor_model'):
+            candidate = _model_name(value.get(field))[1]
+        elif field == 'quality_flags':
+            candidate = sorted(set(value[field]) & COUNTER_NAMES) if value.get(field) else []
+        elif field in ('_history_codec', 'history_merged'):
+            candidate = FACT_CODEC if field == '_history_codec' else True
+        else:
+            candidate = value.get(field, False if field == 'conflicting' else None)
+        if field == 'quality_flags':
+            if not _same_data(candidate, previous[field]):
+                return False
+        elif type(candidate) is not type(previous[field]) or candidate != previous[field]:
+            return False
+    incoming = value.get('blocks', ())
+    if len(incoming) != len(previous['blocks']):
+        return False
+    stored = value.get('_history_codec') == FACT_CODEC
+    for block, old in zip(incoming, previous['blocks']):
+        for field in BLOCK_FIELDS:
+            candidate = block.get(field)
+            if field in ('uuid', 'parent_uuid') and not stored:
+                candidate = _identifier(candidate, 'uuid')
+            prior_value = old.get(field)
+            if type(candidate) is not type(prior_value) or candidate != prior_value:
+                return False
+        usage, prior = block.get('usage'), old['usage']
+        if (usage is None) != (prior is None):
+            return False
+        if usage is not None:
+            for k in USAGE_FIELDS:
+                a, b = usage.get(k), prior.get(k)
+                if k == 'invalid_optional_fields':
+                    if not _same_data(a, b):
+                        return False
+                elif type(a) is not type(b) or a != b:
+                    return False
+        metadata, prior = block.get('response_metadata'), old['response_metadata']
+        if (metadata is None) != (prior is None):
+            return False
+        if metadata is not None and any(type(metadata.get(k)) is not type(prior.get(k)) or
+                                        metadata.get(k) != prior.get(k) for k in METADATA_FIELDS):
+            return False
+        if (block.get('content') or old['content']) and not _same_data(
+                [_safe_content(f) for f in block.get('content', ())], old['content']):
+            return False
+        tools, prior_tools = block.get('tool_starts', ()), old['tool_starts']
+        if len(tools) != len(prior_tools) or any(
+                not _tool_matches(f, prior, stored=stored) for f, prior in zip(tools, prior_tools)):
+            return False
+    return True
+
+
+def _incoming_copy(value, previous=None):
+    """``(safe copy, stored digest or None)``: the digest only when nothing changed."""
+    if previous is not None and _copy_matches(value, previous):
+        return previous, previous['_history_sha256']
+    safe = _safe_copy(value)
+    # This flag describes retained ordering, rather than recorded evidence. Give the
+    # fast-path candidate the same flag as a captured copy; the merge still collapses
+    # first captures and preserves every revision when any other field differs.
+    if previous is not None and _same_copy(dict(safe, history_merged=True), previous):
+        return safe, previous['_history_sha256']
+    return safe, None
 
 
 def _block_identity(block):
@@ -259,7 +531,7 @@ def merge_response_copy(previous, incoming) -> tuple:
     from .ledger import collapse_blocks
     counters = {}
     if incoming is None or incoming.get('stable_read') is False:
-        return copy.deepcopy(previous), counters
+        return dict(previous) if previous is not None else None, counters
     if previous is None:
         out, _ = collapse_blocks(incoming)
         out['history_merged'] = True
@@ -359,34 +631,112 @@ def _fact_key(kind, item):
     if kind == 'turns':
         return item.get('logged_record_key') or item['record_key']
     if kind in ('tool_starts', 'tool_results'):
-        return _digest([item['tool_key'], item.get('record_key')])
-    field = {'content': 'item_key', 'limits': 'reading_key', 'events': 'event_key'}.get(kind, 'record_key')
+        return _tool_fact_key(item['tool_key'], item.get('record_key'))
+    field = {'content': 'item_key', 'limits': 'reading_key', 'events': 'event_key',
+             'calendar': 'response_key'}.get(kind, 'record_key')
     return item[field]
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _tool_fact_key(tool_key, record_key):
+    return _digest([tool_key, record_key])
+
+
+def _incoming_facts(kind, items, retained):
+    variants = {}
+    for entry in retained:
+        variants.setdefault(entry['fact_key'].split(':', 1)[0], []).append(entry)
+    for item in items:
+        key = _fact_key(kind, item)
+        if kind in ('tool_starts', 'tool_results'):
+            same = next((entry for entry in variants.get(key, ())
+                         if _tool_matches(item, entry['value'])), None)
+            if same is not None:
+                yield key, same['value'], same['sha256']
+                continue
+        safe = _safe_fact(kind, item)
+        same = next((entry for entry in variants.get(key, ())
+                     if _same_data(entry.get('_safe_value', entry['value']), safe)), None)
+        # A matched value is exactly the checked retained fact: carry its stored
+        # blob digest, including when that blob is an immutable list of facts.
+        yield key, safe, same['sha256'] if same is not None else _digest(safe)
+
+
+def _tool_calls(facts):
+    calls = {}
+    for entry in facts:
+        _add_tool_call(calls, entry['source_id'], entry['value'])
+    return calls
+
+
+def _add_tool_call(calls, source_id, tool):
+    key = (source_id, tool['tool_key'])
+    call = (tool['call_id'], tool['stream_id'])
+    if key in calls and calls[key] != call:
+        raise ValueError('ambiguous retained tool identity')
+    calls[key] = call
+
+
+def _fact_payload(kind, value, source_id, calls):
+    # tool_key already binds the response identity and original call ID. The
+    # hashed call ID/stream are retained in immutable tool-start facts; timestamps
+    # and every other fact field stay in this blob. Unmatched facts stay complete.
+    if kind == 'tool_results' and calls.get((source_id, value['tool_key'])) == (
+            value['call_id'], value['stream_id']):
+        out = {k: v for k, v in value.items() if k not in ('tool_key', 'call_id', 'stream_id')}
+        out['tool_ref'] = _wire_hash(value['tool_key'])
+        return out
+    return value
+
+
+def _expand_fact(kind, value, source_id, calls):
+    if kind == 'tool_results' and 'tool_ref' in value:
+        out = dict(value)
+        key = _read_hash(out.pop('tool_ref'))
+        call, stream = calls[(source_id, key)]
+        out.update(tool_key=key, call_id=call, stream_id=stream)
+        return out
+    return value
+
+
+def _stored_facts(key, value):
+    if key == FACT_LIST_KEY or key.startswith(FACT_LIST_KEY + ':'):
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError('invalid fact list')
+            # A conflicting revision is wrapped with its suffixed key. Every safe fact
+            # has three or more fields, so the exact two-key shape is unambiguous.
+            yield (item['fact_key'], item['value']) if item.keys() == {'fact_key', 'value'} else (None, item)
+    else:
+        yield key, value
 
 
 def _normalize_turns(result, retained):
     """Keep source-local references stable when re-extraction renumbers openers."""
-    out = copy.deepcopy(result)
     openers = {f['record_key']: f['turn'] for f in retained if f.get('record_key') is not None}
     next_turn = max(openers.values(), default=-1) + 1
     mapping = {}
-    for fact in out['turns']:
+    for fact in result['turns']:
         key = fact.get('record_key')
         if key is not None:
             if key not in openers:
                 openers[key] = next_turn
                 next_turn += 1
             mapping[fact['turn']] = openers[key]
-    for fact in out['turns']:
-        fact['turn'] = mapping.get(fact['turn'], fact['turn'])
-    for response in out['responses']:
-        for block in response['blocks']:
-            block['turn'] = mapping.get(block['turn'], block['turn'])
+    if all(a == b for a, b in mapping.items()):
+        return result
+    out = dict(result)
+    out['turns'] = [dict(f, turn=mapping.get(f['turn'], f['turn'])) for f in result['turns']]
+    out['responses'] = [dict(r, blocks=[dict(b, turn=mapping.get(b['turn'], b['turn']))
+                                      for b in r['blocks']]) for r in result['responses']]
     return out
 
 
 def _restore_fact(kind, item, sources):
-    out = copy.deepcopy(item)
+    if kind != 'links':
+        # Each load decodes fresh JSON; these facts already own their plain values.
+        return item
+    out = dict(item)
     if kind == 'links':
         sessions = {_identifier(s['session_id'], 'session'): s['session_id'] for s in sources}
         threads = {_identifier(s['thread_id'], 'thread'): s['thread_id'] for s in sources}
@@ -426,11 +776,13 @@ def _row_snapshot(row):
 
 def _freeze_calendar(row, captured):
     """First captured assignment wins, including an initially undated assignment."""
-    out, counters = copy.deepcopy(row), {}
+    # The ledger hands over a newly constructed row, before any stream index or
+    # family view refers to it. Only captured scalar calendar fields are replaced.
+    out, counters = row, {}
     if captured is not None:
         if _fields(row, CALENDAR_FIELDS) != captured:
             bump(counters, 'calendar_context_changed')
-        out.update(copy.deepcopy(captured))
+        out.update(captured)
     return out, counters
 
 
@@ -467,10 +819,12 @@ def _month_failures(ledger, submissions):
                 if row is None:
                     reasons.add('months_withheld_missing_contributors')
                     continue
-                current = _row_snapshot(row)
-                if any(current['counts'][field] < count for field, count in snapshot.get('counts', {}).items()):
-                    reasons.add('months_withheld_decreased_contributions')
-                if current['calendar'] != snapshot.get('calendar', current['calendar']):
+                if snapshot.get('counts'):
+                    current = _row_snapshot(row)['counts']
+                    if any(current[field] < count for field, count in snapshot['counts'].items()):
+                        reasons.add('months_withheld_decreased_contributions')
+                calendar = _fields(row, CALENDAR_FIELDS)
+                if calendar != snapshot.get('calendar', calendar):
                     reasons.add('months_withheld_calendar_change')
             for session in evidence.get('sessions', ()):
                 if any(key not in rows for key in session.get('responses', ())):
@@ -523,12 +877,14 @@ class History:
         self.history_available = False
         self.history_committed = False
         self._read_counters = {}
+        self._verified_blobs = set()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.db = sqlite3.connect(str(self.path), timeout=timeout)
             tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not tables:
                 # A new capture store, not a migration/reset of an existing store.
+                self.db.execute('PRAGMA page_size=16384')
                 self.db.executescript('BEGIN;\n' + DDL)
                 self.history_uuid = str(uuid.uuid4())
                 self.db.executemany('INSERT INTO meta(k,v) VALUES(?,?)',
@@ -560,11 +916,29 @@ class History:
             self.db = None
         self.history_available = False
         self.history_committed = False
+        self._verified_blobs.clear()
+
+    def _decode(self, blob, digest):
+        # Verification is tied to the exact compressed bytes as well as the digest.
+        # A changed SQL blob/checksum cannot reuse an earlier integrity decision.
+        if (blob, digest) not in self._verified_blobs:
+            value = _unpack(blob, digest)
+            self._verified_blobs.add((blob, digest))
+            return value
+        return json.loads(zlib.decompress(blob).decode('utf-8'))
+
+    def _encode(self, value):
+        blob, digest = _pack(value)
+        # _pack constructs these exact bytes from checked canonical JSON. Subsequent
+        # reads can reuse that decision, just as they reuse the full verification.
+        self._verified_blobs.add((blob, digest))
+        return blob, digest
 
     def check_integrity(self) -> tuple:
         counters = {}
         if not self.history_available or self.db is None:
             return False, dict(self.counters)
+        self._verified_blobs.clear()
         try:
             meta = dict(self.db.execute('SELECT k,v FROM meta'))
             if meta.get('schema') != str(SCHEMA_VERSION):
@@ -574,26 +948,44 @@ class History:
             elif self.db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
                 bump(counters, 'history_integrity_failed')
             else:
-                for table in ('sources', 'response_copies', 'facts', 'submissions'):
-                    for blob, digest in self.db.execute('SELECT payload,payload_sha256 FROM ' + table):
-                        _unpack(blob, digest)
+                calls, results = {}, []
+                for table in ('sources', 'facts', 'response_copies', 'submissions'):
+                    columns = ('kind,fact_key,source_id,' if table == 'facts' else
+                               'response_key,source_id,' if table == 'response_copies' else
+                               'status,' if table == 'submissions' else '')
+                    for row in self.db.execute('SELECT ' + columns + 'payload,payload_sha256 FROM ' + table):
+                        blob, digest = row[-2:]
+                        value = _unpack(blob, digest)
+                        self._verified_blobs.add((blob, digest))
+                        if table == 'facts':
+                            kind, key, sid = row[:3]
+                            if kind == 'account_snapshot':
+                                if set(value) != set(SNAPSHOT_FIELDS) or key != _digest(value):
+                                    raise ValueError('snapshot identity mismatch')
+                            else:
+                                for _key, item in _stored_facts(key, value):
+                                    if kind == 'tool_starts':
+                                        _add_tool_call(calls, sid, item)
+                                    elif kind == 'tool_results':
+                                        results.append((sid, item))
+                        elif table == 'submissions':
+                            if row[0] not in ACTIVE_STATUSES + ('retired',):
+                                raise ValueError('invalid receipt status')
+                            base64.b64decode(value['payload_base64'], validate=True)
+                        elif table == 'response_copies':
+                            _expand_copy(value, row[0], row[1], calls)
+                    if table == 'facts':
+                        for sid, item in results:
+                            _expand_fact('tool_results', item, sid, calls)
                 for blob, digest in self.db.execute('SELECT contributors,contributors_sha256 FROM submissions'):
                     _unpack(blob, digest)
+                    self._verified_blobs.add((blob, digest))
                 if self.db.execute('SELECT 1 FROM response_copies r LEFT JOIN sources s '
                                     'ON r.source_id=s.source_id WHERE s.source_id IS NULL LIMIT 1').fetchone():
                     raise ValueError('orphan response evidence')
                 if self.db.execute('SELECT 1 FROM facts f LEFT JOIN sources s '
                                     "ON f.source_id=s.source_id WHERE s.source_id IS NULL AND f.source_id != 'account' LIMIT 1").fetchone():
                     raise ValueError('orphan fact evidence')
-                for key, blob, digest in self.db.execute(
-                        "SELECT fact_key,payload,payload_sha256 FROM facts WHERE kind='account_snapshot'"):
-                    snapshot = _unpack(blob, digest)
-                    if set(snapshot) != set(SNAPSHOT_FIELDS) or key != _digest(snapshot):
-                        raise ValueError('snapshot identity mismatch')
-                for status, blob, digest in self.db.execute('SELECT status,payload,payload_sha256 FROM submissions'):
-                    if status not in ACTIVE_STATUSES + ('retired',):
-                        raise ValueError('invalid receipt status')
-                    base64.b64decode(_unpack(blob, digest)['payload_base64'], validate=True)
                 if self.db.execute('SELECT 1 FROM sources WHERE fact_codec != ? LIMIT 1', (FACT_CODEC,)).fetchone():
                     bump(counters, 'history_schema_unsupported')
         except (sqlite3.Error, ValueError, TypeError, KeyError, UnicodeError, zlib.error):
@@ -605,7 +997,7 @@ class History:
         return not counters, counters
 
     def _put_fact(self, kind, key, source_id, value):
-        blob, digest = _pack(value)
+        blob, digest = self._encode(value)
         old = self.db.execute('SELECT payload_sha256 FROM facts WHERE kind=? AND fact_key=? AND source_id=?',
                               (kind, key, source_id)).fetchone()
         conflicting = old is not None and old[0] != digest
@@ -616,16 +1008,73 @@ class History:
         if conflicting and inserted:
             bump(self.counters, 'history_conflicting_revisions')
 
-    def capture(self, results, *, account=None, now=None) -> None:
-        if not self.history_available or not self.check_integrity()[0]:
+    def _append_facts(self, kind, source_id, values, loaded, retained, calls):
+        """Append one immutable list of newly seen safe facts for this source/kind.
+
+        Legacy schema-1 single-fact rows stay in place. Only new facts enter the list,
+        so existing receipt fact keys/digests and every incompatible version survive.
+        """
+        facts, state = loaded[2], loaded[2]['state']
+        variants = {}
+        for entry in retained:
+            variants.setdefault(entry['fact_key'].split(':', 1)[0], []).append(entry)
+        additions = []
+        for key, safe, digest in values:
+            previous = variants.get(key, ())
+            if any(_same_data(entry.get('_safe_value', entry['value']), safe) for entry in previous):
+                continue
+            if previous:
+                key += ':' + digest
+                bump(self.counters, 'history_conflicting_revisions')
+            entry = {'source_id': source_id, 'fact_key': key, 'value': safe}
+            if kind == 'links':
+                entry['_safe_value'] = safe
+            additions.append(entry)
+            variants.setdefault(key.split(':', 1)[0], []).append(entry)
+        if additions:
+            payload = []
+            for entry in additions:
+                safe = entry.get('_safe_value', entry['value'])
+                encoded = _fact_payload(kind, safe, source_id, calls)
+                payload.append(encoded if entry['fact_key'] == _fact_key(kind, safe) else
+                               {'fact_key': entry['fact_key'], 'value': encoded})
+            blob, digest = self._encode(payload)
+            groups = {entry['row_key'] for entry in retained
+                      if entry['row_key'] == FACT_LIST_KEY or entry['row_key'].startswith(FACT_LIST_KEY + ':')}
+            row_key = FACT_LIST_KEY if not groups else '%s:%08d:%s' % (FACT_LIST_KEY, len(groups), digest)
+            self.db.execute('INSERT OR IGNORE INTO facts VALUES(?,?,?,?,?)', (kind, row_key, source_id, blob, digest))
+            for entry in additions:
+                entry.update(sha256=digest, row_key=row_key)
+            facts[kind].extend(additions)
+            retained.extend(additions)
+            state['fact_digests'].append({'kind': kind, 'fact_key': row_key,
+                                          'source_id': source_id, 'sha256': digest})
+
+    def capture(self, results, *, account=None, now=None) -> LedgerResult:
+        if not self.history_available:
             return
         results = list(results.values()) if isinstance(results, dict) else list(results)
         instant = _now(now)
+        loaded = self.load()
+        if not self.history_available:
+            return
+        sources, copies, facts, snapshots = loaded
+        by_source = {s['source_id']: s for s in sources}
+        by_copy = {(c['response_key'], c['source_id']): c for c in copies}
+        calls = _tool_calls(facts['tool_starts'])
+        fact_index = {}
+        for kind in FACT_KINDS + ('calendar',):
+            for entry in facts[kind]:
+                fact_index.setdefault((kind, entry['source_id']), []).append(entry)
+        turns = {}
+        for fact in facts['turns']:
+            turns.setdefault(fact['source_id'], []).append(fact['value'])
         self.history_committed = False
         present = {r['source_id'] for r in results}
-        for source_id, in self.db.execute('SELECT source_id FROM sources').fetchall():
-            if source_id not in present:
+        for source_id, source in by_source.items():
+            if source_id not in present and source['live']:
                 self.db.execute('UPDATE sources SET live=0 WHERE source_id=?', (source_id,))
+                source['live'] = False
         for result in results:
             source_id = result['source_id']
             if not result['stable_read']:
@@ -633,50 +1082,88 @@ class History:
                 for name, count in result['counters'].items():
                     bump(self.counters, name, count)
                 continue
-            retained_turns = [_unpack(blob, digest) for blob, digest in self.db.execute(
-                "SELECT payload,payload_sha256 FROM facts WHERE kind='turns' AND source_id=?", (source_id,))]
-            result = _normalize_turns(result, retained_turns)
-            old = self.db.execute('SELECT payload,payload_sha256 FROM sources WHERE source_id=?', (source_id,)).fetchone()
-            source = _safe_source(result, _unpack(*old) if old else None)
-            blob, digest = _pack(source)
-            self.db.execute(
-                'INSERT INTO sources VALUES(?,?,?,?,?,?,1,?,?,?) ON CONFLICT(source_id) DO UPDATE SET '
-                'session_id=excluded.session_id,thread_id=excluded.thread_id,kind=excluded.kind,'
-                'last_seen=excluded.last_seen,live=1,fact_codec=excluded.fact_codec,'
-                'payload=excluded.payload,payload_sha256=excluded.payload_sha256',
-                (source_id, result['session_id'], result['thread_id'], result['kind'], instant, instant,
-                 result['fact_codec'], blob, digest))
+            result = _normalize_turns(result, turns.get(source_id, ()))
+            for tool in result['tool_starts']:
+                _add_tool_call(calls, source_id, _safe_fact('tool_starts', tool))
+            old = by_source.get(source_id)
+            source = _safe_source(result, old)
+            digest = _digest(source)
+            if old is not None and digest == old['_history_sha256'] and all(
+                    result[k] == old[k] for k in ('session_id', 'thread_id', 'kind', 'fact_codec')):
+                self.db.execute('UPDATE sources SET last_seen=?,live=1 WHERE source_id=?', (instant, source_id))
+            else:
+                blob, digest = self._encode(source)
+                self.db.execute(
+                    'INSERT INTO sources VALUES(?,?,?,?,?,?,1,?,?,?) ON CONFLICT(source_id) DO UPDATE SET '
+                    'session_id=excluded.session_id,thread_id=excluded.thread_id,kind=excluded.kind,'
+                    'last_seen=excluded.last_seen,live=1,fact_codec=excluded.fact_codec,'
+                    'payload=excluded.payload,payload_sha256=excluded.payload_sha256',
+                    (source_id, result['session_id'], result['thread_id'], result['kind'], instant, instant,
+                     result['fact_codec'], blob, digest))
+            source.update(source_id=source_id, session_id=result['session_id'], thread_id=result['thread_id'],
+                          kind=result['kind'], fact_codec=result['fact_codec'], path='', live=True,
+                          first_seen=old['first_seen'] if old else instant, last_seen=instant,
+                          _history_sha256=digest)
+            by_source[source_id] = source
             for incoming in result['responses']:
-                previous = self.db.execute('SELECT payload,payload_sha256 FROM response_copies '
-                                            'WHERE response_key=? AND source_id=?',
-                                            (incoming['response_key'], source_id)).fetchone()
-                prior = _unpack(*previous) if previous else None
-                merged, counters = merge_response_copy(prior, _safe_copy(incoming))
+                key = (incoming['response_key'], source_id)
+                prior = by_copy.get(key)
+                safe, digest = _incoming_copy(incoming, prior) if prior is not None else (_safe_copy(incoming), None)
+                if prior is not None and digest == prior['_history_sha256']:
+                    continue
+                merged, counters = merge_response_copy(prior, safe)
                 for name, count in counters.items():
                     if name != 'history_conflicting_revisions' or not (prior and prior.get('conflicting')):
                         bump(self.counters, name, count)
-                blob, digest = _pack(_safe_copy(merged))
+                safe = _safe_copy(merged)
+                if prior is not None and _same_copy(safe, prior):
+                    continue
+                blob, digest = self._encode(_copy_payload(safe, calls))
                 self.db.execute(
                     'INSERT INTO response_copies VALUES(?,?,?,?,?,?,?) '
                     'ON CONFLICT(response_key,source_id) DO UPDATE SET last_seen=excluded.last_seen,'
                     'payload=excluded.payload,payload_sha256=excluded.payload_sha256,conflicting=excluded.conflicting',
                     (incoming['response_key'], source_id, instant, instant, blob, digest,
                      int(merged.get('conflicting', False))))
+                by_copy[key] = dict(_restore_copy(safe, source), _history_sha256=digest)
             for kind in FACT_KINDS:
-                for item in result[kind]:
-                    safe = _safe_fact(kind, item)
-                    self._put_fact(kind, _fact_key(kind, safe), source_id, safe)
+                retained = fact_index.setdefault((kind, source_id), [])
+                self._append_facts(kind, source_id, _incoming_facts(kind, result[kind], retained), loaded, retained, calls)
         for snapshot in _account_snapshots(account):
-            self._put_fact('account_snapshot', _digest(snapshot), 'account', snapshot)
+            digest = _digest(snapshot)
+            self._put_fact('account_snapshot', digest, 'account', snapshot)
+            if snapshot not in snapshots:
+                snapshots.append(snapshot)
+                facts['state']['fact_digests'].append({'kind': 'account_snapshot', 'fact_key': digest,
+                                                      'source_id': 'account', 'sha256': digest})
+        sources[:] = sorted(by_source.values(), key=lambda s: s['source_id'])
+        copies[:] = [by_copy[key] for key in sorted(by_copy, key=lambda k: (k[1], k[0]))]
+        for entry in facts['links']:
+            entry['value'] = _restore_fact('links', entry['_safe_value'], sources)
+        facts['state'].update(history_committed=False, counters=dict(self.counters),
+                              read_counters=copy.deepcopy(self._read_counters))
         # Capture canonical calendar context once, after union and global ownership.
         from .ledger import build
-        canonical = build(results, history=self.load())
-        calendars = {f['value']['response_key'] for f in self.load()[2]['calendar']}
+        # These exact live copies/facts have already been reconciled above. Avoid
+        # sanitizing them a second time during this one build. Absent and unstable
+        # copies still take the ordinary retention decisions in the ledger.
+        facts['state']['_captured_live_copies'] = [(c['response_key'], r['source_id'])
+            for r in results if r['stable_read'] for c in r['responses']]
+        try:
+            canonical = build(results, history=loaded)
+        finally:
+            facts['state'].pop('_captured_live_copies', None)
+        calendars = {f['value']['response_key'] for f in facts['calendar']}
+        additions = {}
         for row in canonical['rows']:
             if row['response_key'] not in calendars:
-                self._put_fact('calendar', row['response_key'], row['source_id'],
-                               dict(response_key=row['response_key'], **_row_snapshot(row)))
+                safe = dict(response_key=row['response_key'], **_row_snapshot(row))
+                additions.setdefault(row['source_id'], []).append((row['response_key'], safe, _digest(safe)))
+                canonical['_retention']['captured'][row['response_key']] = safe
                 calendars.add(row['response_key'])
+        for source_id, values in additions.items():
+            self._append_facts('calendar', source_id, values, loaded,
+                               fact_index.setdefault(('calendar', source_id), []), calls)
         # The canonical ledger over live and retained evidence, so a caller that goes on
         # to report or share does not build it a second time.
         return canonical
@@ -687,49 +1174,94 @@ class History:
                  'history_uuid': self.history_uuid, 'counters': dict(self.counters),
                  'read_counters': copy.deepcopy(self._read_counters), 'fact_digests': []}
         facts['state'] = state
-        if not self.history_available or not self.check_integrity()[0]:
-            state.update(history_available=False, history_committed=False, counters=dict(self.counters))
+        if not self.history_available:
             return [], [], facts, []
+        collecting = gc.isenabled()
+        if collecting:
+            # Decoded JSON is acyclic. Avoid rescanning the resident live corpus
+            # for cycles while allocating these independent plain-data snapshots.
+            gc.disable()
+        try:
+            return self._load(facts, state)
+        except (sqlite3.Error, ValueError, TypeError, KeyError, UnicodeError, zlib.error):
+            bump(self.counters, 'history_integrity_failed')
+            self.history_available = self.history_committed = False
+            for kind in facts:
+                if kind != 'state':
+                    facts[kind] = []
+            state.update(history_available=False, history_committed=False, counters=dict(self.counters), fact_digests=[])
+            return [], [], facts, []
+        finally:
+            if collecting:
+                gc.enable()
+
+    def _load(self, facts, state):
         sources, copies, snapshots = [], [], []
         for row in self.db.execute('SELECT source_id,session_id,thread_id,kind,first_seen,last_seen,live,'
                                    'fact_codec,payload,payload_sha256 FROM sources ORDER BY source_id'):
             sid, session, thread, kind, first, last, live, codec, blob, digest = row
-            sources.append(dict(_unpack(blob, digest), source_id=sid, session_id=session, thread_id=thread,
+            sources.append(dict(self._decode(blob, digest), source_id=sid, session_id=session, thread_id=thread,
                                 kind=kind, first_seen=first, last_seen=last, live=bool(live),
-                                fact_codec=codec, path=''))
+                                fact_codec=codec, path='', _history_sha256=digest))
         by_source = {s['source_id']: s for s in sources}
+        fact_rows, calls = [], {}
+        for kind, key, sid, blob, digest in self.db.execute('SELECT * FROM facts ORDER BY kind,fact_key,source_id'):
+            value = self._decode(blob, digest)
+            fact_rows.append((kind, key, sid, value, digest))
+            if kind == 'tool_starts':
+                for _key, item in _stored_facts(key, value):
+                    _add_tool_call(calls, sid, item)
         for key, sid, blob, digest, conflicting in self.db.execute(
                 'SELECT response_key,source_id,payload,payload_sha256,conflicting FROM response_copies ORDER BY source_id,response_key'):
-            value = _restore_copy(_unpack(blob, digest), by_source[sid])
+            payload = self._decode(blob, digest)
+            value = _restore_copy(_expand_copy(payload, key, sid, calls), by_source[sid])
+            if value['response_key'] != key or value['source_id'] != sid:
+                raise ValueError('response identity mismatch')
             value['conflicting'] = bool(conflicting)
+            value['_history_sha256'] = digest
             copies.append(value)
-        for kind, key, sid, blob, digest in self.db.execute('SELECT * FROM facts ORDER BY kind,fact_key,source_id'):
-            value = _unpack(blob, digest)
+        for kind, key, sid, value, digest in fact_rows:
             state['fact_digests'].append({'kind': kind, 'fact_key': key, 'source_id': sid, 'sha256': digest})
             if kind == 'account_snapshot':
                 snapshots.append(value)
-            elif kind in facts and kind != 'submissions':
-                facts[kind].append({'source_id': sid, 'fact_key': key,
-                                    'value': _restore_fact(kind, value, sources)})
+            else:
+                for item_key, item in _stored_facts(key, value):
+                    safe = _expand_fact(kind, item, sid, calls)
+                    if kind in facts and kind != 'submissions':
+                        entry = dict(fact_key=_fact_key(kind, safe) if item_key is None else item_key,
+                                     source_id=sid, row_key=key, sha256=digest,
+                                     value=_restore_fact(kind, safe, sources))
+                        if kind == 'links':
+                            entry['_safe_value'] = safe
+                        facts[kind].append(entry)
+        facts['submissions'] = self._load_submissions()
+        return sources, copies, facts, sorted(snapshots, key=lambda s: (s['observed_at'], _digest(s)))
+
+    def _load_submissions(self):
+        receipts = []
         for row in self.db.execute('SELECT submission_id,endpoint,token_binding,status,created_at,confirmed_at,'
                                    'payload,payload_sha256,contributors,contributors_sha256 FROM submissions ORDER BY created_at,submission_id'):
             ident, endpoint, binding, status, created, confirmed, blob, digest, evidence, evidence_digest = row
-            payload = base64.b64decode(_unpack(blob, digest)['payload_base64'], validate=True)
-            facts['submissions'].append({'submission_id': ident, 'endpoint': endpoint, 'token_binding': binding,
+            payload = base64.b64decode(self._decode(blob, digest)['payload_base64'], validate=True)
+            receipts.append({'submission_id': ident, 'endpoint': endpoint, 'token_binding': binding,
                                          'status': status, 'created_at': created, 'confirmed_at': confirmed,
-                                         'payload': payload, 'contributors': _unpack(evidence, evidence_digest)})
-        return sources, copies, facts, sorted(snapshots, key=lambda s: (s['observed_at'], _digest(s)))
+                                         'payload': payload, 'contributors': self._decode(evidence, evidence_digest)})
+        return receipts
 
     def coverage(self, ledger, *, endpoint, token_binding=None) -> CoverageResult:
-        integrity, _ = self.check_integrity()
-        loaded = self.load()
-        receipts = [r for r in loaded[2]['submissions'] if r['endpoint'] == endpoint
+        try:
+            receipts = self._load_submissions() if self.history_available else []
+        except (sqlite3.Error, ValueError, TypeError, KeyError, UnicodeError, zlib.error):
+            bump(self.counters, 'history_integrity_failed')
+            self.history_available = self.history_committed = False
+            receipts = []
+        receipts = [r for r in receipts if r['endpoint'] == endpoint
                     and r['token_binding'] == token_binding and r['status'] in ACTIVE_STATUSES]
         bound = token_binding is None or bool(receipts)
         if not bound:
             self.counters['history_token_binding_mismatch'] = 1
-        view = copy.deepcopy(ledger)
-        view['coverage'].update(history_available=integrity and ledger['coverage']['history_available'],
+        view = dict(ledger, counters=dict(ledger['counters']), coverage=dict(ledger['coverage']))
+        view['coverage'].update(history_available=self.history_available and ledger['coverage']['history_available'],
                                 history_committed=self.history_committed and ledger['coverage']['history_committed'],
                                 token_bound=bound)
         for name, count in self.counters.items():
@@ -751,15 +1283,15 @@ class History:
         return result
 
     def prepare(self, payload, contributors, *, endpoint, token_binding) -> str:
-        if not self.history_available or not self.history_committed or not self.check_integrity()[0]:
+        if not self.history_available or not self.history_committed:
             raise ValueError('history is not committed and intact')
         if not isinstance(endpoint, str) or not endpoint or (token_binding is not None and not isinstance(token_binding, str)):
             raise ValueError('invalid receipt binding')
         raw = payload if isinstance(payload, bytes) else _json_bytes(payload)
         # Payload bytes are already validated wire data by the sharing layer. Encoding
         # them inside canonical JSON preserves even insignificant whitespace exactly.
-        blob, digest = _pack({'payload_base64': base64.b64encode(raw).decode('ascii')})
-        evidence, evidence_digest = _pack(contributors)
+        blob, digest = self._encode({'payload_base64': base64.b64encode(raw).decode('ascii')})
+        evidence, evidence_digest = self._encode(contributors)
         ident = str(uuid.uuid4())
         self.history_committed = False
         self.db.execute('INSERT INTO submissions VALUES(?,?,?,?,?,NULL,?,?,?,?)',

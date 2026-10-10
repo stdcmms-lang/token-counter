@@ -53,6 +53,9 @@ RETENTION_TESTS = (
     'test_calendar_assignment_frozen', 'test_account_snapshot_capture_no_identity',
     'test_no_account_no_snapshot', 'test_unstable_read_keeps_capture',
 )
+# Performance regressions are separate from the unchanged semantic mutation manifest.
+PERFORMANCE_TESTS = ('test_capture_fast_path', 'test_integrity_once_per_open',
+                     'test_legacy_schema1_load', 'test_fact_batches_immutable')
 
 
 def expect(name, got, expected):
@@ -554,9 +557,156 @@ def test_unstable_read_keeps_capture() -> None:
         expect('unstable counters survive plain load without live results', count(_view(store), 'file_changed_during_read'), 2)
 
 
+def test_capture_fast_path() -> None:
+    with captured() as (store, _root, _written, live, before):
+        copies = store.db.execute('SELECT * FROM response_copies').fetchall()
+        changes = store.db.total_changes
+        with mock.patch.object(store, 'load', wraps=store.load) as loads, \
+                mock.patch.object(ledger, 'build', wraps=ledger.build) as builds, \
+                mock.patch.object(history, 'merge_response_copy', wraps=history.merge_response_copy) as merges:
+            canonical = store.capture(copy.deepcopy(live), now=NOW + 2)
+        expect('unchanged capture touches each source once', store.db.total_changes - changes, len(live))
+        expect('unchanged capture writes no response copies',
+               store.db.execute('SELECT * FROM response_copies').fetchall(), copies)
+        expect('unchanged capture does not merge copies', merges.call_count, 0)
+        expect('capture loads and builds at most once', (loads.call_count, builds.call_count), (1, 1))
+        expect('capture returns its canonical ledger before commit',
+               (totals(canonical), canonical['coverage']['history_committed'], store.history_committed),
+               (totals(before), False, False))
+        expect('unchanged source last seen refreshed',
+               [r[0] for r in store.db.execute('SELECT last_seen FROM sources')], [NOW + 2] * len(live))
+        store.commit()
+        loaded = store.load()
+        digests = {(kind, key, sid): digest for kind, key, sid, digest in store.db.execute(
+            'SELECT kind,fact_key,source_id,payload_sha256 FROM facts')}
+        expect('loaded facts carry their captured digest', all(
+            entry['sha256'] == digests[(kind, entry['row_key'], entry['source_id'])]
+            for kind in history.FACT_KINDS + ('calendar',) for entry in loaded[2][kind]), True)
+        calls = history._tool_calls(loaded[2]['tool_starts'])
+        restored = [history._expand_copy(json.loads(zlib.decompress(blob)), key, sid, calls)
+                    for key, sid, blob in store.db.execute(
+                        'SELECT response_key,source_id,payload FROM response_copies ORDER BY source_id,response_key')]
+        expect('positional blobs preserve every safe response field', restored,
+               [history._safe_copy(c) for c in loaded[1]])
+        # A new auxiliary fact alone is still uncaptured evidence, even if source
+        # stat attributes and response copies happen to be identical.
+        extra = copy.deepcopy(live)
+        extra[0]['compactions'].append({'record_key': worker._digest(['new-compaction']),
+                                        'ts': '2026-09-10T00:00:35Z', 'duration_ms': None})
+        expect('uncaptured auxiliary evidence disables replacement',
+               ledger.build(extra, history=loaded)['coverage']['history_committed'], False)
+
+
+def test_integrity_once_per_open() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp) / 'projects'
+        cases.write_corpus(root, _b())
+        live = _extract(root)
+        db_path = Path(temp) / 'history.db'
+        with history.History(db_path) as seed:
+            seed.capture(live, now=NOW)
+            seed.commit()
+            _prepare(seed, _view(seed, live))
+            blobs = sum(seed.db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]
+                        for table in ('sources', 'response_copies', 'facts', 'submissions'))
+            blobs += seed.db.execute('SELECT COUNT(*) FROM submissions').fetchone()[0]
+        original = history.History.check_integrity
+        with mock.patch.object(history, '_checked_digest', wraps=history._checked_digest) as digests, \
+                mock.patch.object(history.History, 'check_integrity', autospec=True, side_effect=original) as checks:
+            with history.History(db_path) as store:
+                expect('open verifies every blob once', digests.call_count, blobs)
+                canonical = store.capture(copy.deepcopy(live), now=NOW + 1)
+                store.commit()
+                loaded = store.load()
+                store.coverage(ledger.build(live, history=loaded), endpoint=ENDPOINT, token_binding=BINDING)
+                expect('open capture load coverage perform one full verification',
+                       (checks.call_count, digests.call_count), (1, blobs))
+                expect('explicit integrity call verifies every blob again',
+                       (store.check_integrity()[0], checks.call_count, digests.call_count), (True, 2, blobs * 2))
+                expect('integrity fast path keeps captured totals', totals(canonical), (2, 255, 18, 90, 7))
+                altered = store.load()
+                altered[1][0]['blocks'][0]['usage']['output'] += 999
+                expect('load values cannot mutate verified storage through aliases', totals(_view(store, live)), (2, 255, 18, 90, 7))
+                # A checksum-valid but incomplete dependency is still damaged history.
+                packed, digest = history._pack([])
+                store.db.execute("UPDATE facts SET payload=?,payload_sha256=? WHERE kind='tool_starts'", (packed, digest))
+                expect('missing retained tool identity fails explicit integrity', store.check_integrity(),
+                       (False, {'history_integrity_failed': 1}))
+                expect('missing tool identity does not reset response evidence',
+                       store.db.execute('SELECT COUNT(*) FROM response_copies').fetchone()[0], 2)
+
+
+def test_legacy_schema1_load() -> None:
+    with captured() as (store, _root, _written, live, before):
+        ident, payload, _ = _prepare(store, before)
+        # Materialize the original round-4 row granularity and dictionary encoding
+        # from invented fixtures, without changing schema or retained values.
+        calls = history._tool_calls(store.load()[2]['tool_starts'])
+        for key, sid, blob in store.db.execute('SELECT response_key,source_id,payload FROM response_copies').fetchall():
+            value = history._expand_copy(json.loads(zlib.decompress(blob)), key, sid, calls)
+            packed, digest = history._pack(value)
+            store.db.execute('UPDATE response_copies SET payload=?,payload_sha256=? WHERE response_key=? AND source_id=?',
+                             (packed, digest, key, sid))
+        for kind, key, sid, blob in store.db.execute('SELECT kind,fact_key,source_id,payload FROM facts').fetchall():
+            value = json.loads(zlib.decompress(blob))
+            if isinstance(value, list):
+                store.db.execute('DELETE FROM facts WHERE kind=? AND fact_key=? AND source_id=?', (kind, key, sid))
+                for item in value:
+                    item = history._expand_fact(kind, item, sid, calls)
+                    packed, digest = history._pack(item)
+                    store.db.execute('INSERT INTO facts VALUES(?,?,?,?,?)',
+                                     (kind, history._fact_key(kind, item), sid, packed, digest))
+        store.db.commit()
+        with history.History(store.path) as reopened:
+            view = _view(reopened, live)
+            expect('legacy schema1 rebuild has identical retained counts', totals(view), totals(before))
+            expect('legacy receipt remains exact', reopened.load()[2]['submissions'][0]['payload'], payload)
+            copies = reopened.db.execute('SELECT * FROM response_copies').fetchall()
+            facts = reopened.db.execute('SELECT * FROM facts').fetchall()
+            reopened.capture(copy.deepcopy(live), now=NOW + 1)
+            reopened.commit()
+            expect('legacy unchanged capture rewrites no copies or facts',
+                   (reopened.db.execute('SELECT * FROM response_copies').fetchall(),
+                    reopened.db.execute('SELECT * FROM facts').fetchall()), (copies, facts))
+            expect('legacy schema1 replacement stays safe', _coverage(reopened, _view(reopened, live))['safe_months'], ['2026-09'])
+
+
+def test_fact_batches_immutable() -> None:
+    with captured() as (store, _root, _written, live, before):
+        original = store.db.execute('SELECT * FROM facts').fetchall()
+        contributors = _contributors(before)
+        contributors['months']['2026-09']['sessions'][0]['facts'] = copy.deepcopy(before['_retention']['fact_digests'])
+        store.prepare(b'{}', contributors, endpoint=ENDPOINT, token_binding=BINDING)
+        changed = copy.deepcopy(live)
+        fact = {'record_key': worker._digest(['retained-compaction']),
+                'ts': '2026-09-10T00:00:25Z', 'duration_ms': 10}
+        changed[0]['compactions'].append(fact)
+        store.capture(changed, now=NOW + 1)
+        store.commit()
+        changed[0]['compactions'][-1]['duration_ms'] = 20
+        store.capture(changed, now=NOW + 2)
+        store.commit()
+        current = store.db.execute('SELECT * FROM facts').fetchall()
+        expect('new facts and revisions never rewrite retained batches', all(row in current for row in original), True)
+        expect('auxiliary conflicting versions both survive',
+               sorted(entry['value']['duration_ms'] for entry in store.load()[2]['compactions']), [10, 20])
+        expect('auxiliary revision counted once', store.counters.get('history_conflicting_revisions'), 1)
+        store.capture(changed, now=NOW + 3)
+        store.commit()
+        expect('auxiliary conflicting replay writes no facts', store.db.execute('SELECT * FROM facts').fetchall(), current)
+        expect('prepared fact digests survive appended batches', _coverage(store, _view(store, changed))['safe_months'], ['2026-09'])
+        changed[0]['compactions'][-1]['duration_ms'] = 20.0
+        store.capture(changed, now=NOW + 4)
+        store.commit()
+        expect('canonical numeric type revisions remain distinct',
+               ([type(entry['value']['duration_ms']).__name__ for entry in store.load()[2]['compactions']],
+                store.counters.get('history_conflicting_revisions')), (['int', 'int', 'float'], 2))
+
+
 def main() -> int:
     RESULTS.clear()
-    for name in RETENTION_TESTS:
+    tests = RETENTION_TESTS + PERFORMANCE_TESTS
+    for name in tests:
         try:
             globals()[name]()
         except Exception as exc:
@@ -564,7 +714,7 @@ def main() -> int:
     for name, ok, detail in RESULTS:
         print('[%s] %s%s' % ('PASS' if ok else 'FAIL', name, '' if ok else ': ' + detail))
     passed = sum(ok for _name, ok, _detail in RESULTS)
-    print('\n%d/%d assertions passed (%d tests)' % (passed, len(RESULTS), len(RETENTION_TESTS)))
+    print('\n%d/%d assertions passed (%d tests)' % (passed, len(RESULTS), len(tests)))
     return 0 if passed == len(RESULTS) else 1
 
 

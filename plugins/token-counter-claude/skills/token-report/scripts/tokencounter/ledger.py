@@ -12,9 +12,16 @@ import functools
 import re
 
 from .models import LedgerResult, bump
-from .worker import _digest, _effort, _model_name, epoch
+from .worker import _digest, _effort, _model_name, epoch as _raw_epoch
 
 _OFFSET_RE = re.compile(r'(Z|[+-]\d{2}:?\d{2})$')
+_cached_epoch = functools.lru_cache(maxsize=1 << 18)(_raw_epoch)
+
+
+def epoch(value):
+    # Offset-bearing record timestamps are immutable measurements, independent of
+    # host calendar context. Invalid/non-string inputs keep the extractor's result.
+    return _cached_epoch(value) if isinstance(value, str) else _raw_epoch(value)
 
 
 @functools.lru_cache(maxsize=1 << 18)
@@ -106,7 +113,7 @@ def collapse_blocks(copy) -> tuple:
     The last valid record supplies the whole tuple. Earlier valid usage can survive a
     malformed terminal as a partial lower bound, but changing prompt counts is a conflict.
     """
-    out, counters, blocks, seen = copylib.deepcopy(copy), {}, [], {}
+    out, counters, blocks, seen = dict(copy, quality_flags=list(copy['quality_flags'])), {}, [], {}
     inputs, previous_output = set(), None
     retained_terminal = out.get('terminal_record_key') if out.get('history_merged') else None
     ordered = out['blocks'] if out.get('history_merged') else sorted(out['blocks'], key=lambda b: b['physical_line'])
@@ -252,7 +259,9 @@ def _owner_rank(copy, families):
 
 def choose_owner(copies, families) -> tuple:
     """Return ``(owner, classified_copies, counters)``; input facts stay unchanged."""
-    copies, counters = copylib.deepcopy(copies), {}
+    # Ownership only annotates the envelopes/flag lists. Blocks are read-only here;
+    # copying their usage and tool trees again costs more than canonicalization.
+    copies, counters = [dict(c, quality_flags=list(c['quality_flags'])) for c in copies], {}
     bump(counters, 'cross_file_response_copies', max(0, len(copies) - 1))
     all_blocks = [(c['response_key'], 'index', b['api_block_index'])
                   if b['api_block_index'] is not None else (c['response_key'], 'record', b['record_key'])
@@ -302,7 +311,7 @@ def choose_owner(copies, families) -> tuple:
     return owner, copies, counters
 
 
-def _response_row(owner, attribution, counters):
+def _response_row(owner, attribution, counters, day_spans=None):
     terminal = _terminal(owner)
     usage = terminal['usage']
     model, raw_model, context = _model_name(owner['raw_model'])
@@ -326,7 +335,12 @@ def _response_row(owner, attribution, counters):
         bump(counters, 'response_stop_reason_missing')
     ts = terminal['ts']
     day = _day(ts) if epoch(ts) is not None else None
-    start, end = _day_span(day)
+    if day_spans is None:
+        start, end = _day_span(day)
+    else:
+        if day not in day_spans:
+            day_spans[day] = _day_span(day)
+        start, end = day_spans[day]
     if day is None or start is None or end is None:
         day, start, end = None, None, None
         bump(counters, 'undated_responses')
@@ -512,13 +526,15 @@ def _tools(results, owners, attribution, counters):
 
 
 def _cost_diagnostics(checks, rows, counters):
+    by_model = collections.defaultdict(list)
+    for row in rows:
+        by_model[(row['source_id'], row['model'], row['context_1m'])].append(row)
     for check in checks:
         if check['source'] != 'cost_state':
             continue
-        matching = [row for row in rows if row['source_id'] == check['source_id']
-                    and row['model'] == check['model'] and row['context_1m'] == check['context_1m'] and
-                    (check['ts'] is None or (epoch(row['ts']) is not None
-                                            and epoch(row['ts']) <= epoch(check['ts'])))]
+        matching = [row for row in by_model[(check['source_id'], check['model'], check['context_1m'])]
+                    if check['ts'] is None or (epoch(row['ts']) is not None
+                                               and epoch(row['ts']) <= epoch(check['ts']))]
         if not matching:
             bump(counters, 'cost_state_unmatched_models')
             continue
@@ -533,25 +549,30 @@ def _cost_diagnostics(checks, rows, counters):
 
 def _historical_results(live, history, counters):
     """Reconcile a checked plain-data capture before lineage and ownership."""
-    from .history import (FACT_KINDS, _fact_key, _normalize_turns, _restore_copy,
-                          _restore_fact, _safe_copy, _safe_fact, _safe_source,
+    from .history import (FACT_KINDS, _incoming_copy, _incoming_facts, _normalize_turns, _restore_copy,
+                          _restore_fact, _same_copy, _safe_source,
                           merge_response_copy)
     sources, retained, facts, snapshots = history
     state = facts['state']
     for name, count in state['counters'].items():
         if name.startswith(('history_', 'share_')) and name != 'history_conflicting_revisions':
             bump(counters, name, count)
-    previous = {s['source_id']: copylib.deepcopy(s) for s in sources}
+    previous = {s['source_id']: s for s in sources}
     current = {r['source_id']: r for r in live}
     combined = {}
+    uncaptured = False
     for sid in sorted(set(previous) | set(current)):
         old, incoming = previous.get(sid), current.get(sid)
         if incoming is not None and incoming['stable_read']:
-            source = dict(copylib.deepcopy(incoming), **_safe_source(incoming, old))
+            safe = _safe_source(incoming, old)
+            source = dict(incoming, **safe)
+            if old is None or _digest(safe) != old['_history_sha256']:
+                uncaptured = True
         elif old is not None:
-            source = copylib.deepcopy(old)
+            source = dict(old)
         else:
-            source = copylib.deepcopy(incoming)
+            source = dict(incoming)
+        source['counters'] = dict(source['counters'])
         source['responses'] = []
         for kind in FACT_KINDS:
             source[kind] = []
@@ -562,37 +583,51 @@ def _historical_results(live, history, counters):
         for name, count in state.get('read_counters', {}).get(sid, {}).items():
             source['counters'][name] = max(count, source['counters'].get(name, 0))
         combined[sid] = source
+    fact_entries = collections.defaultdict(list)
     for kind in FACT_KINDS:
         for entry in facts[kind]:
-            combined[entry['source_id']][kind].append(
-                _restore_fact(kind, entry['value'], list(combined.values())))
+            combined[entry['source_id']][kind].append(entry['value'])
+            fact_entries[(kind, entry['source_id'])].append(entry)
+    source_list = list(combined.values())
+    old_copies = {(c['response_key'], c['source_id']): c for c in retained}
+    captured_keys = set(state.get('_captured_live_copies', ()))
+    capture_complete = '_captured_live_copies' in state
     incoming_copies = {}
     for sid, incoming in sorted(current.items()):
         if not incoming['stable_read']:
             continue
+        if capture_complete:
+            continue
         incoming = _normalize_turns(incoming, combined[sid]['turns'])
-        incoming_copies.update({(c['response_key'], sid): _safe_copy(c) for c in incoming['responses']})
+        incoming_copies.update({(c['response_key'], sid): _incoming_copy(c, old_copies.get((c['response_key'], sid)))
+                                for c in incoming['responses']})
         for kind in FACT_KINDS:
-            seen = {_digest(_safe_fact(kind, f)) if kind not in ('links', 'tool_starts', 'tool_results')
-                    else _fact_key(kind, f) for f in combined[sid][kind]}
-            for item in incoming[kind]:
-                safe = _safe_fact(kind, item)
-                key = (_digest(safe) if kind not in ('links', 'tool_starts', 'tool_results')
-                       else _fact_key(kind, safe))
+            entries = fact_entries[(kind, sid)]
+            digests = {entry['sha256'] for entry in entries}
+            keyed = kind in ('links', 'tool_starts', 'tool_results')
+            seen = {entry['fact_key'].split(':', 1)[0] for entry in entries} if keyed else set(digests)
+            for fact_key, safe, digest in _incoming_facts(kind, incoming[kind], entries):
+                key = fact_key if keyed else digest
+                if digest not in digests:
+                    uncaptured = True
                 if key not in seen:
-                    combined[sid][kind].append(_restore_fact(kind, safe, list(combined.values())))
+                    combined[sid][kind].append(_restore_fact(kind, safe, source_list))
                     seen.add(key)
-    old_copies = {(c['response_key'], c['source_id']): _safe_copy(c) for c in retained}
-    uncaptured = False
     for key in sorted(set(old_copies) | set(incoming_copies)):
-        incoming = incoming_copies.get(key)
+        candidate = incoming_copies.get(key)
+        incoming = candidate[0] if candidate is not None else None
+        old = old_copies.get(key)
         if key[1] in current and not current[key[1]]['stable_read']:
             incoming = {'stable_read': False}
-        merged, _ = merge_response_copy(old_copies.get(key), incoming)
+        if old is not None and (key in captured_keys or
+                               (candidate is not None and candidate[1] == old['_history_sha256'])):
+            merged = old
+        else:
+            merged, _ = merge_response_copy(old, incoming)
+            if merged is not None and (old is None or not _same_copy(merged, old)):
+                uncaptured = True
         if merged is not None:
             combined[key[1]]['responses'].append(_restore_copy(merged, combined[key[1]]))
-            if _safe_copy(merged) != old_copies.get(key):
-                uncaptured = True
     live_keys = {c['response_key'] for r in live if r['stable_read'] for c in r['responses']}
     live_blocks = {(c['response_key'], b['api_block_index'] if b['api_block_index'] is not None else b['record_key'])
                    for r in live if r['stable_read'] for c in r['responses'] for b in c['blocks']}
@@ -638,7 +673,7 @@ def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerRes
                     bump(counters, name, count)
             collapsed_copies.append(collapsed)
     copies = _group_copies(collapsed_copies)
-    rows, owners = [], []
+    rows, owners, day_spans = [], [], {}
     for key in sorted(copies):
         owner, _classified, owner_counters = choose_owner(copies[key], attribution)
         for name, count in owner_counters.items():
@@ -648,7 +683,7 @@ def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerRes
             continue
         if attribution[owner['source_id']]['family_id'] is None:
             bump(counters, 'response_owner_unavailable')
-        rows.append(_response_row(owner, attribution[owner['source_id']], counters))
+        rows.append(_response_row(owner, attribution[owner['source_id']], counters, day_spans))
         owners.append(owner)
     if history is not None:
         from .history import _freeze_calendar
