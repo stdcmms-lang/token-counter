@@ -76,20 +76,25 @@ COUNTER_SCOPES = {
         'latency_subagent_prompt_missing', 'latency_unknown_speed',
         'logged_turn_over_cap', 'latency_groups_omitted', 'latency_tier_groups_omitted',
     ),
-    # These diagnostics are needed by extraction now. Attribution, clustering, timing
-    # aggregation and state counters arrive with their implementing rounds.
-    'observation': (
+    'windows': (
         'limit_reports', 'limit_readings', 'limit_reading_invalid', 'limit_reset_invalid',
-        'limit_unknown_kind', 'limit_unknown_scope', 'limit_429_assumed_all_models',
+        'limit_reset_cluster_ambiguous', 'limit_reset_grid_departures',
+        'limit_quote_conflict', 'limit_percent_decreased', 'limit_unknown_kind',
+        'limit_unknown_scope', 'limit_429_assumed_all_models',
+        'window_single_reading', 'window_zero_delta', 'window_partial_response',
+        'window_unknown_speed', 'window_unknown_cache_ttl', 'window_overlapping_span',
+        'window_unavailable_timestamps', 'window_unknown_plan', 'window_rows_fast',
+        'window_rows_us', 'window_rows_haiku_long', 'account_tier_unrecognized',
+        'account_plan_unknown', 'account_plan_conflict', 'account_subscription_date_missing',
+    ),
+    'observation': (
         'limit_events', 'limit_event_copies', 'limit_event_missing_identity',
-        'limit_reading_copies', 'limit_quote_conflict',
+        'limit_reading_copies',
         'limit_event_invalid_timestamp', 'limit_event_unknown_kind', 'limit_events_undated',
-        'account_tier_unrecognized', 'account_plan_unknown', 'account_plan_conflict',
         'account_fields_contradictory',
-        'account_subscription_date_missing', 'account_unavailable', 'account_invalid',
+        'account_unavailable', 'account_invalid',
         'account_field_invalid', 'logged_turn_invalid', 'logged_turn_unmatched',
         'tool_unmatched_call', 'tool_unmatched_result', 'tool_identity_conflict',
-        'windows_unavailable',
     ),
     'history': (
         'history_unavailable', 'history_integrity_failed', 'history_commit_failed',
@@ -417,6 +422,43 @@ class CoverageResult(TypedDict):
     withheld_months: Dict[str, List[str]]
     windows_replace_safe: bool
     window_reasons: List[str]
+
+
+class WindowSplit(TypedDict):
+    model: str
+    tier: Literal['standard', 'fast']
+    responses: int
+    input: int
+    cached: int
+    output: int
+    cache_write_5m: Optional[int]
+    cache_write_1h: Optional[int]
+
+
+class Window(TypedDict):
+    window_key: str
+    kind: LimitKind
+    nominal_start: float
+    reset_at: float
+    observation_start: Optional[float]
+    observation_end: Optional[float]
+    first_pct: Optional[float]
+    peak_pct: Optional[float]
+    last_pct: Optional[float]
+    readings: List[LimitReading]
+    rows: List[str]
+    counts: Counts
+    nominal_rows: List[str]
+    nominal_counts: Counts
+    cache_write_5m: Optional[int]
+    cache_write_1h: Optional[int]
+    split: List[WindowSplit]
+    split_complete: bool
+    speed_unrecorded_responses: int
+    plan: Optional[Plan]
+    plan_source: Optional[Literal['account']]
+    shareable: bool
+    withheld_reasons: List[str]
 
 
 class LedgerResult(TypedDict):

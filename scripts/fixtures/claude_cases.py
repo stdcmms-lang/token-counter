@@ -5,6 +5,7 @@ A case has ``files`` mapping relative POSIX paths to lists of records, plus
 No builder reads account state, transcripts, prices or any other input file.
 """
 import copy
+import datetime
 import json
 from pathlib import Path
 
@@ -152,6 +153,48 @@ def _reading(hhmm, percent, reset, parent):
             "resets_at": reset, "scope": None, "severity": "normal", "is_active": True,
         }], "extra_usage": None}},
     }
+
+
+def account_snapshot(observed_at, *, organization_type='claude_max',
+                     rate_limit_tier='default_claude_max_5x',
+                     subscription_created_at='2026-09-10T17:00:00Z') -> dict:
+    """Invented five-field snapshot; account identity is never part of a fixture fact."""
+    def stamp(value):
+        if isinstance(value, str):
+            return datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+        return value
+    plan = {'default_claude_max_5x': 'claude:max-5x',
+            'default_claude_max_20x': 'claude:max-20x'}.get(rate_limit_tier) if organization_type == 'claude_max' else None
+    if organization_type == 'claude_pro' and rate_limit_tier not in ('default_claude_max_5x', 'default_claude_max_20x'):
+        plan = 'claude:pro'
+    return {'observed_at': stamp(observed_at), 'organization_type': organization_type,
+            'rate_limit_tier': rate_limit_tier, 'current_plan': plan,
+            'subscription_created_at': stamp(subscription_created_at)}
+
+
+def quota_429(timestamp='2026-09-10T19:30:00Z', *, kind='seven_day', status='rejected',
+              reset='2026-09-17T16:00:00Z', uuid='W-429') -> dict:
+    return assistant_record('error-message', 'error-request', timestamp, {}, uuid=uuid,
+        model='<synthetic>', flags={'isApiErrorMessage': True, 'apiErrorStatus': 429,
+                                    'quotaLimits': {'status': status, 'rateLimitType': kind, 'resetsAt': reset}})
+
+
+def quota_W_timed() -> dict:
+    """W plus invented own prompts ten seconds before each response; counts unchanged."""
+    case = quota_W()
+    records, parent = [], None
+    for record in next(iter(case['files'].values())):
+        if record['type'] == 'assistant':
+            end = datetime.datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00'))
+            start = (end - datetime.timedelta(seconds=10)).isoformat().replace('+00:00', 'Z')
+            prompt = _user(record['uuid'] + '-prompt', start, 'invented task', parent)
+            prompt['sessionId'] = case['session_id']
+            records.append(prompt)
+            record['parentUuid'] = prompt['uuid']
+        records.append(record)
+        parent = record['uuid']
+    case['files'][next(iter(case['files']))] = records
+    return case
 
 
 def write_corpus(root, case) -> list:

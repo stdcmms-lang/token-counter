@@ -60,7 +60,8 @@ def test_analyzer_B():
         for key in ('reconciliation', 'resend_cost', 'amplification', 'cache_leads'):
             expect('unsupported ' + key, model[key], {'available': False, 'reason': 'Claude transcripts do not establish per-content token attribution.'})
         expect('coverage passed through by identity', model['coverage'] is result['coverage'], True)
-        expect('round five windows unavailable', (model['rate_limits']['windows'], model['quality']['windows_unavailable']), ([], 1))
+        expect('B has no quota readings or unavailable counter',
+               (model['rate_limits']['windows'], 'windows_unavailable' in model['quality']), ([], False))
         expect('B one family one stream', (len(model['sessions']), model['sessions'][0]['threads'], model['sessions'][0]['active_s']), (1, 1, 10))
         day = model['daily'][0]
         expect('captured daily chart spans', (day['start'], day['end'], day['sessions'], day['input']),
@@ -79,6 +80,57 @@ def test_analyzer_B():
         expect('public model strips identity and local fields', any(s in encoded for s in sentinels), False)
         expect('public omits images and private timing adapter', ('images' in public, '_share_latency' in public), (False, False))
         expect('no UTC calendar arrays', any(k in encoded for k in ('utc_hours', 'utc_weekdays')), False)
+
+
+def test_analyzer_W():
+    with corpus(cases.quota_W_timed()) as (result, _files, _root):
+        result['account_snapshots'] = [cases.account_snapshot('2026-09-10T21:00:00Z',
+                                                           subscription_created_at='2026-09-10T16:00:00Z')]
+        model = analyze.analyze(result, now='2026-09-18T00:00:00Z')
+        limits, window = model['rate_limits'], model['rate_limits']['windows'][0]
+        legacy = ('index', 'reset_at', 'reset_at_iso', 'resets_at', 'resets_at_iso', 'peak_pct',
+                  'last_pct', 'tokens', 'pct_points', 'cum_points', 'usd', 'usd_points', 'late_points')
+        expect('W legacy window contract', all(k in window for k in legacy), True)
+        top = ('available', 'window_minutes', 'weekly', 'windows', 'windows_total', 'current',
+               'observations', 'quotes', 'idle_windows', 'overlapping', 'late_readings',
+               'boundary_without_drop', 'other_windows', 'plans', 'now')
+        expect('W Codex top level rate limit contract', all(k in limits for k in top), True)
+        nominal, reset = worker.epoch('2026-09-10T16:00:00Z'), worker.epoch('2026-09-17T16:00:00Z')
+        first, peak = worker.epoch('2026-09-10T18:00:00Z'), worker.epoch('2026-09-10T19:00:00Z')
+        #Median reset00.470 rounds00; nominal=reset-604800; all late points0.
+        expect('W nominal inferred anchor and expiry',
+               (window['reset_at'], window['reset_at_iso'], window['resets_at'], window['resets_at_iso'],
+                window['reset_inferred'], window['anchor_inferred'], window['late_points'], window['expired']),
+               (nominal, analyze._iso(nominal), reset, analyze._iso(reset), True, True, 0, True))
+        #First20 at18:00; first peak25 at19:00; plateau25 at20:00 retains only a sparse point.
+        expect('W observation chart points', (window['first_pct'], window['peak_pct'], window['last_pct'],
+               window['observation_start'], window['observation_end'], window['pct_points']),
+               (20, 25, 25, first, peak, [[first, 20], [peak, 25], [peak + 3600, 25]]))
+        #Nominal100+200+300+400+500=1500; reads40+80+120+160+200=600;output150.
+        expect('W chart nominal hand counts', window['tokens'],
+               dict(responses=5, input=1500, cached=600, output=150, reasoning=0, uncached=900))
+        #Observation300+400=700;reads120+160=280;output30+40=70;5m10+10=20;1h20+20=40.
+        expect('W share observation hand counts', (window['counts'], window['cache_write_5m'], window['cache_write_1h']),
+               (dict(responses=2, input=700, cached=280, output=70, reasoning=0), 20, 40))
+        #Cumulative nominal input+output:110;110+220=330;+330=660;+440=1100;+550=1650.
+        expect('W nominal cumulative hand values', [p[1] + p[3] for p in window['cum_points']], [110, 330, 660, 1100, 1650])
+        #Opus5.5 row values448/896/1434/1882/2240 microdollars sum6900, no search fee.
+        expect('W nominal default price hand values', (window['usd'], [p[1] for p in window['usd_points']]),
+               (.0069, [.000448, .001344, .002778, .00466, .0069]))
+        expect('W latency captured account plan', (model['latency']['plan'], model['latency']['plan_source']), ('claude:max-5x', 'account'))
+        public = analyze.public_model(model)
+        expect('public W window wire fields only', set(public['rate_limits']['windows'][0]),
+               set(('start', 'window_minutes', 'plan', 'first_pct', 'peak_pct', 'responses', 'input', 'cached', 'output', 'reasoning', 'split')))
+        encoded = json.dumps(public)
+        sentinels = [window['window_key']] + [r['reading_key'] for r in result['limits']] + [r['response_key'] for r in result['rows']]
+        expect('public W strips reading and response identities', any(s in encoded for s in sentinels), False)
+        #Subscription17:30 permits quota start18:00, but is after earliest accepted latency end17:00.
+        result['account_snapshots'] = [cases.account_snapshot('2026-09-10T21:00:00Z',
+                                                           subscription_created_at='2026-09-10T17:30:00Z')]
+        model = analyze.analyze(result, now='2026-09-10T22:00:00Z')
+        expect('W latency applies earliest sample subscription guard',
+               (model['rate_limits']['windows'][0]['plan'], model['latency']['plan'], model['latency']['plan_source']),
+               ('claude:max-5x', None, None))
 
 
 def test_frozen_stream_anchor():

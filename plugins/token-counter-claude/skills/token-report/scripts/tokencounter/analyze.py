@@ -10,7 +10,7 @@ import math
 import re
 import time
 
-from . import composition, latency, pricing
+from . import composition, latency, pricing, windows
 from .ledger import _day, _day_span, _family_summary, _iso, _local_day, epoch
 from .models import COUNTER_NAMES, ReportModel, bump
 
@@ -165,7 +165,68 @@ def _timing(ledger, rows, since=None):
     model['daily'] = [dict(latency._summary(v), date=d, start=spans[d][0], end=spans[d][1],
                            median_above_s=latency._r(latency._pct(sorted(day_above[d]), .5)))
                       for d, v in sorted(day_values.items())]
+    ends = [epoch(r['ts']) for r in accepted]
+    model['plan'], model['plan_source'], plan_q = (
+        windows.plan_for_interval(min(ends), max(ends), ledger['account_snapshots'])
+        if ends else (None, None, {}))
+    for name, value in plan_q.items():
+        bump(counters, name, value)
     return model, counters
+
+
+def _rate_limits(built, rows, prices, now):
+    """Legacy chart fields beside the separate observation-span numerator."""
+    by_key = {r['response_key']: r for r in rows}
+    table = prices[0] if isinstance(prices, tuple) else prices
+    row_prices, ends = {}, {}
+    for row in rows:
+        key = row['response_key']
+        ends[key] = epoch(row['ts'])
+        quote = pricing.price_row(row, table)
+        row_prices[key] = ((quote['tokens_usd'] or 0) + quote['web_search_usd']
+                           if quote['tokens_usd'] is not None or quote['web_search_usd'] else None)
+    records = []
+    for index, window in enumerate(built):
+        members = [by_key[k] for k in window['nominal_rows']]
+        running, value, priced = collections.Counter(), 0.0, False
+        cum_points, usd_points = [], []
+        for row in members:
+            u, key = row['usage'], row['response_key']
+            running.update(input=u['input_tokens'], cached=u['cached_input_tokens'], output=u['output_tokens'])
+            # Legacy columns: timestamp, cumulative input, cumulative uncached, output.
+            # Their input + output is the nominal recorded-token curve.
+            cum_points.append([ends[key], running['input'], running['input'] - running['cached'], running['output']])
+            quote = row_prices[key]
+            value += quote or 0
+            priced = priced or quote is not None
+            usd_points.append([ends[key], round(value, 6)])
+        local = dict(window)
+        local.update(index=index, reset_at=window['nominal_start'], reset_at_iso=_iso(window['nominal_start']),
+                     resets_at=window['reset_at'], resets_at_iso=_iso(window['reset_at']),
+                     reset_inferred=True, anchor_inferred=True, anchor=window['nominal_start'],
+                     tokens=dict(window['nominal_counts'], uncached=window['nominal_counts']['input'] - window['nominal_counts']['cached']),
+                     observation_counts=dict(window['counts']),
+                     cum_points=cum_points, usd=round(value, 6) if priced else None,
+                     usd_points=usd_points if priced else [], late_points=0,
+                     observations=len(window['readings']), expired=window['reset_at'] <= now,
+                     start=windows._wire_entry(window)['start'], window_minutes=300 if window['kind'] == 'session' else 10080,
+                     **window['counts'])
+        records.append(local)
+    weekly = [w for w in records if w['kind'] == 'weekly_all']
+    current = max(weekly, key=lambda w: (max(epoch(r['ts']) or 0 for r in w['readings']), w['resets_at'])) if weekly else None
+    # Scoped and five-hour observations stay distinct local series, with their own kinds.
+    return {'available': bool(records), 'reason': None if records else 'no structured limit readings in range',
+            'window_minutes': 10080, 'weekly': bool(weekly), 'windows': records,
+            'windows_total': len(records), 'current': current,
+            'observations': sum(w['observations'] for w in weekly),
+            'quotes': len({r['resets_at'] for w in weekly for r in w['readings']}),
+            'idle_windows': sum(w['peak_pct'] == 0 for w in weekly),
+            'overlapping': sum('window_overlapping_span' in w['withheld_reasons'] for w in weekly),
+            'late_readings': 0, 'boundary_without_drop': 0,
+            'other_windows': [{'kind': kind, 'window_minutes': 300 if kind == 'session' else 10080,
+                               'observations': sum(w['observations'] for w in records if w['kind'] == kind)}
+                              for kind in ('weekly_scoped', 'session') if any(w['kind'] == kind for w in records)],
+            'plans': dict(collections.Counter(w['plan'] for w in weekly if w['plan'])), 'now': now}
 
 
 def _logged_turns(ledger, rows, counters):
@@ -205,7 +266,6 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
     if (since is not None or until is not None) and any(counters.get(n) for n in (
             'unparseable_records', 'non_object_records', 'malformed_records', 'trailing_partial_lines')):
         bump(counters, 'damage_outside_window')
-    bump(counters, 'windows_unavailable')
     groups, families, days = (collections.defaultdict(list) for _ in range(3))
     for row in rows:
         groups[row['model']].append(row)
@@ -276,6 +336,13 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
     for name, count in lat_q.items():
         bump(counters, name, count)
     share_lat, _ = _timing(timing_view, rows, since=current - 30 * 86400)
+    readings = [r for r in ledger['limits'] if _selected(r, since, until) and source_matches(r['source_id'])
+                and (not live_only or r['reading_key'] in ledger.get('_live_limit_keys', {}))]
+    built_windows, window_q = windows.build_windows(readings, rows,
+        account_snapshots=ledger['account_snapshots'], established=ledger.get('_reset_clusters', ()), now=current)
+    for name, count in window_q.items():
+        bump(counters, name, count)
+    rate_limits = _rate_limits(built_windows, rows, prices, current)
     logged = _logged_turns(timing_view, rows, counters)
     event_days = collections.Counter()
     undated = 0
@@ -309,7 +376,7 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
             'cat_series': [[t, dict(c)] for t, c in sorted(series.items())], 'cat_bucket_s': CAT_BUCKET_S,
             'images': {'count': len(image_facts), 'facts': image_facts,
                        'estimated_visual_tokens': sum(f['estimated_visual_tokens'] or 0 for f in image_facts)},
-            'rate_limits': {'windows': []},
+            'rate_limits': rate_limits,
             'limit_events': {'total': sum(event_days.values()) + undated, 'undated': undated,
                              'daily': [dict(date=d, n=n, start=_day_span(d)[0], end=_day_span(d)[1])
                                        for d, n in sorted(event_days.items())]},
@@ -335,7 +402,7 @@ def public_model(model) -> ReportModel:
         return result
 
     def safe_latency(value):
-        out = fields(value, ('available', 'reason', 'responses', 'turns', 'tools_total', 'method'))
+        out = fields(value, ('available', 'reason', 'responses', 'turns', 'tools_total', 'method', 'plan', 'plan_source'))
         for key in ('responses', 'turns'):
             if key in out:
                 out[key] = fields(out[key], ('n', 'total_s', 'median_s', 'p90_s', 'model_s', 'model_share',
@@ -380,7 +447,16 @@ def public_model(model) -> ReportModel:
                          if c['category'] in composition.CATEGORIES]
     out['cat_series'] = [[t, {k: v for k, v in c.items() if k in composition.CATEGORIES}]
                          for t, c in model['cat_series']]
+    # Public windows carry only the observation-span wire fields. Local chart series,
+    # anchor inference, response keys, scope digests and reading provenance stay local.
     out['rate_limits'] = {'windows': []}
+    for window in model['rate_limits']['windows']:
+        if window['kind'] != 'weekly_all':
+            continue
+        w = fields(window, windows.WIRE_FIELDS)
+        w['split'] = [dict(fields(s, windows.SPLIT_FIELDS), model=named_counts(s)['model'])
+                      for s in window['split'] if s.get('tier') in pricing.TIER_CLASSES]
+        out['rate_limits']['windows'].append(w)
     events = model['limit_events']
     out['limit_events'] = dict(fields(events, ('total', 'undated')),
                                daily=[fields(d, ('date', 'n', 'start', 'end')) for d in events['daily']])

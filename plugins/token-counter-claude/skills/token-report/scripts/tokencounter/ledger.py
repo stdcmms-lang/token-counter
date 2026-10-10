@@ -659,6 +659,7 @@ def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerRes
     live_content = [(r['source_id'], f) for r in results if r['stable_read']
                     for f in r['content'] + [f for c in r['responses'] for b in c['blocks'] for f in b['content']]]
     live_events = {f['event_key']: True for r in results if r['stable_read'] for f in r['events']}
+    live_limits = {f['reading_key']: True for r in results if r['stable_read'] for f in r['limits']}
     live_starts = {f['tool_key'] for r in results if r['stable_read'] for f in r['tool_starts']}
     live_tool_results = {f['tool_key'] for r in results if r['stable_read'] for f in r['tool_results']}
     live_logged = {f['logged_record_key']: True for r in results if r['stable_read']
@@ -785,6 +786,7 @@ def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerRes
         '_live_snapshot_keys': [[attribution[sid]['family_id'], f['category'], f['body_digest']]
                                 for sid, f in live_content if f['snapshot'] and f['body_digest'] is not None],
         '_live_event_keys': live_events,
+        '_live_limit_keys': live_limits,
         '_live_tool_keys': {key: True for key in live_starts & live_tool_results},
         '_live_logged_keys': live_logged,
         '_source_families': {sid: {k: info[k] for k in ('session_id', 'family_id', 'stream_id')}
@@ -795,6 +797,7 @@ def build(results, *, history=None, account_snapshots=(), now=None) -> LedgerRes
                      'windows_replace_safe': False, 'window_reasons': []},
     }
     if state is not None:
+        result['_reset_clusters'] = copylib.deepcopy(state.get('reset_clusters', ()))
         result['coverage'].update(history_available=state['history_available'],
                                   history_committed=state['history_committed'], token_bound=True,
                                   archived_responses=counters.get('archived_responses', 0))

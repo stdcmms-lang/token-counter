@@ -9,6 +9,7 @@ The patch is in memory and restored after each target; no source files are rewri
 import argparse
 import copy
 import importlib.util
+import inspect
 from pathlib import Path
 import sys
 
@@ -844,14 +845,394 @@ def _pricing_main():
     return 1 if bad else 0
 
 
+WINDOWS_MANIFEST = {}
+
+
+def windows_pair(name, function, mutation, assertion, test=None):
+    def decorate(factory):
+        WINDOWS_MANIFEST[name] = dict(test=test or name, function=function, mutation=mutation,
+                                      assertion=assertion, factory=factory)
+        return factory
+    return decorate
+
+
+def _window_source(original, before, after):
+    source = inspect.getsource(original)
+    if source.count(before) != 1:
+        raise ValueError('mutation source decision is not unique')
+    namespace = dict(original.__globals__)
+    exec(compile(source.replace(before, after), '<window decision mutation>', 'exec'), namespace)
+    return namespace[original.__name__]
+
+
+@windows_pair('test_reset_jitter_cluster', 'windows._canonical', 'use earliest reset floor instead of rounded median', 'jitter canonical reset')
+def _window_earliest_reset(original):
+    return lambda resets: float(int(min(resets)))
+
+
+@windows_pair('test_cluster_not_neighbor_chained', 'windows._fits', 'chain by nearest neighbor instead of full span', 'whole cluster span not neighbor distance')
+def _window_neighbor_chain(original):
+    return lambda c, reset, tolerance: min(abs(reset - c['min_reset']), abs(reset - c['max_reset'])) <= tolerance
+
+
+@windows_pair('test_cluster_tolerance_inclusive', 'windows._fits', 'exclude the two-second boundary', 'two second tolerance inclusive')
+def _window_exclusive_tolerance(original):
+    return lambda c, reset, tolerance: max(c['max_reset'], reset) - min(c['min_reset'], reset) < tolerance
+
+
+@windows_pair('test_canonical_reset_rounding', 'windows._canonical', 'round median ties to even', 'canonical median tie upward')
+def _window_bankers_rounding(original):
+    return _window_source(original, 'math.floor(statistics.median(resets) + .5)', 'round(statistics.median(resets))')
+
+
+@windows_pair('test_established_anchor_stable', 'windows.cluster_resets', 'recompute an established reset from later quotes', 'captured anchor and phase stable')
+def _window_move_anchor(original):
+    def changed(*args, **kwargs):
+        clusters, q = original(*args, **kwargs)
+        for c in clusters:
+            if c['readings']:
+                c['reset_at'] = c['readings'][-1]['resets_at']
+        return clusters, q
+    return changed
+
+
+@windows_pair('test_ambiguous_cluster_withheld', 'windows.cluster_resets', 'attach an ambiguous quote to one captured cluster', 'ambiguous established anchors never merged')
+def _window_allow_ambiguous(original):
+    return _window_source(original, 'if len(fits) > 1:', 'if len(fits) > 100:')
+
+
+@windows_pair('test_reset_grid_diagnostic', 'windows._grid_departure', 'ignore departures from the learned phase', 'grid diagnostics only offset604804')
+def _window_ignore_grid(original):
+    return lambda reset, phase: False
+
+
+@windows_pair('test_grid_snapping_mutation', 'windows.cluster_resets', 'snap a departing reset to the weekly grid',
+              'grid diagnostics only offset604804', test='test_reset_grid_diagnostic')
+def _window_snap_grid(original):
+    def changed(*args, **kwargs):
+        clusters, q = original(*args, **kwargs)
+        for c in clusters:
+            if c['kind'] == 'weekly_all':
+                phase = c['grid_phase']
+                c['reset_at'] = phase + round((c['reset_at'] - phase) / 604800) * 604800
+        return clusters, q
+    return changed
+
+
+@windows_pair('test_first_to_first_peak_span', 'windows.observation_span', 'use the last peak instead of first peak', 'first to earliest peak')
+@windows_pair('test_plateau_does_not_extend_span', 'windows.observation_span', 'extend numerator through the plateau', 'plateau leaves first peak endpoint')
+def _window_last_peak(original):
+    return _window_source(original, 'next((t for t, p in points if p == peak), None)',
+                          'next((t for t, p in reversed(points) if p == peak), None)')
+
+
+@windows_pair('test_boundary_open_closed', 'windows._in_span', 'include first end and exclude peak end', 'observation boundaries open closed')
+def _window_reverse_boundaries(original):
+    return _window_source(original, 'start < stamp <= end', 'start <= stamp < end')
+
+
+@windows_pair('test_single_reading_withheld', 'windows.observation_span', 'accept a single sourced percentage', 'single reading withheld')
+@windows_pair('test_429_only_single_reading', 'windows.observation_span', 'accept a lone full refusal reading', '429 only is single reading')
+def _window_single_accepted(original):
+    return _window_source(original, "bump(counters, 'window_single_reading')", 'pass')
+
+
+@windows_pair('test_zero_delta_withheld', 'windows.observation_span', 'accept a nonincreasing comparison', 'zero delta withheld')
+def _window_zero_accepted(original):
+    return _window_source(original, "bump(counters, 'window_zero_delta')", 'pass')
+
+
+@windows_pair('test_percent_drop_withheld', 'windows.observation_span', 'ignore percentage declines', 'percent decrease withheld')
+def _window_drop_accepted(original):
+    return _window_source(original, "bump(counters, 'limit_percent_decreased')", 'pass')
+
+
+@windows_pair('test_same_stamp_conflict', 'windows.observation_span', 'accept conflicting percentages at the same time', 'same timestamp conflict withheld')
+def _window_conflict_accepted(original):
+    return _window_source(original, "bump(counters, 'limit_quote_conflict')", 'pass')
+
+
+@windows_pair('test_429_is_full_reading', 'worker._full_reading', 'drop rejected weekly full readings', 'weekly refusal sourced full reading')
+def _window_no_weekly_refusal(original):
+    return lambda record: False
+
+
+@windows_pair('test_429_without_weekly_rejection_has_no_percent', 'worker._full_reading', 'promote nonweekly refusals to all-model100',
+              "nonweekly or nonrejected refusal has no percent {'kind': 'five_hour'}")
+def _window_every_refusal_full(original):
+    return lambda record: original(record) or record.get('quotaLimits', {}).get('rateLimitType') == 'five_hour'
+
+
+@windows_pair('test_weekly_all_only', 'windows.wire_windows', 'submit local five-hour windows as weekly', 'wire only weekly all')
+def _window_wire_all_kinds(original):
+    return _window_source(original, "if w['kind'] == 'weekly_all' and w['shareable']", "if w['kind'] == 'session' or w['shareable']")
+
+
+@windows_pair('test_scoped_not_aliased_to_all', 'windows.cluster_resets', 'erase scoped identities during reset clustering', 'scoped identities remain separate')
+def _window_erase_scope(original):
+    return _window_source(original, "selected[(kind, scope if kind == 'weekly_scoped' else None)]", 'selected[(kind, None)]')
+
+
+@windows_pair('test_five_hour_not_weekly', 'windows.build_windows', 'subtract a week for session quota', 'session nominal five hours')
+def _window_session_week(original):
+    return _window_source(original, "300 * 60 if cluster['kind'] == 'session' else WEEK_S", 'WEEK_S')
+
+
+@windows_pair('test_unknown_plan_null', 'windows.plan_for_interval', 'invent a Max5 witness without any captured snapshot', 'unknown plan does not withhold')
+def _window_invent_plan_witness(original):
+    def changed(start, end, snapshots):
+        snapshots = list(snapshots)
+        if not snapshots:
+            snapshots = [dict(observed_at=start, organization_type='claude_max',
+                              rate_limit_tier='default_claude_max_5x', current_plan='claude:max-5x', subscription_created_at=start)]
+        return original(start, end, snapshots)
+    return changed
+
+
+@windows_pair('test_plan_from_current_snapshot', 'account.map_plan', 'map known Max5 tier to Pro', 'current captured snapshot attributes plan')
+def _window_max5_as_pro(original):
+    def changed(org, tier):
+        plan, q = original(org, tier)
+        return ('claude:pro' if plan == 'claude:max-5x' else plan), q
+    return changed
+
+
+@windows_pair('test_plan_null_before_subscription', 'windows.plan_for_interval', 'ignore subscription creation after span start', 'subscription start guard')
+def _window_ignore_created_after(original):
+    return _window_source(original, 'or created is None or created > start', 'or created is None')
+
+
+@windows_pair('test_plan_conflict_in_span', 'windows.plan_for_interval', 'ignore earlier post-start snapshots', 'in span plan conflict once')
+def _window_latest_snapshot_only(original):
+    return lambda start, end, snapshots: original(start, end, sorted(snapshots, key=lambda s: s['observed_at'])[-1:])
+
+
+@windows_pair('test_plan_changed_after_span', 'windows.plan_for_interval', 'ignore account observations after interval end', 'after span tier change invalidates plan')
+def _window_ignore_after_span(original):
+    return lambda start, end, snapshots: original(start, end, [s for s in snapshots if s['observed_at'] <= end])
+
+
+@windows_pair('test_latency_plan_same_rule', 'analyze._timing', 'test subscription date against latest sample end', 'latency captured snapshot rule1')
+def _window_latency_latest_end(original):
+    return _window_source(original, 'windows.plan_for_interval(min(ends), max(ends),', 'windows.plan_for_interval(max(ends), max(ends),')
+
+
+@windows_pair('test_snapshot_null_blocks_plan', 'windows.plan_for_interval', 'discard applicable null plan evidence', 'null snapshot blocks without known disagreement')
+@windows_pair('test_plan_predecessor_null_blocks', 'windows.plan_for_interval', 'discard null latest predecessor evidence', 'null latest predecessor blocks')
+def _window_ignore_null_plans(original):
+    return lambda start, end, snapshots: original(start, end, [s for s in snapshots if s['current_plan'] is not None])
+
+
+@windows_pair('test_subscription_date_missing_null', 'windows.plan_for_interval', 'invent a missing latest subscription date', 'missing witness subscription date')
+def _window_invent_subscription_date(original):
+    def changed(start, end, snapshots):
+        snapshots = copy.deepcopy(snapshots)
+        for s in snapshots:
+            if s['subscription_created_at'] is None:
+                s['subscription_created_at'] = start
+        return original(start, end, snapshots)
+    return changed
+
+
+@windows_pair('test_team_max_tier_not_personal_max', 'account.map_plan', 'infer a personal Max plan from a Team tier', 'team tier never personal Max')
+@windows_pair('test_plan_mapping_table', 'account.map_plan', 'let known Max tiers override organization type', 'closed account mapping table')
+def _window_tier_overrides_org(original):
+    return lambda org, tier: original('claude_max' if tier in ('default_claude_max_5x', 'default_claude_max_20x') else org, tier)
+
+
+@windows_pair('test_unknown_max_tier_null', 'account.map_plan', 'assume Max5 for unfamiliar nonempty Max tiers', 'unknown Max tier diagnostic')
+def _window_unknown_max5(original):
+    return lambda org, tier: original(org, 'default_claude_max_5x' if org == 'claude_max' and tier else tier)
+
+
+@windows_pair('test_plan_latest_predecessor_only', 'windows.plan_for_interval', 'let all older snapshots veto a later interval', 'only latest predecessor vetoes')
+def _window_all_predecessors(original):
+    return _window_source(original, 'latest_before = predecessor[-1:]', 'latest_before = predecessor')
+
+
+@windows_pair('test_plan_predecessor_only_witness', 'windows.plan_for_interval', 'require a post-start snapshot as the witness', 'predecessor only witness accepted')
+def _window_require_later_witness(original):
+    return _window_source(original, 'or created is None or created > start',
+                          'or created is None or created > start or not any(t >= start for t, s, p, d in mapped)')
+
+
+@windows_pair('test_plan_latest_witness_date', 'windows.plan_for_interval', 'borrow the older witness creation date', 'latest witness owns creation guard')
+def _window_old_witness_date(original):
+    return _window_source(original, 'witness = mapped[-1][1]', 'witness = mapped[0][1]')
+
+
+@windows_pair('test_plan_at_start_inclusive', 'windows.plan_for_interval', 'ignore snapshots exactly at the attribution start', 'snapshot at start participates')
+def _window_exclude_start_snapshot(original):
+    return _window_source(original, 's[0] >= start]', 's[0] > start]')
+
+
+@windows_pair('test_partial_window_withheld', 'windows.build_windows', 'treat explicit partial contributors as complete', 'partial contributing response withheld')
+def _window_accept_partial(original):
+    return _window_source(original, "if any(r.get('partial') for r in members):", 'if False:')
+
+
+@windows_pair('test_unknown_speed_window_partial_split', 'windows._split', 'infer Standard for absent recorded speed', 'known speed split exact counts')
+def _window_infer_standard(original):
+    return lambda rows: original([dict(r, tier=r.get('tier') or 'standard') for r in rows])
+
+
+@windows_pair('test_missing_speed_withholding_mutation', 'windows.build_windows', 'withhold missing speed rather than keep partial partition',
+              'unknown speed accepted outside split', test='test_unknown_speed_window_partial_split')
+def _window_withhold_speed(original):
+    return _window_source(original, "shareable=cluster['kind'] == 'weekly_all' and not reasons,",
+                          "shareable=cluster['kind'] == 'weekly_all' and not reasons and not speed_missing,")
+
+
+@windows_pair('test_unknown_ttl_window_withheld', 'windows._ttl_complete', 'assume unknown creation TTL is exact', 'unknown nonzero TTL withheld')
+def _window_assume_ttl(original):
+    return lambda row: True
+
+
+@windows_pair('test_unavailable_timestamps_withheld', 'windows.build_windows', 'accept unassignable and replayed response ends', 'required response timing withheld tsNone')
+def _window_ignore_timestamps(original):
+    return _window_source(original,
+        "if any(ts is None or _in_span(ts, span['observation_start'], span['observation_end'])\n               and not _timing_safe(r, ts) for ts, r in timed):", 'if False:')
+
+
+@windows_pair('test_overlapping_span_withheld', 'windows._overlaps', 'permit overlapping all-model observation spans', 'overlapping all model spans withheld')
+def _window_allow_overlap(original):
+    return lambda a, b: False
+
+
+@windows_pair('test_server_pricing_diagnostics_only', 'windows.build_windows', 'withhold Fast rows for server pricing differences', 'server pricing diagnostic only window_rows_fast')
+def _window_withhold_fast(original):
+    return _window_source(original, "shareable=cluster['kind'] == 'weekly_all' and not reasons,",
+                          "shareable=cluster['kind'] == 'weekly_all' and not reasons and not any(r['tier'] == 'fast' for r in members),")
+
+
+@windows_pair('test_sparse_points_no_synthetic_endpoints', 'windows.observation_span', 'synthesize a nominal zero-percent opening', 'sparse sourced percentage points')
+def _window_fake_opening(original):
+    def changed(readings):
+        span, q = original(readings)
+        span['pct_points'].insert(0, [min(r['resets_at'] for r in readings) - 604800, 0])
+        return span, q
+    return changed
+
+
+@windows_pair('test_nominal_chart_observation_share', 'windows._in_nominal', 'restrict nominal chart to the share observation span', 'nominal counts distinct from share')
+def _window_chart_share_span(original):
+    return lambda stamp, start, end: stamp is not None and start + 7200 < stamp <= start + 10800
+
+
+@windows_pair('test_nominal_chart_boundaries', 'windows._in_nominal', 'exclude nominal start and include reset', 'nominal interval includes start excludes reset')
+def _window_reverse_nominal_boundary(original):
+    return _window_source(original, 'start <= stamp < end', 'start < stamp <= end')
+
+
+@windows_pair('test_small_delta_shareable_ineligible', 'windows.build_windows', 'withhold a positive delta below five points', 'small positive delta accepted')
+def _window_minimum_delta_for_share(original):
+    return _window_source(original, "shareable=cluster['kind'] == 'weekly_all' and not reasons,",
+                          "shareable=cluster['kind'] == 'weekly_all' and not reasons and span['peak_pct'] - span['first_pct'] >= 5,")
+
+
+@windows_pair('test_wire_coverage_guard', 'windows.wire_windows', 'submit entries despite unsafe replacement coverage', 'coverage forbids window replacement False')
+def _window_ignore_coverage(original):
+    return _window_source(original, 'return None, reasons', "return [_wire_entry(w) for w in windows if w['shareable']], reasons")
+
+
+def _evaluate_windows(suite, entry, factory=None):
+    def run():
+        suite.RESULTS.clear()
+        try:
+            with suite.offline():
+                getattr(suite, entry['test'])()
+        except BaseException as exc:
+            return list(suite.RESULTS), exc.__class__.__name__
+        return list(suite.RESULTS), None
+
+    before, error = run()
+    named = entry['assertion']
+    if error or not before or any(not ok for _n, ok, _d in before) or not any(n == named for n, _ok, _d in before):
+        return False, 'invalid mutation: baseline did not pass its designated assertion'
+    module_name, function_name = entry['function'].split('.')
+    module = {'windows': suite.windows, 'account': suite.account, 'worker': suite.worker, 'analyze': suite.analyze}[module_name]
+    original = getattr(module, function_name)
+    state = {'calls': 0, 'error': None}
+    try:
+        mutation = (factory or entry['factory'])(original)
+    except BaseException as exc:
+        return False, 'invalid mutation: setup ' + exc.__class__.__name__
+
+    def instrumented(*args, **kwargs):
+        state['calls'] += 1
+        try:
+            return mutation(*args, **kwargs)
+        except BaseException as exc:
+            state['error'] = exc.__class__.__name__
+            raise
+
+    setattr(module, function_name, instrumented)
+    try:
+        after, error = run()
+    finally:
+        setattr(module, function_name, original)
+    if state['error'] or error:
+        return False, 'invalid mutation: exception ' + (state['error'] or error)
+    if not state['calls']:
+        return False, 'invalid mutation: decision did not execute'
+    if not any(n == named and not ok for n, ok, _d in after):
+        return False, 'invalid mutation: designated assertion did not fail'
+    return True, 'caught by: ' + named
+
+
+def _windows_main():
+    spec = importlib.util.spec_from_file_location('test_claude_windows', str(Path(__file__).with_name('test_claude_windows.py')))
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    missing = set(suite.WINDOWS_DECISIONS) - {entry['test'] for entry in WINDOWS_MANIFEST.values()}
+    if missing:
+        print('[FAIL] missing windows mutation pairs: ' + ', '.join(sorted(missing)))
+        return 1
+    witness = WINDOWS_MANIFEST['test_boundary_open_closed']
+    for exception in (RuntimeError, ImportError):
+        def factory(original):
+            def crash(*args, **kwargs):
+                raise exception('invented mutation failure')
+            return crash
+        ok, reason = _evaluate_windows(suite, witness, factory)
+        if ok or 'invalid mutation: exception ' not in reason:
+            print('[FAIL] windows mutation exception self-test')
+            return 1
+    noop, _ = _evaluate_windows(suite, witness, lambda original: original)
+    unrelated_entry = dict(WINDOWS_MANIFEST['test_nominal_chart_observation_share'], function='windows._split')
+    def unrelated_factory(original):
+        def changed(rows):
+            split = original(rows)
+            for s in split:
+                s['cache_write_5m'] = 0
+            return split
+        return changed
+    unrelated, unrelated_reason = _evaluate_windows(suite, unrelated_entry, unrelated_factory)
+    if noop or unrelated or unrelated_reason != 'invalid mutation: designated assertion did not fail':
+        print('[FAIL] windows mutation sensitivity self-test')
+        return 1
+    print('[PASS] crashes, import errors, no-ops and unrelated failures are invalid mutations')
+    bad = 0
+    for name, entry in sorted(WINDOWS_MANIFEST.items()):
+        ok, reason = _evaluate_windows(suite, entry)
+        bad += int(not ok)
+        print('[%s] %s -> %s -> %s\n        %s' %
+              ('PASS' if ok else 'FAIL', name, entry['function'], entry['mutation'], reason))
+    print('\n%d/%d windows mutations caught' % (len(WINDOWS_MANIFEST) - bad, len(WINDOWS_MANIFEST)))
+    return 1 if bad else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--section', choices=('ledger', 'retention', 'pricing'), default='ledger')
+    parser.add_argument('--section', choices=('ledger', 'retention', 'pricing', 'windows'), default='ledger')
     args = parser.parse_args(argv)
     if args.section == 'retention':
         return _retention_main()
     if args.section == 'pricing':
         return _pricing_main()
+    if args.section == 'windows':
+        return _windows_main()
     missing = set(tests.LEDGER_TESTS) - set(MANIFEST)
     if missing:
         print('[FAIL] missing ledger mutation pairs: ' + ', '.join(sorted(missing)))

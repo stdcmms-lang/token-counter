@@ -951,6 +951,7 @@ class History:
             elif self.db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
                 bump(counters, 'history_integrity_failed')
             else:
+                self._load_reset_clusters()
                 calls, results = {}, []
                 for table in ('sources', 'facts', 'response_copies', 'submissions'):
                     columns = ('kind,fact_key,source_id,' if table == 'facts' else
@@ -1157,6 +1158,17 @@ class History:
             canonical = build(results, history=loaded)
         finally:
             facts['state'].pop('_captured_live_copies', None)
+        # Captured reset anchors and the account's observed grid phase are durable
+        # metadata. Re-clustering later facts may widen quotes, but cannot move them.
+        from . import windows
+        clusters, _ = windows.cluster_resets(canonical['limits'], established=facts['state'].get('reset_clusters', ()))
+        anchors = windows._anchors(clusters)
+        if anchors != facts['state'].get('reset_clusters', []):
+            raw = _json_bytes(anchors).decode('utf-8')
+            self.db.executemany('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v',
+                                [('reset_clusters', raw), ('reset_clusters_sha256', _digest(anchors))])
+        facts['state']['reset_clusters'] = anchors
+        canonical['_reset_clusters'] = copy.deepcopy(anchors)
         calendars = {f['value']['response_key'] for f in facts['calendar']}
         additions = {}
         for row in canonical['rows']:
@@ -1200,6 +1212,7 @@ class History:
                 gc.enable()
 
     def _load(self, facts, state):
+        state['reset_clusters'] = self._load_reset_clusters()
         sources, copies, snapshots = [], [], []
         for row in self.db.execute('SELECT source_id,session_id,thread_id,kind,first_seen,last_seen,live,'
                                    'fact_codec,payload,payload_sha256 FROM sources ORDER BY source_id'):
@@ -1240,6 +1253,16 @@ class History:
                         facts[kind].append(entry)
         facts['submissions'] = self._load_submissions()
         return sources, copies, facts, sorted(snapshots, key=lambda s: (s['observed_at'], _digest(s)))
+
+    def _load_reset_clusters(self):
+        from . import windows
+        meta = dict(self.db.execute("SELECT k,v FROM meta WHERE k IN ('reset_clusters','reset_clusters_sha256')"))
+        if not meta:
+            return []  # Round-4/5 histories learn anchors on their next capture.
+        anchors = json.loads(meta['reset_clusters'])
+        if not isinstance(anchors, list) or _digest(anchors) != meta.get('reset_clusters_sha256'):
+            raise ValueError('reset anchor metadata checksum mismatch')
+        return windows._checked_anchors(anchors)
 
     def _load_submissions(self):
         receipts = []
