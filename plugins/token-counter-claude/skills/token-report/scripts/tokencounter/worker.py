@@ -346,7 +346,7 @@ def _cost_checks(record, source_id, record_key, ts, counters):
               'reads': 'cacheReadInputTokens', 'output': 'outputTokens',
               'thinking': 'thinkingTokens', 'searches': 'webSearchRequests'}
     for raw_model, item in sorted(box.items()):
-        model = _model_name(raw_model)[0]
+        model, safe, context = _model_name(raw_model)
         if model == 'unknown' or not isinstance(item, dict):
             bump(counters, 'cost_check_invalid')
             continue
@@ -363,9 +363,12 @@ def _cost_checks(record, source_id, record_key, ts, counters):
         basis = basis if basis in ('list', 'actual') else None
         if invalid:
             bump(counters, 'cost_check_invalid')
-        out.append({'record_key': _digest([record_key, model]), 'source_id': source_id,
-                    'ts': ts, 'source': source, 'model': model, 'cost_usd': cost,
-                    'cost_basis': basis, 'counts': counts})
+        # Keyed by the raw id: a map routinely holds a `[1m]` and a plain entry for one
+        # canonical model (12 records on the development corpus), and both are kept.
+        out.append({'record_key': _digest([record_key, safe]), 'source_id': source_id,
+                    'ts': ts, 'source': source, 'model': model, 'raw_model': safe,
+                    'context_1m': context, 'cost_usd': cost, 'cost_basis': basis,
+                    'counts': counts})
         if source == 'usage_report':
             bump(counters, 'usage_report_cost_crosschecks')
     return out
@@ -571,6 +574,21 @@ def _extract_once(path, metrics_only):
                                 flags.append('optional_metadata_invalid')
                             elif copy['advisor_model'] is None:
                                 copy['advisor_model'] = advisor_model
+                        # Retain metadata with its block, so a rewrite of a captured
+                        # effort, model or interruption marker is conflicting evidence
+                        # even when its usage numbers happen to be identical.
+                        copy['blocks'][-1]['response_metadata'] = {
+                            'raw_model': raw_model,
+                            'requested_model': _model_name(record.get('requestedModel'))[1],
+                            'advisor_model': (_model_name(advisor)[0]
+                                              if _model_name(advisor)[1] is not None else None),
+                            'effort': a if usage is not None and isinstance(a, str) and a in EFFORTS else None,
+                            'per_turn_effort': b if usage is not None and isinstance(b, str) and b in EFFORTS else None,
+                            'aborted': record.get('isAbortedMidStream') is True,
+                            'truncated': record.get('truncatedAfterOutput') is True,
+                            'stop_reason': (message.get('stop_reason') if message.get('stop_reason') in (
+                                'tool_use', 'end_turn', 'max_tokens', 'refusal', 'stop_sequence') else None),
+                        }
             elif kind == 'user':
                 bump(counters, 'nonusage_records')
                 message = record.get('message')

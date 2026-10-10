@@ -373,6 +373,17 @@ def test_cost_state_no_charge() -> None:
     with corpus(case) as (result, _files, _root):
         expect('cost state no charge', totals(result), (2, 255, 18))
         expect('cost state separate diagnostic', (len(result['cost_checks']), count(result, 'cost_state_count_mismatches')), (1, 1))
+    # A map routinely holds a [1m] entry beside the plain one (12 records on the
+    # development corpus). Both are kept as distinct checks; B's rows have no [1m]
+    # context, so the [1m] entry matches nothing and the plain one mismatches.
+    _records(case)[-1]['modelUsage']['claude-opus-5-5[1m]'] = {
+        'inputTokens': 1, 'cacheCreationInputTokens': 1, 'cacheReadInputTokens': 1,
+        'outputTokens': 1, 'thinkingTokens': 0, 'webSearchRequests': 0, 'costUSD': 1}
+    with corpus(case) as (result, _files, _root):
+        expect('cost state context entries kept apart',
+               (sorted((c['raw_model'], c['context_1m']) for c in result['cost_checks']),
+                count(result, 'cost_state_count_mismatches'), count(result, 'cost_state_unmatched_models')),
+               ([('claude-opus-5-5', False), ('claude-opus-5-5[1m]', True)], 1, 1))
 
 
 def test_iterations_not_added() -> None:

@@ -75,6 +75,16 @@ COUNTER_SCOPES = {
         'account_field_invalid', 'logged_turn_invalid', 'logged_turn_unmatched',
         'tool_unmatched_call', 'tool_unmatched_result', 'tool_identity_conflict',
     ),
+    'history': (
+        'history_unavailable', 'history_integrity_failed', 'history_commit_failed',
+        'history_schema_unsupported', 'history_token_binding_mismatch',
+        'history_conflicting_revisions', 'months_withheld',
+        'months_withheld_missing_contributors', 'months_withheld_decreased_contributions',
+        'months_withheld_calendar_change', 'months_withheld_schema_budget',
+        'sessions_withheld_month', 'windows_withheld_retention',
+        'windows_withheld_schema_budget', 'share_prepared', 'share_confirmed',
+        'share_outcome_unknown',
+    ),
 }
 COUNTER_NAMES = frozenset(name for names in COUNTER_SCOPES.values() for name in names)
 REASONS = {name: name.replace('_', ' ') for name in COUNTER_NAMES}
@@ -163,6 +173,7 @@ class BlockFact(TypedDict):
     # result can move them. They survive caching without retaining user records.
     req_ts: Optional[str]
     turn: Optional[int]
+    response_metadata: Dict[str, object]  # safe per-record metadata for revision checks
 
 
 class ResponseCopy(TypedDict):
@@ -221,6 +232,7 @@ class ResponseRow(TypedDict):
     usage: Usage
     partial: bool
     replayed: bool
+    archived: bool                 # no live transcript copy; present when history is loaded
     plan: Optional[Plan]
     plan_source: Optional[Literal['account']]
     quality_flags: List[str]
@@ -276,6 +288,8 @@ class CostCheck(TypedDict):
     ts: Optional[str]
     source: Literal['cost_state', 'usage_report']
     model: str
+    raw_model: str                 # safe normalized id as the map spelt it, e.g. with [1m]
+    context_1m: bool
     cost_usd: Optional[float]
     cost_basis: Optional[str]
     counts: Dict[str, Optional[int]]

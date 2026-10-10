@@ -389,10 +389,262 @@ def _self_test():
     return not ok
 
 
+RETENTION_MANIFEST = {}
+
+
+def retention_pair(test, function, mutation, assertion):
+    def decorate(factory):
+        RETENTION_MANIFEST[test] = {'function': function, 'mutation': mutation,
+                                    'assertion': assertion, 'factory': factory}
+        return factory
+    return decorate
+
+
+def _discard_absent(original):
+    def changed(previous, incoming):
+        if previous is not None and incoming is None:
+            return None, {}
+        return original(previous, incoming)
+    return changed
+
+
+for _test, _assertion in (
+        ('test_capture_then_prune', 'pruned B retained'),
+        ('test_capture_then_shorten', 'shortened B retained'),
+        ('test_rebuild_preserves_history', 'rebuild after prune retains B'),
+        ('test_no_cache_preserves_history', 'no-cache after prune retains B')):
+    retention_pair(_test, 'history.merge_response_copy', 'discard absent captured response', _assertion)(_discard_absent)
+
+
+def _replace_with_short_copy(original):
+    def changed(previous, incoming):
+        if previous is not None and incoming is not None and incoming.get('stable_read') is not False:
+            return copy.deepcopy(incoming), {}
+        return original(previous, incoming)
+    return changed
+
+
+for _test, _assertion in (
+        ('test_removed_terminal_block', 'removed R1 terminal retained'),
+        ('test_rebuild_shortened_source_keeps_terminal', 'full reextract shortened source keeps terminal')):
+    retention_pair(_test, 'history.merge_response_copy', 'replace retained terminal with earlier incoming blocks',
+                   _assertion)(_replace_with_short_copy)
+
+
+@retention_pair('test_advance_terminal', 'history.merge_response_copy', 'ignore a genuinely new later terminal',
+                'new later terminal advances whole tuple')
+def _never_advance(original):
+    def changed(previous, incoming):
+        return (copy.deepcopy(previous), {}) if previous is not None else original(previous, incoming)
+    return changed
+
+
+@retention_pair('test_conflicting_revision_quarantined', 'history.merge_response_copy', 'clear captured revision quarantine',
+                'changed captured block quarantines identity')
+def _permit_revision(original):
+    def changed(previous, incoming):
+        result, counters = original(previous, incoming)
+        if result is not None:
+            result['conflicting'] = False
+            result['quality_flags'] = [f for f in result['quality_flags'] if f != 'history_conflicting_revisions']
+        counters.pop('history_conflicting_revisions', None)
+        return result, counters
+    return changed
+
+
+@retention_pair('test_initial_calendar_unknown', 'history.month_coverage', 'claim complete calendar coverage',
+                'initial calendar remains unknown')
+def _complete_calendar(original):
+    def changed(view, submissions):
+        result = original(view, submissions)
+        result['calendar_completeness'] = 'complete'
+        return result
+    return changed
+
+
+@retention_pair('test_prepared_snapshot_guard', 'history.month_coverage', 'ignore possibly submitted prepared evidence',
+                'prepared receipt guards possible submission')
+def _ignore_prepared(original):
+    return lambda view, submissions: original(view, [r for r in submissions if r['status'] != 'prepared'])
+
+
+def _allow_month_failure(reason):
+    def factory(original):
+        def changed(view, submissions):
+            from claude_counter import history
+            result = original(view, submissions)
+            for month, reasons in history._month_failures(view, submissions).items():
+                if reason in reasons:
+                    result['withheld_months'].pop(month, None)
+                    if month not in result['safe_months']:
+                        result['safe_months'].append(month)
+            result['safe_months'].sort()
+            return result
+        return changed
+    return factory
+
+
+retention_pair('test_missing_contributor_withholds_month', 'history.month_coverage', 'allow a missing previous contributor',
+               'missing submitted contributor withholds whole month')(
+                   _allow_month_failure('months_withheld_missing_contributors'))
+retention_pair('test_decreased_contribution_withholds_month', 'history.month_coverage', 'allow decreased submitted counts',
+               'decreased input_tokens withholds month')(
+                   _allow_month_failure('months_withheld_decreased_contributions'))
+
+
+@retention_pair('test_other_month_survives_withholding', 'history.month_coverage', 'withhold every month after one unsafe month',
+                'other month survives withholding')
+def _withhold_all_months(original):
+    def changed(view, submissions):
+        result = original(view, submissions)
+        if result['withheld_months']:
+            result['safe_months'] = []
+        return result
+    return changed
+
+
+@retention_pair('test_commit_failure_no_send', 'history.month_coverage', 'allow sharing an uncommitted capture',
+                'commit failure prevents any safe month')
+def _ignore_commit_failure(original):
+    def changed(view, submissions):
+        view = copy.deepcopy(view)
+        view['coverage']['history_committed'] = True
+        view['counters'].pop('history_commit_failed', None)
+        return original(view, submissions)
+    return changed
+
+
+@retention_pair('test_corrupt_blob_no_fallback_share', 'history._checked_digest', 'accept a wrong blob checksum',
+                'corrupt digest disables fallback sharing')
+def _ignore_blob_digest(original):
+    return lambda raw, expected: True
+
+
+@retention_pair('test_calendar_assignment_frozen', 'history._freeze_calendar', 'reassign captured rows in the current host zone',
+                'captured calendar frozen across host zone change')
+def _reassign_calendar(original):
+    return lambda row, captured: (copy.deepcopy(row), {})
+
+
+@retention_pair('test_account_snapshot_capture_no_identity', 'history._snapshot', 'add account identity to captured observation',
+                'capture blobs contain no identity or text sentinels')
+def _retain_account_identity(original):
+    def changed(account):
+        snapshot = original(account)
+        snapshot['email'] = 'FORBIDDEN-EMAIL'
+        return snapshot
+    return changed
+
+
+@retention_pair('test_no_account_no_snapshot', 'history._account_snapshots', 'invent an observation with no account',
+                'no-account writes no snapshot')
+def _invent_account_snapshot(original):
+    def changed(account):
+        return original(account) if account is not None else [{
+            'observed_at': 1.0, 'organization_type': None, 'rate_limit_tier': None,
+            'current_plan': None, 'subscription_created_at': None}]
+    return changed
+
+
+@retention_pair('test_unstable_read_keeps_capture', 'history.merge_response_copy', 'discard the capture after an unstable read',
+                'unstable read preserves B and reports damage')
+def _discard_unstable(original):
+    def changed(previous, incoming):
+        if incoming is not None and incoming.get('stable_read') is False:
+            return None, {}
+        return original(previous, incoming)
+    return changed
+
+
+def _evaluate_retention(suite, entry, factory=None):
+    target = getattr(suite, entry['test'])
+
+    def run():
+        suite.RESULTS.clear()
+        try:
+            target()
+        except BaseException as exc:
+            return list(suite.RESULTS), exc.__class__.__name__
+        return list(suite.RESULTS), None
+
+    before, error = run()
+    named = entry['assertion']
+    if error or not before or any(not ok for _n, ok, _detail in before) or not any(n == named for n, _ok, _d in before):
+        return False, 'invalid mutation: baseline did not pass its designated assertion'
+    module_name, function_name = entry['function'].split('.')
+    module = {'history': suite.history}[module_name]
+    original = getattr(module, function_name)
+    state = {'calls': 0, 'error': None}
+    try:
+        mutation = (factory or entry['factory'])(original)
+    except BaseException as exc:
+        return False, 'invalid mutation: setup ' + exc.__class__.__name__
+
+    def instrumented(*args, **kwargs):
+        state['calls'] += 1
+        try:
+            return mutation(*args, **kwargs)
+        except BaseException as exc:
+            state['error'] = exc.__class__.__name__
+            raise
+
+    setattr(module, function_name, instrumented)
+    try:
+        results, error = run()
+    finally:
+        setattr(module, function_name, original)
+    if state['error'] or error:
+        return False, 'invalid mutation: exception ' + (state['error'] or error)
+    if not state['calls']:
+        return False, 'invalid mutation: decision did not execute'
+    if not any(n == named and not ok for n, ok, _detail in results):
+        return False, 'invalid mutation: designated assertion did not fail'
+    return True, 'caught by: ' + named
+
+
+def _retention_main():
+    spec = importlib.util.spec_from_file_location('test_claude_retention', str(Path(__file__).with_name('test_claude_retention.py')))
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    missing = set(suite.RETENTION_TESTS) - set(RETENTION_MANIFEST)
+    if missing:
+        print('[FAIL] missing retention mutation pairs: ' + ', '.join(sorted(missing)))
+        return 1
+    entries = {name: dict(entry, test=name) for name, entry in RETENTION_MANIFEST.items()}
+    witness = entries['test_capture_then_prune']
+    for exception in (RuntimeError, ImportError):
+        def factory(original):
+            def crash(*args, **kwargs):
+                raise exception('invented mutation failure')
+            return crash
+        ok, reason = _evaluate_retention(suite, witness, factory)
+        if ok or 'invalid mutation: exception ' not in reason:
+            print('[FAIL] retention mutation exception self-test')
+            return 1
+    noop, _ = _evaluate_retention(suite, witness, lambda original: original)
+    unrelated, _ = _evaluate_retention(suite, dict(witness, assertion='pruned extract has no live file'))
+    if noop or unrelated:
+        print('[FAIL] retention mutation sensitivity self-test')
+        return 1
+    print('[PASS] crashes, import errors, no-ops and unrelated failures are invalid mutations')
+    bad = 0
+    for name, entry in sorted(entries.items()):
+        ok, reason = _evaluate_retention(suite, entry)
+        if not ok:
+            bad += 1
+        print('[%s] %s -> %s -> %s\n        %s' %
+              ('PASS' if ok else 'FAIL', name, entry['function'], entry['mutation'], reason))
+    print('\n%d/%d retention mutations caught' % (len(entries) - bad, len(entries)))
+    return 1 if bad else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--section', choices=('ledger',), default='ledger')
-    parser.parse_args(argv)
+    parser.add_argument('--section', choices=('ledger', 'retention'), default='ledger')
+    args = parser.parse_args(argv)
+    if args.section == 'retention':
+        return _retention_main()
     missing = set(tests.LEDGER_TESTS) - set(MANIFEST)
     if missing:
         print('[FAIL] missing ledger mutation pairs: ' + ', '.join(sorted(missing)))
