@@ -194,7 +194,10 @@ def _wire_group(g):
 
 def _latency_with_counters(ledger, safe_months, *, now):
     rows = [r for r in ledger['rows'] if r['local_day'] and r['local_day'][:7] in safe_months]
-    lat, counters = analyze._timing(ledger, rows, since=analyze._now(now) - 30 * 86400)
+    current = analyze._now(now)
+    lat, counters = analyze._timing(ledger, rows, since=current - 30 * 86400)
+    # Ephemeral only: neither history nor a report/payload serializes this adapter.
+    ledger['_share_timing'] = {'now': current, 'rows': tuple(r['response_key'] for r in rows), 'model': lat}
     if not lat['available'] or not lat['daily']:
         return None, counters
     r, t = lat['responses'], lat['turns']
@@ -581,13 +584,22 @@ def main(argv=None) -> int:
         return 2
     current, started = time.time(), time.perf_counter()
     context = reportcli.RECEIPT_ENDPOINT.set(a.api)
+    holder = {}
+    store_context = reportcli.RECEIPT_STORE.set(holder)
     try:
         captured = reportcli.collect(a, now=current)
+    except BaseException:
+        if holder.get('store') is not None:
+            holder['store'].close()
+        raise
     finally:
+        reportcli.RECEIPT_STORE.reset(store_context)
         reportcli.RECEIPT_ENDPOINT.reset(context)
     if a._history_failed:
+        if holder.get('store') is not None:
+            holder['store'].close()
         return 4
-    store = history.History(resolved['history_path'])
+    store = holder.get('store') or history.History(resolved['history_path'])
     posted = saved = False  # what the server already holds when a local step fails below
     try:
         intact, _q = store.check_integrity()  # prepare() itself does not verify integrity

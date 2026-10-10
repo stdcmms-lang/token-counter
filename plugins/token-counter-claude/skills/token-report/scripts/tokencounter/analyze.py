@@ -257,7 +257,8 @@ def _logged_turns(ledger, rows, counters):
 
 
 def analyze(ledger, *, scope=None, since=None, until=None, session=None,
-            live_only=False, metrics_only=False, prices=None, now=None) -> ReportModel:
+            live_only=False, metrics_only=False, prices=None, now=None,
+            include_share_latency=True) -> ReportModel:
     current = _now(now)
     for bound in (since, until):
         if bound is not None:
@@ -356,7 +357,18 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
     lat, lat_q = _timing(timing_view, rows)
     for name, count in lat_q.items():
         bump(counters, name, count)
-    share_lat, _ = _timing(timing_view, rows, since=current - 30 * 86400)
+    # Local HTML/terminal output uses the full timing summary. Materialize the
+    # private 30-day adapter only for complete JSON or public output. A share's
+    # preview can reuse the exact same selected rows already timed for its payload.
+    share_lat = None
+    if include_share_latency:
+        cached = ledger.get('_share_timing')
+        selection = tuple(r['response_key'] for r in rows)
+        if (cached is not None and since is None and until is None and not live_only
+                and cached['now'] == current and cached['rows'] == selection):
+            share_lat = cached['model']
+        else:
+            share_lat, _ = _timing(timing_view, rows, since=current - 30 * 86400)
     readings = [r for r in ledger['limits'] if _selected(r, since, until) and source_matches(r['source_id'])
                 and (not live_only or r['reading_key'] in ledger.get('_live_limit_keys', {}))]
     built_windows, window_q = windows.build_windows(readings, rows,
@@ -394,7 +406,7 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
     report_scope = dict(scope or {})
     report_scope.update(since=since, until=until, session=session, live_only=live_only, metrics_only=metrics_only)
     checks = [c for c in ledger['cost_checks'] if _selected(c, since, until) and source_matches(c['source_id'])]
-    return {'schema': 1, 'client': 'claude-usage',
+    model = {'schema': 1, 'client': 'claude-usage',
             'generated_at': datetime.datetime.fromtimestamp(current, datetime.timezone.utc).isoformat(timespec='seconds'),
             'scope': report_scope, 'totals': totals, 'daily': daily, 'models': model_rows, 'sessions': sessions,
             'categories': [{'category': c, 'label': composition.LABELS[c], 'bytes': cat_bytes[c],
@@ -413,6 +425,9 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
             'logged_turns': logged, 'crosschecks': pricing._crosscheck(checks, rows, prices, quote_row),
             'reconciliation': dict(UNSUPPORTED), 'resend_cost': dict(UNSUPPORTED),
             'amplification': dict(UNSUPPORTED), 'cache_leads': dict(UNSUPPORTED)}
+    if not include_share_latency:
+        del model['_share_latency']
+    return model
 
 
 def public_model(model) -> ReportModel:

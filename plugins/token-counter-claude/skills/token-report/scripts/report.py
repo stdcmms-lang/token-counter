@@ -24,6 +24,7 @@ from tokencounter.models import LedgerResult, bump  # noqa: E402
 DEFAULT_ENDPOINT = 'https://tokenusage.dev/api'
 HISTORY_WARNING = 'History unavailable: showing live captured usage only; sharing is disabled.'
 RECEIPT_ENDPOINT = contextvars.ContextVar('claude_share_endpoint', default=None)
+RECEIPT_STORE = contextvars.ContextVar('claude_share_history', default=None)
 
 
 def parse_args(argv=None):
@@ -212,7 +213,13 @@ def collect(options, *, now=None) -> LedgerResult:
     finally:
         if store is not None:
             history_q.update(store.counters)
-            store.close()
+            holder = RECEIPT_STORE.get()
+            if captured is not None and holder is not None:
+                # Only share.main supplies a holder and takes responsibility for
+                # closing this committed, verified instance on every exit path.
+                holder['store'] = store
+            else:
+                store.close()
     options._timings['capture + commit'] = time.perf_counter() - started
     if captured is None:
         print(HISTORY_WARNING, file=sys.stderr)
@@ -269,7 +276,8 @@ def build_report(options, *, now=None) -> tuple:
     started = time.perf_counter()
     model = analyze.analyze(built, scope={'label': 'captured local usage'}, since=options.since,
         until=options.until, session=session, live_only=options.live_only or options._history_failed,
-        metrics_only=options.metrics_only, prices=table, now=instant)
+        metrics_only=options.metrics_only, prices=table, now=instant,
+        include_share_latency=bool(options.json or options.public))
     options._timings['analyze'] = time.perf_counter() - started
     if options.public:
         model = analyze.public_model(model)

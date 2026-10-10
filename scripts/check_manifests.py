@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline packaging/contract checks, with future Claude surfaces checked when present.
+"""Offline packaging, contract and isolated installed-copy checks for both plugins.
 
 check(repo) returns errors. The CLI also prints missing surfaces as "not present".
 --existing-only permits an unfinished Claude plugin, checking every file that is
-already present; without it a present Claude manifest requires the full product.
+already present. Full mode requires both marketplaces and the complete Claude product.
 No installed-plugin directories or account/corpus files are inspected.
 """
 import argparse
@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -129,40 +130,81 @@ def _frontmatter(repo, relative, skill):
         raise ValueError(skill + ": missing quoted Windows/POSIX interpreter variants")
     if "${CLAUDE_PLUGIN_ROOT}" in text or "$CLAUDE_SKILL_DIR/" in text:
         raise ValueError(skill + ": paths must use the documented skill-dir substitution")
+    commands = re.findall(r'^python3? "([^"\n]+)".*$', text, re.M)
+    for command_path in commands:
+        if command_path != "${CLAUDE_SKILL_DIR}/scripts/" + script:
+            raise ValueError(skill + ": command outside its skill scripts")
+        _local_path(repo, (repo / relative).parent, "./scripts/" + script)
+    if skill == "token-report" and fields.get("disable-model-invocation") != "false":
+        raise ValueError(skill + ": explicit model invocation setting missing")
+    if skill == "token-share" and "disable-model-invocation" in fields:
+        raise ValueError(skill + ": use default model invocation, without a disabling field")
+    return text
 
 
 def _installed_smoke(repo):
     plugin = (repo / CLAUDE).resolve()
     _tree_within(plugin)
     cases = _import_script(repo, "scripts/fixtures/claude_cases.py", "manifest_claude_cases")
-    with tempfile.TemporaryDirectory(prefix="claude-installed-smoke-") as directory:
+    with tempfile.TemporaryDirectory(prefix="claude installed smoke ") as directory:
         root = Path(directory).resolve()
-        installed = root / "installed"
-        shutil.copytree(str(plugin), str(installed), symlinks=True)
+        installed = root / "installed plugin"
+        shutil.copytree(str(plugin), str(installed), symlinks=True,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         sessions = root / "config/projects"
         cases.write_corpus(sessions, cases.baseline_B())
         # -I -S and a temp cwd remove the repository/sibling from the import path.
         # Block network inside each child as well as in the outer test harness.
-        wrapper = ("import runpy, socket, sys, urllib.request\n"
+        wrapper = ("import pathlib, runpy, socket, sys, urllib.request\n"
                    "def deny(*a, **k): raise AssertionError('installed smoke attempted network')\n"
                    "socket.socket = socket.create_connection = socket.getaddrinfo = deny\n"
                    "urllib.request.urlopen = deny\n"
+                   "checkout = pathlib.Path(sys.argv.pop(1)).resolve()\n"
+                   "installed = pathlib.Path(sys.argv.pop(1)).resolve()\n"
+                   "def within(path, base):\n"
+                   "    try: path.resolve().relative_to(base); return True\n"
+                   "    except ValueError: return False\n"
+                   "def imports_stay_installed():\n"
+                   "    assert not any(within(pathlib.Path(p), checkout) for p in sys.path), 'checkout on sys.path'\n"
+                   "    for name, module in list(sys.modules.items()):\n"
+                   "        if name == 'report' or name == 'tokencounter' or name.startswith('tokencounter.'):\n"
+                   "            assert within(pathlib.Path(module.__file__), installed), 'import outside installed plugin'\n"
+                   "imports_stay_installed()\n"
                    "sys.argv = sys.argv[1:]\n"
-                   "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+                   "try: runpy.run_path(sys.argv[0], run_name='__main__')\n"
+                   "except SystemExit as exc:\n"
+                   "    if exc.code not in (None, 0): raise\n"
+                   "imports_stay_installed()\n")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(root / "config"), TOKEN_COUNTER_NO_INSTALL="1")
-        for relative, args in ((SCRIPT_DIR + "/report.py", ["--no-open", "--no-account", "--json", str(root / "model.json")]),
-                               ("skills/token-share/scripts/share.py", ["--no-account", "--handle", "synthetic-smoke", "--out", str(root / "payload.json")])):
-            command = [sys.executable, "-I", "-S", "-B", "-c", wrapper, str(installed / relative),
-                       "--sessions-root", str(sessions)] + args
-            result = subprocess.run(command, cwd=str(root), env=env, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=60)
-            if result.returncode != 0:
-                raise ValueError("isolated installed-copy " + Path(relative).name + " failed (exit %d)" % result.returncode)
-        model = json.loads((root / "model.json").read_bytes())
-        payload = json.loads((root / "payload.json").read_bytes())
-        if model["totals"]["input"] != 255 or sum(d["input"] for d in payload["days"]) != 255:
-            raise ValueError("isolated installed-copy B counts differ")
-        if (root / "installed/../token-counter").exists():
+        for skill in ("token-report", "token-share"):
+            text = (installed / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
+            skill_dir = (installed / "skills" / skill).as_posix()
+            for interpreter in ("python", "python3"):
+                match = re.search(r'^' + interpreter + r' "\$\{CLAUDE_SKILL_DIR\}[^"\n]+".*$', text, re.M)
+                assert match is not None, "missing skill interpreter command"
+                args = shlex.split(match.group(0).replace("${CLAUDE_SKILL_DIR}", skill_dir))
+                args = ["synthetic-smoke" if arg == "HANDLE" else arg for arg in args[1:]]
+                artifact = root / (interpreter + ("-model.json" if skill == "token-report" else "-payload.json"))
+                args += ["--sessions-root", str(sessions), "--no-account", "--procs", "1", "--quiet"]
+                args += ["--json", str(artifact)] if skill == "token-report" else ["--out", str(artifact)]
+                # Test both documented command variants using this CI cell's Python,
+                # including skill-text substitution and paths containing spaces.
+                command = [sys.executable, "-I", "-S", "-B", "-c", wrapper, str(repo), str(installed)] + args
+                result = subprocess.run(command, cwd=str(root), env=env, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, timeout=60)
+                if result.returncode != 0:
+                    raise ValueError("isolated installed-copy " + skill + "/" + interpreter +
+                                     " failed (exit %d)" % result.returncode)
+                value = json.loads(artifact.read_bytes())
+                counts = value['totals'] if skill == 'token-report' else {
+                    key: sum(d[key] for d in value['days']) for key in ('responses', 'input', 'cached', 'output', 'reasoning')}
+                assert tuple(counts[k] for k in ('responses', 'input', 'cached', 'output', 'reasoning')) == (2, 255, 90, 18, 7), "installed B counts differ"
+                if skill == 'token-share':
+                    assert b'Dry run: nothing was sent.' in result.stdout, "share was not a dry run"
+        assert not list(root.rglob('claude-share.json')), "installed dry run created a token"
+        previews = list((root / 'config').rglob('report-shared.html'))
+        assert len(previews) == 1 and previews[0].read_bytes().lower().startswith(b'<!doctype html>'), "public preview missing"
+        if (root / "token-counter").exists():
             raise ValueError("installed-copy smoke unexpectedly has a Codex sibling")
 
 
@@ -193,7 +235,7 @@ def _run(repo, existing_only=False):
 
     marketplaces = {}
     for relative in (".agents/plugins/marketplace.json", ".claude-plugin/marketplace.json"):
-        if optional(relative):
+        if optional(relative, required=True):
             data = attempt(relative, lambda relative=relative: _json(repo, relative))
             if data is not None:
                 marketplaces[relative] = data
@@ -205,14 +247,28 @@ def _run(repo, existing_only=False):
             errors.append("Codex manifest and share CLIENT must independently agree on token-counter 1.10.0")
         else:
             notes.append("Codex manifest and share CLIENT: 1.10.0")
+        def codex_paths():
+            market = marketplaces['.agents/plugins/marketplace.json']
+            assert market['name'] == 'stdcmms-lang', 'wrong Codex marketplace name'
+            entries = market['plugins']
+            assert len(entries) == 1 and entries[0]['name'] == 'token-counter', 'wrong Codex entry'
+            source = entries[0]['source']
+            assert source['source'] == 'local', 'Codex source must be local'
+            assert _local_path(repo, repo, source['path']) == repo / CODEX, 'wrong Codex source'
+            plugin = (repo / CODEX).resolve()
+            _tree_within(plugin)
+            _local_path(repo, plugin, codex['skills'].rstrip('/'))
+            for key in ('composerIcon', 'logo', 'logoDark'):
+                _local_path(repo, plugin, codex['interface'][key])
+        attempt('Codex source/component paths', codex_paths)
 
     for relative, expected in HASHES.items():
-        if optional(relative):
+        if optional(relative, required=True):
             digest = attempt(relative, lambda relative=relative: hashlib.sha256(_read(repo, relative)).hexdigest())
             if digest is not None and digest != expected:
                 errors.append(relative + ": frozen SHA-256 mismatch")
     contract = "scripts/server_contract/"
-    if optional(contract + "provenance.json"):
+    if optional(contract + "provenance.json", required=True):
         def provenance_check():
             provenance = _json(repo, contract + "provenance.json")
             assert provenance["server_commit"] == "9afabc0", "wrong server commit"
@@ -224,19 +280,22 @@ def _run(repo, existing_only=False):
                 assert entry["source"] == "server_" + name, "wrong evidence source"
                 assert entry["sha256"] == HASHES[contract + name], "wrong evidence hash"
             pkg = _json(repo, contract + "package.json")
+            assert pkg['name'] == 'token-counter-server-contract-tests' and pkg['version'] == '0.1.0', 'contract package identity'
             assert pkg["private"] is True and pkg["dependencies"] == PINS, "contract package pins/private"
             assert not pkg.get("devDependencies") and not pkg.get("optionalDependencies"), "extra dependencies"
             lock = _json(repo, contract + "package-lock.json")
+            assert lock['lockfileVersion'] == 3 and lock['version'] == '0.1.0', 'lockfile format/version'
             assert lock["packages"][""]["dependencies"] == PINS, "lockfile root pins"
             assert set(lock["packages"]) == {"", "node_modules/typescript", "node_modules/zod"}, "extra lockfile packages"
             for package, version in PINS.items():
                 entry = lock["packages"]["node_modules/" + package]
                 assert entry["version"] == version, "wrong lockfile resolved version"
                 assert entry["resolved"].startswith("https://registry.npmjs.org/"), "lockfile must use public npm registry"
+                assert entry['integrity'].startswith('sha512-'), 'lockfile integrity pin missing'
         attempt("server provenance/lockfile", provenance_check)
 
     manifest_path = CLAUDE + "/.claude-plugin/plugin.json"
-    manifest_exists = optional(manifest_path)
+    manifest_exists = optional(manifest_path, required=True)
     manifest = attempt("Claude manifest", lambda: _json(repo, manifest_path)) if manifest_exists else None
     marketplace = marketplaces.get(".claude-plugin/marketplace.json")
     if marketplace is not None:
@@ -246,8 +305,9 @@ def _run(repo, existing_only=False):
             assert name not in RESERVED_MARKETPLACES and name not in RESERVED_NAMES, "reserved marketplace name"
             assert name == "stdcmms-lang", "wrong marketplace name"
             assert isinstance(marketplace["owner"]["name"], str) and marketplace["owner"]["name"], "missing owner name"
+            assert marketplace['metadata']['version'] == '0.1.0', 'wrong Claude marketplace version'
             entries = marketplace["plugins"]
-            assert isinstance(entries, list), "plugins must be an array"
+            assert isinstance(entries, list) and len(entries) == 1, "expected one Claude plugin entry"
             names = set()
             for entry in entries:
                 assert _name(entry["name"]), "invalid or reserved plugin entry name"
@@ -269,6 +329,7 @@ def _run(repo, existing_only=False):
             plugin = (repo / CLAUDE).resolve()
             assert _within(plugin, repo), "Claude plugin outside repository"
             _tree_within(plugin)
+            assert {p.name for p in (plugin / 'skills').iterdir() if p.is_dir()} == {'token-report', 'token-share'}, 'expected exactly two Claude skills'
             for name in ("skills", "commands", "hooks", "agents"):
                 assert not (plugin / ".claude-plugin" / name).exists(), "components must be at plugin root"
             for key in ("commands", "icon"):
@@ -277,7 +338,7 @@ def _run(repo, existing_only=False):
                     _local_path(repo, plugin, value)
             assert marketplace is not None, "Claude marketplace missing"
         attempt("Claude manifest/path rules", manifest_check)
-    required = manifest is not None
+    required = True
     package_path = CLAUDE + "/" + SCRIPT_DIR + "/tokencounter/__init__.py"
     share_path = CLAUDE + "/skills/token-share/scripts/share.py"
     if optional(package_path, required):
@@ -301,6 +362,7 @@ def _run(repo, existing_only=False):
         def price_check():
             parser = _import_script(repo, "scripts/fetch_anthropic_prices.py", "manifest_price_parser")
             table = _json(repo, prices_path)
+            assert table['as_of'] == '2026-10-10' and table['source_url'] == parser.PRICING_URL, 'price provenance differs'
             markdown = _read(repo, "scripts/fixtures/anthropic_pricing.md").decode("utf-8")
             expected = parser.parse_prices(markdown, as_of=table["as_of"], source_url=table["source_url"])
             assert expected == table, "offline price fixture differs from vendored table"
@@ -310,8 +372,15 @@ def _run(repo, existing_only=False):
         if optional(path, required):
             attempt(skill + " frontmatter/commands", lambda path=path, skill=skill: _frontmatter(repo, path, skill))
     report_exists = optional(CLAUDE + "/" + SCRIPT_DIR + "/report.py", required)
+    if optional('scripts/test_codex_compat.py', required=True):
+        def sensitivity_check():
+            harness = _import_script(repo, 'scripts/test_codex_compat.py', 'manifest_codex_compat')
+            harness.test_comparison_detects_render_byte_change()
+        attempt('Codex compatibility sensitivity self-test', sensitivity_check)
     if manifest is not None and report_exists and (repo / share_path).exists() and not errors:
         attempt("Claude isolated installed-copy smoke", lambda: _installed_smoke(repo))
+        if not errors:
+            notes.append('Claude installed-copy smoke: report/share, python/python3 substitution, isolated imports, no network/token')
     elif manifest is None:
         notes.append("not present: Claude isolated installed-copy smoke (plugin manifest absent)")
     return errors, notes
