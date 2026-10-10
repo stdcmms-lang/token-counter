@@ -12,12 +12,23 @@ import time
 
 from . import composition, latency, pricing, windows
 from .ledger import _day, _day_span, _family_summary, _iso, _local_day, epoch
-from .models import COUNTER_NAMES, ReportModel, bump
+from .models import COUNTER_NAMES, RenderProfile, ReportModel, bump
 
 CAT_BUCKET_S = 3600
+MAX_POINTS = 120        # chart points per window, as Codex's analyzer caps them
 UNSUPPORTED = {'available': False,
                'reason': 'Claude transcripts do not establish per-content token attribution.'}
 COUNTS = ('responses', 'input', 'cached', 'output', 'reasoning')
+
+
+def _downsample(points, limit=MAX_POINTS):
+    """Keep at most `limit` points, preserving the first and last."""
+    if len(points) <= limit:
+        return points
+    step = len(points) / float(limit - 1)
+    keep = [points[int(i * step)] for i in range(limit - 1)]
+    keep.append(points[-1])
+    return keep
 
 
 def _counts(rows):
@@ -174,7 +185,7 @@ def _timing(ledger, rows, since=None):
     return model, counters
 
 
-def _rate_limits(built, rows, prices, now):
+def _rate_limits(built, rows, prices, now, quote_row):
     """Legacy chart fields beside the separate observation-span numerator."""
     by_key = {r['response_key']: r for r in rows}
     table = prices[0] if isinstance(prices, tuple) else prices
@@ -182,7 +193,7 @@ def _rate_limits(built, rows, prices, now):
     for row in rows:
         key = row['response_key']
         ends[key] = epoch(row['ts'])
-        quote = pricing.price_row(row, table)
+        quote = quote_row(row, table)
         row_prices[key] = ((quote['tokens_usd'] or 0) + quote['web_search_usd']
                            if quote['tokens_usd'] is not None or quote['web_search_usd'] else None)
     records = []
@@ -206,8 +217,8 @@ def _rate_limits(built, rows, prices, now):
                      reset_inferred=True, anchor_inferred=True, anchor=window['nominal_start'],
                      tokens=dict(window['nominal_counts'], uncached=window['nominal_counts']['input'] - window['nominal_counts']['cached']),
                      observation_counts=dict(window['counts']),
-                     cum_points=cum_points, usd=round(value, 6) if priced else None,
-                     usd_points=usd_points if priced else [], late_points=0,
+                     cum_points=_downsample(cum_points), usd=round(value, 6) if priced else None,
+                     usd_points=_downsample(usd_points) if priced else [], late_points=0,
                      observations=len(window['readings']), expired=window['reset_at'] <= now,
                      start=windows._wire_entry(window)['start'], window_minutes=300 if window['kind'] == 'session' else 10080,
                      **window['counts'])
@@ -254,6 +265,16 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
     if since is not None and until is not None and since > until:
         raise ValueError('inverted analysis range')
     prices = pricing.load() if prices is None else prices
+    quotes = {}
+
+    def quote_row(row, table):
+        key = id(row)
+        if key not in quotes:
+            quotes[key] = pricing.price_row(row, table)
+        return quotes[key]
+
+    def summarize(selected):
+        return pricing._summarize(selected, prices, quote_row)
     focused = {info['family_id'] for info in ledger.get('_source_families', {}).values()
                if info['session_id'] == session or info['family_id'] == session} if session is not None else set()
     def source_matches(source_id):
@@ -281,7 +302,7 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
         summary['local_day'] = original['local_day']
         summary.update(session_id=family, threads=len(summary['streams']), first=summary['start'],
                        last=summary['end'], uncached=summary['input'] - summary['cached'],
-                       api_usd=pricing.summarize(family_rows, prices)['usd'])
+                       api_usd=summarize(family_rows)['usd'])
         sessions.append(summary)
     sessions.sort(key=lambda s: (-s['input'], s['family_id']))
     daily = []
@@ -292,13 +313,13 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
                       models={m: sum(r['usage']['input_tokens'] for r in day_rows if r['model'] == m)
                               for m in sorted({r['model'] for r in day_rows})},
                       uncached=counts['input'] - counts['cached'],
-                      api_usd=pricing.summarize(day_rows, prices)['usd'])
+                      api_usd=summarize(day_rows)['usd'])
         daily.append(counts)
     model_rows = []
     for name, named_rows in groups.items():
         counts = _counts(named_rows)
         counts.update(model=name, uncached=counts['input'] - counts['cached'],
-                      api_usd=pricing.summarize(named_rows, prices)['usd'])
+                      api_usd=summarize(named_rows)['usd'])
         model_rows.append(counts)
     model_rows.sort(key=lambda m: (-m['input'], m['model']))
     live_snapshots = {tuple(k) for k in ledger.get('_live_snapshot_keys', [])}
@@ -320,7 +341,7 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
         stamp = epoch(fact['ts'])
         if stamp is not None:
             series[int(stamp // CAT_BUCKET_S) * CAT_BUCKET_S][fact['category']] += fact['utf8_bytes']
-    value = pricing.summarize(rows, prices)
+    value = summarize(rows)
     for name, count in value.items():
         if name in COUNTER_NAMES and type(count) is int:
             # Some evidence flags are already on the ledger; pricing is their final count.
@@ -342,7 +363,7 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
         account_snapshots=ledger['account_snapshots'], established=ledger.get('_reset_clusters', ()), now=current)
     for name, count in window_q.items():
         bump(counters, name, count)
-    rate_limits = _rate_limits(built_windows, rows, prices, current)
+    rate_limits = _rate_limits(built_windows, rows, prices, current, quote_row)
     logged = _logged_turns(timing_view, rows, counters)
     event_days = collections.Counter()
     undated = 0
@@ -364,6 +385,11 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
                   files=len(selected_sources), bytes=sum(cat_bytes.values()), input_source='recorded',
                   base_input=sum(r['base_input_tokens'] for r in rows),
                   cache_creation=sum(r['cache_creation_input_tokens'] for r in rows),
+                  cache_write_5m=sum(r['cache_write_5m'] or 0 for r in rows),
+                  cache_write_1h=sum(r['cache_write_1h'] or 0 for r in rows),
+                  cache_write_unknown=sum(r['cache_creation_input_tokens'] - (r['cache_write_5m'] or 0)
+                                          - (r['cache_write_1h'] or 0) for r in rows),
+                  thinking_unavailable=sum(r['usage']['reasoning_output_tokens'] is None for r in rows),
                   archived_responses=sum(bool(r.get('archived')) for r in rows))
     report_scope = dict(scope or {})
     report_scope.update(since=since, until=until, session=session, live_only=live_only, metrics_only=metrics_only)
@@ -381,11 +407,10 @@ def analyze(ledger, *, scope=None, since=None, until=None, session=None,
                              'daily': [dict(date=d, n=n, start=_day_span(d)[0], end=_day_span(d)[1])
                                        for d, n in sorted(event_days.items())]},
             'latency': lat, '_share_latency': share_lat, 'api_value': value,
-            'response_rows': copy.deepcopy(rows),
             'quality': dict(sorted(counters.items())),
             'coverage': ledger['coverage'],
             'account': ledger.get('account', {'available': False, 'reason': 'not requested'}),
-            'logged_turns': logged, 'crosschecks': pricing.crosscheck(checks, rows, prices),
+            'logged_turns': logged, 'crosschecks': pricing._crosscheck(checks, rows, prices, quote_row),
             'reconciliation': dict(UNSUPPORTED), 'resend_cost': dict(UNSUPPORTED),
             'amplification': dict(UNSUPPORTED), 'cache_leads': dict(UNSUPPORTED)}
 
@@ -434,7 +459,8 @@ def public_model(model) -> ReportModel:
     out['scope'] = fields(model['scope'], ('since', 'until', 'live_only', 'metrics_only'))
     out['totals'] = fields(model['totals'], COUNTS + ('uncached', 'total_tokens', 'cache_hit', 'sessions',
                                                     'threads', 'files', 'bytes', 'input_source', 'base_input',
-                                                    'cache_creation', 'archived_responses'))
+                                                    'cache_creation', 'archived_responses', 'cache_write_5m',
+                                                    'cache_write_1h', 'cache_write_unknown', 'thinking_unavailable'))
     out['models'] = [named_counts(m) for m in model['models']]
     out['daily'] = []
     for day in model['daily']:
@@ -447,16 +473,27 @@ def public_model(model) -> ReportModel:
                          if c['category'] in composition.CATEGORIES]
     out['cat_series'] = [[t, {k: v for k, v in c.items() if k in composition.CATEGORIES}]
                          for t, c in model['cat_series']]
-    # Public windows carry only the observation-span wire fields. Local chart series,
-    # anchor inference, response keys, scope digests and reading provenance stay local.
-    out['rate_limits'] = {'windows': []}
+    # Wire fields plus chart aggregates. Reading identities and source paths stay local.
+    out['rate_limits'] = fields(model['rate_limits'], ('available', 'reason', 'window_minutes', 'weekly',
+        'windows_total', 'observations', 'quotes', 'idle_windows', 'overlapping', 'late_readings',
+        'boundary_without_drop', 'other_windows', 'plans', 'now'))
+    out['rate_limits']['windows'] = []
     for window in model['rate_limits']['windows']:
         if window['kind'] != 'weekly_all':
             continue
         w = fields(window, windows.WIRE_FIELDS)
         w['split'] = [dict(fields(s, windows.SPLIT_FIELDS), model=named_counts(s)['model'])
                       for s in window['split'] if s.get('tier') in pricing.TIER_CLASSES]
+        w.update(fields(window, ('kind', 'index', 'reset_at', 'reset_at_iso', 'resets_at', 'resets_at_iso',
+            'reset_inferred', 'anchor_inferred', 'anchor', 'tokens', 'observation_counts', 'cum_points',
+            'pct_points', 'usd', 'usd_points', 'late_points', 'observations', 'expired', 'last_pct',
+            'peak_pct', 'observation_start', 'observation_end')))
+        w['readings'] = [fields(r, ('ts', 'percent', 'source'))
+                         for r in window['readings']]
         out['rate_limits']['windows'].append(w)
+    current = model['rate_limits'].get('current')
+    out['rate_limits']['current'] = next((w for w in out['rate_limits']['windows']
+        if current and w['index'] == current['index']), None)
     events = model['limit_events']
     out['limit_events'] = dict(fields(events, ('total', 'undated')),
                                daily=[fields(d, ('date', 'n', 'start', 'end')) for d in events['daily']])
@@ -483,3 +520,62 @@ def public_model(model) -> ReportModel:
     for key in ('reconciliation', 'resend_cost', 'amplification', 'cache_leads'):
         out[key] = dict(UNSUPPORTED)
     return out
+
+
+def claude_profile(model) -> RenderProfile:
+    """All Claude wording and chart choices, kept out of the shared defaults."""
+    t = model['totals']
+    number = lambda n: format(n or 0, ',')
+    output_note = '{n} recorded thinking tokens'.format(n=number(t['reasoning']))
+    if t.get('thinking_unavailable'):
+        output_note += ' · unavailable for {m} responses'.format(m=number(t['thinking_unavailable']))
+    notes = [
+        'Recorded input includes base input, cache creation and cache reads. Recorded output already includes thinking when that subset is available.',
+        'Captured usage can omit calls without transcript usage, activity on other devices, and transcripts removed before the first capture.',
+        'Quota points are sparse recorded readings. The report does not derive quota percentages from tokens.',
+        'API list value is a comparison at the vendored price table, not a bill. Missing settings, fees and unpriced models are shown separately.',
+    ]
+    if model.get('latency', {}).get('plan') or model.get('rate_limits', {}).get('plans'):
+        notes.extend([
+            'Historical plan labels use captured account observations and subscriptionCreatedAt; they are not plan records recovered from transcripts.',
+            'A plan change that leaves subscriptionCreatedAt unchanged is not detectable until a later run observes the new tier. A window that ended before that run can therefore carry the old plan.',
+        ])
+    return {
+        'vendor': 'claude', 'title': 'Claude Code Token Report',
+        'kickers': {
+            'clinical': 'Claude Code usage, recorded locally',
+            'matisse': 'Papiers découpés — Claude Code usage, cut from local records',
+            'nocturne': 'Nocturne in blue and gold — Claude Code usage, recorded locally',
+        },
+        'recorded_by': 'Claude Code', 'input_tile_label': 'Recorded input',
+        'input_tile_note': 'base input + cache writes + cache reads · {n} responses'.format(n=number(t['responses'])),
+        'output_tile_label': 'Output', 'output_tile_note': output_note,
+        'cache_tile_label': 'Cache hit',
+        'cache_tile_note': '{reads} read · {w5} 5m writes · {w1} 1h writes · {unknown} writes with unknown TTL'.format(
+            reads=number(t['cached']), w5=number(t.get('cache_write_5m')),
+            w1=number(t.get('cache_write_1h')), unknown=number(t.get('cache_write_unknown'))),
+        'sessions_unit': '{n} streams'.format(n=number(t['threads'])),
+        'largest_session_label': 'Largest session', 'api_tile_label': 'API list value',
+        'api_tile_note': 'captured usage at Anthropic list prices; assumptions and exclusions in JSON and the terminal summary',
+        'composition_title': 'Visible text inventory', 'composition_unit': 'UTF-8 bytes in view',
+        'composition_accessibility': 'visible text inventory by category',
+        'composition_empty': 'No captured text bytes in the visible range.',
+        'metrics_only_note': 'Text inventory was skipped with --metrics-only.',
+        'composition_note': 'Byte shares describe captured text and saved snapshots. They are not Claude token shares or a reconstruction of the full API prompt.',
+        'sparse_limit_points': True, 'weekly_label': 'weekly all-model',
+        'missing_weekly': 'No weekly all-model readings in range.',
+        'missing_limits': 'No structured limit readings in range.',
+        'limit_source_note': 'last recorded weekly reading',
+        'expired_reading': 'Reset since the last weekly reading; no current percentage recorded.',
+        'anchor_tooltip': 'nominal seven-day start, inferred from reset',
+        'observation_tooltip': 'captured usage between the first reading and the first peak reading',
+        'refusal_tooltip': 'weekly 429 refusal: 100%, assumed all-model',
+        'percentage_legend': 'recorded /usage and weekly 429 points',
+        'limit_metric': 'tokens', 'limit_metric_choices': ['tokens', 'usd'],
+        'limit_metric_labels': {'tokens': 'Recorded tokens', 'usd': 'API list value'},
+        'token_chart_accessibility': 'cumulative recorded input and output per nominal weekly window',
+        'timing_note': 'Response time is the interval from the last known prompt-side record to the last response record.',
+        'price_source_note': 'Anthropic API price table · {as_of} · vendored locally'.format(
+            as_of=model['api_value'].get('as_of') or 'unavailable'),
+        'brand_link': 'https://tokenusage.dev', 'standing_notes': notes,
+    }

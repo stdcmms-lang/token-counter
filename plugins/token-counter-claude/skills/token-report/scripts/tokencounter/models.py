@@ -490,6 +490,47 @@ class Paths(TypedDict):
     explicit_sessions_root: bool
 
 
+class RenderProfile(TypedDict):
+    vendor: str
+    title: str
+    kickers: Dict[str, str]
+    recorded_by: str
+    input_tile_label: str
+    input_tile_note: str
+    output_tile_label: str
+    output_tile_note: str
+    cache_tile_label: str
+    cache_tile_note: str
+    sessions_unit: str
+    largest_session_label: str
+    api_tile_label: str
+    api_tile_note: str
+    composition_title: str
+    composition_unit: str
+    composition_accessibility: str
+    composition_empty: str
+    composition_note: str
+    metrics_only_note: str
+    sparse_limit_points: bool
+    weekly_label: str
+    missing_weekly: str
+    missing_limits: str
+    limit_source_note: str
+    expired_reading: str
+    anchor_tooltip: str
+    observation_tooltip: str
+    refusal_tooltip: str
+    percentage_legend: str
+    limit_metric: str
+    limit_metric_choices: List[str]
+    limit_metric_labels: Dict[str, str]
+    token_chart_accessibility: str
+    timing_note: str
+    price_source_note: str
+    brand_link: Optional[str]
+    standing_notes: List[str]
+
+
 class ReportModel(TypedDict):
     schema: int
     client: str

@@ -104,7 +104,7 @@ svg{display:block;width:100%;height:auto;overflow:visible}
 # deuteranopia).
 STYLE_CSS = r"""
 /* ---- shared chrome: the style bar, the masthead, the switch ---------------------------- */
-:root{--kicker:"Codex usage, recounted locally"}
+:root{--kicker:@@kicker_clinical@@}
 .bar{position:sticky;top:0;z-index:20;display:flex;justify-content:space-between;align-items:center;
   gap:12px;padding:10px 16px;background:var(--bg);border-bottom:1px solid var(--line)}
 .brand{font-weight:700;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -167,7 +167,7 @@ STYLE_CSS = r"""
   --c7:#66640c;--c8:#5571d8;--c9:#cb749e;--c10:#00673f;--c11:#c6784a;--c12:#87579d;--c13:#8f887c;
   --sage:#c9d4d2;--rose:#a8807b;--blush:#dcc0ba;--straw:#e9dfc8;--ink:#23252f;
   --serif:"Didot","Bodoni 72","Bodoni MT","Playfair Display","Libre Bodoni",Georgia,"Times New Roman",serif;
-  --kicker:"Papiers d\00E9 coup\00E9 s \00B7  Codex usage, cut from local records"}
+  --kicker:@@kicker_matisse@@}
 [data-style="matisse"] body{font:15px/1.55 "Avenir Next",Avenir,Futura,"Century Gothic","Gill Sans",
   "Trebuchet MS",system-ui,sans-serif}
 [data-style="matisse"] .wrap{position:relative;z-index:1}
@@ -245,7 +245,7 @@ STYLE_CSS = r"""
   --n-lamp:#f3c878;--n-stone:#15242d;--n-trim:#b98f45;--n-spark:#ffc766;
   --serif:"Baskerville","Libre Baskerville","Big Caslon","Palatino Linotype",Palatino,"Book Antiqua",
     Georgia,serif;
-  --kicker:"Nocturne in blue and gold \00B7  Codex usage, recounted locally"}
+  --kicker:@@kicker_nocturne@@}
 [data-style="nocturne"] body{background:radial-gradient(120% 70% at 50% 0,#10283a,var(--bg) 70%) fixed}
 [data-style="nocturne"] nav.bar{background:rgba(11,23,32,.82);border-bottom:1px solid #2a3e49;
   backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
@@ -409,113 +409,8 @@ function axis(h, top, bot, tk, grid = true){
   return s;
 }
 
-// ---- chart 1: cumulative API value per weekly limit window ---------------------------
-const RL = D.rate_limits || {};
-const WINS = RL.windows || [];
-// The window the limit chart draws: the weekly one, or the longest the logs quote without it.
-const LIMIT = (RL.name || 'weekly') + ' limit';
-// The curve is a window's API value, usd_points [t, cumulative dollars]: tokens of different
-// models are priced differently, so a token count does not say what a week was worth.
-// No price table, no dollars: the windows then carry usd null and the value axis is blank.
-const USD = WINS.some(w => w.usd != null);
-const TK = D.input_source === 'tiktoken';
-const INPUT = TK ? 'input' : 'recorded input';
-/** A window's input, as the tooltip states it. */
-const winInput = w => (TK && w.tokens.tiktoken_input != null)
-  ? `input ${big(w.tokens.tiktoken_input)} (tiktoken)` : `recorded input ${big(w.tokens.input)}`;
-// Fixed over the corpus, never over the viewport: zoom moves the time axis and leaves the
-// value axis alone, so a curve keeps its height while the window slides under it.
-let VMAX = 0;
-WINS.forEach(w => (w.usd_points||[]).forEach(p => { VMAX = Math.max(VMAX, p[1]); }));
-VMAX = VMAX || 1;
-
-function drawRL(tk){
-  const host = byId('rlchart');
-  if(!host) return;
-  if(!WINS.length){
-    host.innerHTML = '<p class="sub">No weekly-limit snapshots in range.</p>';
-    marks(host, null);
-    return;
-  }
-  const H = G.rl_h||300, T = G.rl_t||18, B = G.rl_b||34;
-  const y  = v => H-B - (v/VMAX)*(H-B-T);
-  const yp = p => H-B - (p/100)*(H-B-T);
-
-  let s = `<svg viewBox="0 0 ${W} ${H}" data-h="${H}" data-t="${T}" data-b="${B}" role="img" `+
-          `aria-label="cumulative API value per ${LIMIT} window">`;
-  s += `<defs><clipPath id="tcclip-rl"><rect x="${L}" y="0" width="${PLOT}" height="${H}"/>`+
-       `</clipPath></defs>`;
-  // horizontal guides + left axis (measured) + right axis (reported)
-  [0,.25,.5,.75,1].forEach(f=>{
-    const yy = y(VMAX*f);
-    s += `<line x1="${L}" y1="${yy.toFixed(1)}" x2="${W-RM}" y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="1"/>`;
-    if(USD) s += `<text x="${L-8}" y="${(yy+4).toFixed(1)}" text-anchor="end" fill="var(--dim)" font-size="11">${usd(VMAX*f, VMAX >= 100)}</text>`;
-    s += `<text x="${W-RM+8}" y="${(yp(100*f)+4).toFixed(1)}" fill="var(--warn)" font-size="11">${Math.round(100*f)}%</text>`;
-  });
-  s += axis(H, T, B, tk);
-
-  s += `<g clip-path="url(#tcclip-rl)">`;
-  const mk = [];
-  // Window boundaries carry the date they opened.  On a narrow screen, or zoomed out far
-  // enough that three windows share fifty pixels, those labels collide into a smear -- so a
-  // label is drawn only where there is room for it.  The boundary line is always drawn.
-  let lastLbl = -1e9;
-  WINS.forEach((w, wi)=>{
-    const pts = w.cum_points||[], pcs = w.pct_points||[], ups = w.usd_points||[];
-    const start = w.reset_at!=null ? w.reset_at : (pts.length?pts[0][0]:null);
-    if(start==null) return;
-    let hi = start;
-    if(pts.length) hi = Math.max(hi, pts[pts.length-1][0]);
-    if(pcs.length) hi = Math.max(hi, pcs[pcs.length-1][0]);
-    if(hi < VIEW[0] || start > VIEW[1]) return;    // no part of this window is on screen
-    // Reset boundary: the instant the replacement window was first reported.
-    s += `<line x1="${X(start).toFixed(1)}" y1="${T}" x2="${X(start).toFixed(1)}" y2="${H-B}" `+
-         `stroke="var(--dim)" stroke-dasharray="3 3" stroke-width="1"/>`;
-    if(X(start) - lastLbl >= 46){
-      lastLbl = X(start);
-      s += `<text x="${(X(start)+3).toFixed(1)}" y="${T+10}" fill="var(--dim)" font-size="10">${esc(day(start))}</text>`;
-    }
-    const tip = `<title>window opened ${esc(when(start))}\nreset quoted ${esc(w.resets_at_iso||'--')}\n`+
-           `peak reported ${w.peak_pct==null?'--':w.peak_pct+'%'}\n`+
-           `API value ${usd(w.usd)}\n`+
-           `${winInput(w)} over ${w.tokens.responses} responses\n`+
-           `uncached ${big(w.tokens.uncached)} | output ${big(w.tokens.output)}`+
-           (TK ? ' (recorded by Codex)' : '')+
-           (w.late_points ? `\n${w.late_points} later reading(s) not drawn: the next window `+
-                            `had already opened` : '')+`</title>`;
-    if(ups.length){
-      const line = [[X(start), y(0)]].concat(ups.map(p=>[X(p[0]), y(p[1])]));
-      mk.push({t:'area', pts:line, base:y(0), c:'--uncached', a:.16, win:wi},
-              {t:'line', pts:line, w:1.8, c:'--uncached', win:wi});
-      const d = [`M ${X(start).toFixed(1)} ${y(0).toFixed(1)}`]
-        .concat(ups.map(p=>`L ${X(p[0]).toFixed(1)} ${y(p[1]).toFixed(1)}`));
-      const last = ups[ups.length-1];
-      s += `<path d="${d.join(' ')} L ${X(last[0]).toFixed(1)} ${y(0).toFixed(1)} Z" `+
-           `fill="var(--uncached)" fill-opacity=".16" class="mk"/>`;
-      s += `<path d="${d.join(' ')}" fill="none" stroke="var(--uncached)" stroke-width="1.8" class="mk">`+
-           `${tip}</path>`;
-    } else if(pts.length){
-      // Nothing in this window could be priced: no curve, rather than one claiming $0.  It
-      // keeps its tooltip, and a flat mark the scene hangs its reset and hover target on.
-      const x1 = X(pts[pts.length-1][0]);
-      mk.push({t:'area', pts:[[X(start), y(0)], [x1, y(0)]], base:y(0), c:'--uncached', a:.16, win:wi});
-      s += `<rect x="${X(start).toFixed(1)}" y="${T}" width="${Math.max(0, x1-X(start)).toFixed(1)}" `+
-           `height="${H-B-T}" fill="transparent">${tip}</rect>`;
-    }
-    if(pcs.length){
-      const d = pcs.map((p,i)=>`${i?'L':'M'} ${X(p[0]).toFixed(1)} ${yp(p[1]).toFixed(1)}`);
-      s += `<path d="${d.join(' ')}" fill="none" stroke="var(--warn)" stroke-width="1.4" stroke-dasharray="5 3" class="mk"/>`;
-      mk.push({t:'line', pts:pcs.map(p=>[X(p[0]), yp(p[1])]), w:1.4, c:'--warn', dash:[5,3], win:wi});
-    }
-  });
-  s += `</g>`;
-  s += `<line x1="${L}" y1="${H-B}" x2="${W-RM}" y2="${H-B}" stroke="var(--line)"/>`;
-  s += '</svg>';
-  host.innerHTML = s;
-  marks(host, ()=>host.querySelector('svg'), [W, H], [L, 0, PLOT, H], mk, [L, T, PLOT, H-B-T]);
-}
-
-// ---- chart 2: daily input -------------------------------------------------------------
+@@limit_heading@@
+@@limit_chart@@// ---- chart 2: daily input -------------------------------------------------------------
 // The bars are rendered server-side in unit-x -- one unit is one local day -- so only the
 // group transform changes here.  Nothing vertical is ever touched.
 function drawDaily(tk){
@@ -556,7 +451,7 @@ function drawDaily(tk){
 // not a point (one slow response is not a slow day) and breaks the line, as a day with none
 // does; it keeps a hover target that says so.
 // Behind the lines, on an axis of their own at the right, a bar a day counts the rate-limit
-// events Codex logged: snapshots in which a limit was reached.  A day the limit blocked
+@@limit_events_comment@@
 // outright has events and no timed response, so the bars keep their own list of days.
 const LATD = D.latency || {};
 const LDAYS = LATD.days || [];                // [start, end, timed responses, median, p90]
@@ -682,8 +577,8 @@ function drawPie(){
   if(!sum){
     // An empty pie has two very different causes -- nothing tokenized at all, or nothing in
     // the range on screen -- and a reader cannot tell them apart from an empty panel.
-    const msg = series.length ? 'No tokenized content in the visible range.'
-                              : (CATS.note || 'No content in range.');
+    const msg = series.length ? @@composition_empty_range@@
+                              : (CATS.note || @@composition_empty@@);
     host.innerHTML = emptyPie(msg);
     host.__shown = null;
     marks(host, null);
@@ -693,7 +588,7 @@ function drawPie(){
   // the viewport moves and one pie can be read against the last.
   const order = CATS.order || Object.keys(tot);
   const rows = order.map((k,i)=>({k:k, v:tot[k]||0, fill:`var(--c${i%14})`}));
-  pieTo(host, rows, sum, 'tokens in view', 'content composition by category');
+  pieTo(host, rows, sum, @@composition_pie@@);
 }
 
 // ---- chart 3b: which models took the input --------------------------------------------
@@ -1176,7 +1071,7 @@ const GLX = (()=>{
       const c = rgba(m.c, m.a);
       if(m.pts.length < 2) return;
       for(const run of (m.dash ? dashes(m.pts, m.dash) : [m.pts])) line(V, run, m.w/2, c);
-    } else if(m.t === 'pie'){
+@@gl_points@@
       let a = -Math.PI/2;
       const seps = [];
       for(const [f, cv] of m.slices){
@@ -1920,19 +1815,19 @@ const N3 = (()=>{
     const G = Geo(), W = [], glass = [], hits = [], PW = info.pw || N3PW;
     const [px, py, pw, ph] = rec.plot, H = WIN_H, zb = -FIN/2 - .45;
     const at = p => [(p[0] - px)/pw, (py + ph - p[1])/ph];
-    const lg = legendLines([{s: 'cumulative API value', c: '--uncached'}, {s: LIMIT, c: '--warn'}],
+    const lg = legendLines(@@scene_limit_legend@@,
                            0, PW, cx.measure);
     let bx = stone(G, cx, -2.3, PW + 1.5, -1.5, 1.35, lg.rows);
     legendOn(G, W, cx, lg, 1.35);
     for(const f of [0, .25, .5, .75, 1]){
       if(f) box(G, 0, f*H - .012, zb - .015, PW, f*H + .012, zb + .015, cx.col('--line'), -1, .5);
       const y = Math.max(.08, f*H - .1);                    // the zero sits on the stone, not in it
-      if(USD) W.push(word(usd(info.vmax*f, info.vmax >= 100), .3, -.3, y, zb, {al: 'r', c: '--dim'}));
+      if(USD) W.push(word(@@scene_limit_axis@@, .3, -.3, y, zb, {al: 'r', c: '--dim'}));
       W.push(word(Math.round(100*f) + '%', .3, PW + .3, y, zb, {c: '--warn'}));
     }
     let lastLbl = -1e9;
     for(const m of rec.list){
-      const pts = clipX(m.pts.map(at));
+@@scene_points@@
       if(pts.length < 2) continue;
       if(m.t === 'area'){
         const V = Geo(), c = cx.col('--uncached', .3), z0 = -FIN/2, z1 = FIN/2;
@@ -2086,20 +1981,19 @@ const N3 = (()=>{
   /** The headline numbers, afloat over a low slab: the masthead, then the tiles, three a row. */
   function ledger(info, cx){
     const G = Geo(), W = [];
-    const n = info.tiles.length, cols = 3, rows = Math.ceil(n/cols), cw = 4.9;
-    const x0 = -cols*cw/2, top = rows*2.25 + 1.05;          // the notes clear the far shore
+@@scene_ledger_layout@@
     W.push(word(info.kicker, .36, x0, top + 2.45, 0, {f: 'serif', c: '--dim'}));
     W.push(word(info.title, 1.15, x0 - .05, top + 1.1, 0, {f: 'serif', c: '--fg', ext: .22}));
     W.push(word(info.dek, .34, x0, top + .38, 0, {c: '--dim'}));
     info.tiles.forEach((t, i) => {
-      const x = x0 + (i % cols)*cw, y = top - .6 - Math.floor(i/cols)*2.25;
+@@scene_ledger_position@@
       W.push(word(t.k.toUpperCase(), .26, x, y, 0, {c: '--dim', f: 'caps'}));
       W.push(word(t.v, .86, x - .03, y - 1.0, 0, {c: i ? '--fg' : '--warn', ext: .14, w: 300}));
-      if(t.n) W.push(word(t.n, .3, x, y - 1.5, 0, {c: '--dim'}));
+@@scene_tile_notes@@
     });
     box(G, x0 - .6, -.6, -1.1, -x0 + .6, 0, 1.1, cx.col('--n-stone'), -1, 0, true);
     box(G, x0 - .6, -.05, 1.1, -x0 + .6, 0, 1.12, cx.col('--n-trim'), -1, .55);
-    if(info.brand) W.push(word(info.brand, .26, 0, -.4, 1.13, {al: 'c', c: '--n-trim', f: 'serif'}));
+@@scene_notes@@    if(info.brand) W.push(word(info.brand, .26, 0, -.4, 1.13, {al: 'c', c: '--n-trim', f: 'serif'}));
     const bx = union([x0 - .6, -.6, -1.1, -x0 + .6, 0, 1.12], extent(W, cx.measure));
     return {solid: G.v, glass: [], words: W, box: bx, hits: [], plot: null};
   }
@@ -2598,12 +2492,12 @@ void main(){
     windows: '',                                       // the time charts need no heading
     daily: '',
     latency: '',
-    content: 'What filled the window',
+    content: @@scene_composition_title@@,
     models: TK ? 'Input by model' : 'Recorded input by model',
   };
   const NAMES = {ledger: 'The numbers', windows: LIMIT[0].toUpperCase() + LIMIT.slice(1) + ' windows',
                  daily: 'Daily input', latency: 'Response time',
-                 content: 'What filled the window', models: 'Input by model'};
+                 content: @@scene_composition_title@@, models: 'Input by model'};
   function exhibits(){
     EX.length = 0;
     const panels = document.querySelectorAll('.wrap > .panel');
@@ -2651,7 +2545,7 @@ void main(){
                        n: text(t.querySelector('.n'))}))}, cx);
     } else if(ex.key === 'windows'){
       m = rec ? N3.windows(rec, {vmax: VMAX, wins: WINS, tk, view: VIEW, pw, title: TITLES.windows}, cx)
-              : N3.empty(text((ex.panel || document).querySelector('.sub')) || 'No weekly-limit snapshots in range.',
+              : N3.empty(text((ex.panel || document).querySelector('.sub')) || @@scene_empty_limits@@,
                          {title: TITLES.windows, pw}, cx);
     } else if(ex.key === 'latency'){
       m = rec ? N3.lines(rec, {tk, view: VIEW, pw, title: TITLES.latency,
@@ -3062,8 +2956,7 @@ void main(){
         best.plot = best.u >= 0 && best.u <= 1 && best.v >= -.15 && best.v <= 1.1;
       }
       for(const h of m.hits){
-        if(N3.rayBox(best.lo, best.ld, h.box) !== null || (q && q[0] >= h.box[0] && q[0] <= h.box[3]
-           && q[1] >= 0 && q[1] <= h.box[4] + .3)){ best.id = h.id; best.hit = h; break; }
+@@scene_pick_hit@@
       }
     } else if(m.medal){
       const q = N3.onPlane(best.lo, best.ld, 0);
@@ -3087,9 +2980,7 @@ void main(){
       const w = WINS[hit.id];
       if(!w) return null;
       const t0 = w.reset_at != null ? w.reset_at : ((w.cum_points || [])[0] || [null])[0];
-      return [at(`window opened ${t0 == null ? '--' : when(t0)}  ·  API value ${usd(w.usd)}  ·  peak reported ${w.peak_pct == null ? '--' : w.peak_pct + '%'}`, 0, '--fg'),
-              at(`${winInput(w)} over ${w.tokens.responses.toLocaleString()} responses  ·  uncached ${big(w.tokens.uncached)}`, 1, '--dim')];
-    }
+@@scene_limit_tooltip@@    }
     if(ex.key === 'latency'){
       const r = LROW.get(hit.day), n = LEVN.get(hit.day);
       const ev = n ? `  ·  ${evWord(n)}` : '';
@@ -3112,8 +3003,7 @@ void main(){
     hov = h;
     let cur = 'default';
     EX.forEach((ex, i)=>{
-      const id = h && h.ex === ex && i === F ? h.id : -1;
-      if(ex.hot !== id){
+@@scene_hover@@
         ex.hot = id;
         ex.tip = id >= 0 && ex.m.plot && h.hit ? tipFor(ex, h.hit) : null;
         if(ex.key === 'content' || ex.key === 'models') need = true;
@@ -3374,7 +3264,7 @@ def usd(x):
     return f'${x:,.2f}'
 
 
-def api_tile(av):
+def api_tile(av, *, profile=None):
     """The API value headline: what the recorded usage would cost at API list prices.
 
     Worded as a counterfactual on the page itself, since a plan is not billed per token.
@@ -3383,7 +3273,8 @@ def api_tile(av):
     """
     if not (av or {}).get('available'):
         return None
-    return tile('API value', usd(av['usd']), 'if billed at API price')
+    return tile(esc(profile['api_tile_label']) if profile else 'API value', usd(av['usd']),
+                esc(profile['api_tile_note']) if profile else 'if billed at API price')
 
 
 def tile(k, v, note=''):
@@ -3441,7 +3332,7 @@ def _domain(model):
     return [int(lo), int(max(hi, lo + 3600))]
 
 
-def _daily_svg(daily, order, domain, tiktoken=False):
+def _daily_svg(daily, order, domain, tiktoken=False, *, profile=None):
     """Daily input, stacked by the model that was charged for it: tiktoken's count when
     `tiktoken`, else Codex's recorded figure.
 
@@ -3508,6 +3399,10 @@ def _daily_svg(daily, order, domain, tiktoken=False):
                 f'{d["date"]}\nrecorded {d["input"]:,}\ncached {d["cached"]:,}\n')
                + f'uncached {d["uncached"]:,}\nresponses {d["responses"]:,}'
                + ('\n' + '\n'.join(rows) if rows else ''))
+        if profile:
+            tip = (f'{d["date"]}\n{profile["input_tile_label"]} {d["input"]:,}'
+                   f'\ncached {d["cached"]:,}\nuncached {d["uncached"]:,}'
+                   f'\nresponses {d["responses"]:,}' + ('\n' + '\n'.join(rows) if rows else ''))
         parts.append(f'<rect x="0" y="{T}" width="1" height="{DAILY_H-T-B}" '
                      f'fill="transparent"><title>{esc(tip)}</title></rect>')
         parts.append('</g>')
@@ -3651,7 +3546,320 @@ def secs(x):
 
 HOUR_MIN = 5            # a day with fewer timed responses is left empty, not drawn tall
 LAT_H = 190             # the response-time chart's height, in the same units as RL_H
-def render(model, public=False, style=None):
+
+_SPARSE_LIMIT_JS = r"""const PF = D.profile;
+const RL = D.rate_limits || {}, WINS = RL.windows || [];
+const LIMIT = PF.weekly_label, TK = false, INPUT = 'recorded input';
+let LIMIT_METRIC = PF.limit_metric, USD = true, VMAX = 1;
+const winInput = w => `recorded input ${big(w.tokens.input)}`;
+const metricPoints = w => LIMIT_METRIC === 'usd' ? (w.usd_points || [])
+  : (w.cum_points || []).map(p => [p[0], p[1] + p[3]]);
+const metricValue = v => LIMIT_METRIC === 'usd' ? usd(v, VMAX >= 100) : big(v);
+const metricLabel = () => PF.limit_metric_labels[LIMIT_METRIC];
+function limitScale(){
+  VMAX = 0;
+  WINS.forEach(w => metricPoints(w).forEach(p => { VMAX = Math.max(VMAX, p[1]); }));
+  VMAX = VMAX || 1;
+  USD = LIMIT_METRIC !== 'usd' || WINS.some(w => w.usd != null);
+}
+limitScale();
+const selector = byId('limitmetric');
+if(selector) selector.addEventListener('change', () => {
+  LIMIT_METRIC = selector.value === 'usd' ? 'usd' : 'tokens';
+  limitScale();
+  const label = byId('limitmetriclabel');
+  if(label) label.textContent = metricLabel();
+  redraw();
+});
+function drawRL(tk){
+  const host = byId('rlchart');
+  if(!host) return;
+  if(!WINS.length){
+    host.innerHTML = `<p class="sub">${esc(RL.available ? PF.missing_weekly : PF.missing_limits)}</p>`;
+    marks(host, null); return;
+  }
+  const H = G.rl_h || 300, T = G.rl_t || 18, B = G.rl_b || 34;
+  const y = v => H-B - v/VMAX*(H-B-T), yp = p => H-B - p/100*(H-B-T);
+  const aria = LIMIT_METRIC === 'tokens' ? PF.token_chart_accessibility
+    : `${PF.api_tile_label} per nominal weekly window`;
+  let s = `<svg viewBox="0 0 ${W} ${H}" data-h="${H}" data-t="${T}" data-b="${B}" role="img" aria-label="${esc(aria)}">`;
+  s += `<defs><clipPath id="tcclip-rl"><rect x="${L}" y="0" width="${PLOT}" height="${H}"/></clipPath></defs>`;
+  [0,.25,.5,.75,1].forEach(f => {
+    const yy = y(VMAX*f);
+    s += `<line x1="${L}" y1="${yy}" x2="${W-RM}" y2="${yy}" stroke="var(--line)"/>`;
+    if(USD) s += `<text x="${L-8}" y="${yy+4}" text-anchor="end" fill="var(--dim)" font-size="11">${metricValue(VMAX*f)}</text>`;
+    s += `<text x="${W-RM+8}" y="${yp(100*f)+4}" fill="var(--warn)" font-size="11">${Math.round(100*f)}%</text>`;
+  });
+  s += axis(H, T, B, tk) + '<g clip-path="url(#tcclip-rl)">';
+  const mk = [];
+  let lastLbl = -1e9;
+  WINS.forEach((w, wi) => {
+    const start = w.reset_at, hi = w.resets_at, points = metricPoints(w);
+    if(start == null || hi < VIEW[0] || start > VIEW[1]) return;
+    const anchorTip = `${PF.anchor_tooltip}\n${when(start)}`;
+    s += `<line data-nominal="inferred" x1="${X(start)}" y1="${T}" x2="${X(start)}" y2="${H-B}" stroke="var(--dim)" stroke-dasharray="3 3"><title>${esc(anchorTip)}</title></line>`;
+    mk.push({t:'line', pts:[[X(start),T],[X(start),H-B]], w:1, c:'--dim', dash:[3,3], win:wi, nominal:true});
+    if(X(start)-lastLbl >= 46){
+      lastLbl = X(start);
+      s += `<text x="${X(start)+3}" y="${T+10}" fill="var(--dim)" font-size="10">${esc(day(start))}</text>`;
+    }
+    const tip = `${anchorTip}\n${metricLabel()} ${LIMIT_METRIC === 'usd' ? usd(w.usd) : big(w.tokens.input+w.tokens.output)}\n${winInput(w)} | output ${big(w.tokens.output)}`;
+    const line = [[X(start),y(0)]].concat(points.map(p => [X(p[0]),y(p[1])]));
+    if(line.length === 1) line.push([X(hi),y(0)]);
+    mk.push({t:'area', pts:line, base:y(0), c:'--uncached', a:.16, win:wi});
+    if(points.length){
+      mk.push({t:'line', pts:line, w:1.8, c:'--uncached', win:wi});
+      const d = line.map((p,i) => `${i?'L':'M'} ${p[0]} ${p[1]}`).join(' ');
+      s += `<path d="${d} L ${line[line.length-1][0]} ${y(0)} Z" fill="var(--uncached)" fill-opacity=".16" class="mk"/>`;
+      s += `<path d="${d}" fill="none" stroke="var(--uncached)" stroke-width="1.8" class="mk"><title>${esc(tip)}</title></path>`;
+    }
+    if(w.observation_start != null && w.observation_end != null){
+      const a = X(w.observation_start), b = X(w.observation_end), yy = H-B-5;
+      const obsTip = `${PF.observation_tooltip}\n${when(w.observation_start)} — ${when(w.observation_end)}`;
+      s += `<line data-observation="span" x1="${a}" y1="${yy}" x2="${b}" y2="${yy}" stroke="var(--warn)" stroke-width="3"><title>${esc(obsTip)}</title></line>`;
+      mk.push({t:'line', pts:[[a,yy],[b,yy]], w:3, c:'--warn', win:wi, observation:true});
+    }
+    (w.pct_points || []).forEach((p, i) => {
+      const matching = (w.readings || []).filter(r => Math.abs(Date.parse(r.ts)/1000-p[0]) < .001 && r.percent === p[1]);
+      const reading = matching.find(r => r.source === 'quota_429') || matching[0];
+      const source = reading && reading.source;
+      const note = source === 'quota_429' ? PF.refusal_tooltip : `recorded /usage: ${p[1]}%`;
+      s += `<circle data-limit-point="${source || 'usage_report'}" cx="${X(p[0])}" cy="${yp(p[1])}" r="3.5" fill="var(--warn)" class="mk"><title>${esc(note+'\n'+when(p[0]))}</title></circle>`;
+      mk.push({t:'point', pts:[[X(p[0]),yp(p[1])]], r:3.5, c:'--warn', win:wi, reading:i, source});
+    });
+  });
+  host.innerHTML = s + '</g></svg>';
+  marks(host, () => host.querySelector('svg'), [W,H], [L,0,PLOT,H], mk, [L,T,PLOT,H-B-T]);
+}
+
+"""
+
+
+def _template(template, profile):
+    fragments = dict(_FRAGMENT_DEFAULTS)
+    if profile:
+        string = _script_json
+        fragments.update({
+            'limit_heading': '// ---- chart 1: cumulative recorded usage per nominal weekly window ----------------',
+            'limit_events_comment': '// recorded rate-limit events. A day the limit blocked',
+            'limit_chart': _SPARSE_LIMIT_JS if profile['sparse_limit_points'] else fragments['limit_chart'],
+            'composition_empty_range': string(profile['composition_empty']),
+            'composition_empty': string(profile['composition_empty']),
+            'composition_pie': string(profile['composition_unit']) + ', ' + string(profile['composition_accessibility']),
+            'scene_composition_title': string(profile['composition_title']),
+            'scene_empty_limits': string(profile['missing_weekly']),
+            'scene_limit_legend': "[{s: metricLabel(), c: '--uncached'}, {s: PF.percentage_legend, c: '--warn'}]",
+            'scene_limit_axis': 'metricValue(info.vmax*f)',
+            'scene_ledger_layout': """    const n = info.tiles.length, cols = 3, rows = Math.ceil(n/cols), cw = 4.9;
+    const tileNotes = info.tiles.map(t => t.n ? wrap(t.n, 26) : []), rowHeights = [];
+    for(let r=0; r<rows; r++) rowHeights.push(2.25 + Math.max(0,
+      ...tileNotes.slice(r*cols, (r+1)*cols).map(a => a.length-1))*.35);
+    const rowOffsets = rowHeights.map((_,r) => rowHeights.slice(0,r).reduce((a,b) => a+b, 0));
+    const x0 = -cols*cw/2, top = rowHeights.reduce((a,b) => a+b, 0) + 1.05;""",
+            'scene_ledger_position': '      const x = x0 + (i % cols)*cw, y = top - .6 - rowOffsets[Math.floor(i/cols)];',
+            'scene_tile_notes': """      tileNotes[i].forEach((line,j) =>
+        W.push(word(line, .25, x, y - 1.5 - j*.35, 0, {c:'--dim'})));""",
+            'scene_pick_hit': """        const precise = h.reading != null || h.nominal || h.observation;
+        if(N3.rayBox(best.lo, best.ld, h.box) !== null || (!precise && q
+           && q[0] >= h.box[0] && q[0] <= h.box[3] && q[1] >= 0 && q[1] <= h.box[4] + .3)){
+          best.id = h.id; best.hit = h; break;
+        }""",
+            'scene_hover': """      const id = h && h.ex === ex && i === F ? h.id : -1;
+      const hit = h && h.ex === ex && i === F ? h.hit : null;
+      const hotKey = hit ? [id, hit.reading == null ? '' : hit.reading, !!hit.nominal, !!hit.observation].join(':') : String(id);
+      if(ex.hot !== id || ex.hotKey !== hotKey){
+        ex.hotKey = hotKey;""",
+            'gl_points': """    } else if(m.t === 'point'){
+      const c = rgba(m.c, m.a), p = m.pts[0], r = m.r || 3.5;
+      for(let i=0; i<16; i++){
+        const a = i*Math.PI/8, b = (i+1)*Math.PI/8;
+        tri(V, p[0], p[1], p[0]+r*Math.cos(a), p[1]+r*Math.sin(a),
+            p[0]+r*Math.cos(b), p[1]+r*Math.sin(b), c);
+      }
+    } else if(m.t === 'pie'){""",
+            'scene_points': """      if(m.t === 'point' || m.nominal || m.observation){
+        const p = at(m.pts[0]), q = at(m.pts[m.pts.length-1]), z = FIN/2+.35;
+        if(m.t === 'point'){
+          if(p[0] < 0 || p[0] > 1) continue;
+          const x = p[0]*PW, y = p[1]*H, r = .085;
+          box(G, x-r, y-r, z-r, x+r, y+r, z+r, cx.col('--warn'), m.win, .8);
+          hits.unshift({id:m.win, reading:m.reading, source:m.source, box:[x-r,y-r,z-r,x+r,y+r,z+r]});
+        } else {
+          const run = clipX([p,q]);
+          if(run.length < 2) continue;
+          const a = run[0], b = run[1];
+          tube(G, [[a[0]*PW,a[1]*H,z],[b[0]*PW,b[1]*H,z]], .025,
+               cx.col(m.c), m.win, .7);
+          hits.unshift({id:m.win, nominal:m.nominal, observation:m.observation,
+            box:[a[0]*PW-.05,Math.min(a[1],b[1])*H-.05,z-.05,b[0]*PW+.05,Math.max(a[1],b[1])*H+.05,z+.05]});
+        }
+        continue;
+      }
+      const pts = clipX(m.pts.map(at));""",
+            'scene_limit_tooltip': """      if(hit.reading != null){
+        const p = (w.pct_points || [])[hit.reading];
+        return [at(hit.source === 'quota_429' ? PF.refusal_tooltip : `recorded /usage: ${p[1]}%`, 0, '--warn'),
+                at(when(p[0]), 1, '--dim')];
+      }
+      if(hit.observation) return [at(PF.observation_tooltip, 0, '--fg'),
+        at(`${when(w.observation_start)} — ${when(w.observation_end)}`, 1, '--dim')];
+      return [at(`${PF.anchor_tooltip} · ${when(t0)}`, 0, '--fg'),
+              at(`${metricLabel()} ${LIMIT_METRIC === 'usd' ? usd(w.usd) : big(w.tokens.input+w.tokens.output)}`, 1, '--dim')];
+""",
+            'scene_notes': """    const notes = [PF.composition_note, PF.timing_note, PF.price_source_note].concat(PF.standing_notes);
+    let ny = -.95;
+    notes.forEach(n => wrap(n, 80).forEach(l => {
+      W.push(word(l, .25, x0, ny, 0, {c:'--dim'})); ny -= .36;
+    }));
+""",
+        })
+        for style, kicker in profile['kickers'].items():
+            fragments['kicker_' + style] = string(kicker)
+    for key, value in fragments.items():
+        template = template.replace('@@' + key + '@@', value)
+    return template
+
+
+# Template fragments are resolved before composing the page. Their defaults are the
+# original templates, including whitespace and JavaScript. A missing profile is inert.
+_FRAGMENT_DEFAULTS = {
+    'scene_ledger_layout': '    const n = info.tiles.length, cols = 3, rows = Math.ceil(n/cols), cw = 4.9;\n    const x0 = -cols*cw/2, top = rows*2.25 + 1.05;          // the notes clear the far shore',
+    'scene_ledger_position': '      const x = x0 + (i % cols)*cw, y = top - .6 - Math.floor(i/cols)*2.25;',
+    'scene_tile_notes': "      if(t.n) W.push(word(t.n, .3, x, y - 1.5, 0, {c: '--dim'}));",
+    'scene_pick_hit': '        if(N3.rayBox(best.lo, best.ld, h.box) !== null || (q && q[0] >= h.box[0] && q[0] <= h.box[3]\n           && q[1] >= 0 && q[1] <= h.box[4] + .3)){ best.id = h.id; best.hit = h; break; }',
+    'scene_hover': '      const id = h && h.ex === ex && i === F ? h.id : -1;\n      if(ex.hot !== id){',
+    'limit_heading': '// ---- chart 1: cumulative API value per weekly limit window ---------------------------',
+    'limit_events_comment': '// events Codex logged: snapshots in which a limit was reached.  A day the limit blocked',
+    'limit_chart': r"""const RL = D.rate_limits || {};
+const WINS = RL.windows || [];
+// The window the limit chart draws: the weekly one, or the longest the logs quote without it.
+const LIMIT = (RL.name || 'weekly') + ' limit';
+// The curve is a window's API value, usd_points [t, cumulative dollars]: tokens of different
+// models are priced differently, so a token count does not say what a week was worth.
+// No price table, no dollars: the windows then carry usd null and the value axis is blank.
+const USD = WINS.some(w => w.usd != null);
+const TK = D.input_source === 'tiktoken';
+const INPUT = TK ? 'input' : 'recorded input';
+/** A window's input, as the tooltip states it. */
+const winInput = w => (TK && w.tokens.tiktoken_input != null)
+  ? `input ${big(w.tokens.tiktoken_input)} (tiktoken)` : `recorded input ${big(w.tokens.input)}`;
+// Fixed over the corpus, never over the viewport: zoom moves the time axis and leaves the
+// value axis alone, so a curve keeps its height while the window slides under it.
+let VMAX = 0;
+WINS.forEach(w => (w.usd_points||[]).forEach(p => { VMAX = Math.max(VMAX, p[1]); }));
+VMAX = VMAX || 1;
+
+function drawRL(tk){
+  const host = byId('rlchart');
+  if(!host) return;
+  if(!WINS.length){
+    host.innerHTML = '<p class="sub">No weekly-limit snapshots in range.</p>';
+    marks(host, null);
+    return;
+  }
+  const H = G.rl_h||300, T = G.rl_t||18, B = G.rl_b||34;
+  const y  = v => H-B - (v/VMAX)*(H-B-T);
+  const yp = p => H-B - (p/100)*(H-B-T);
+
+  let s = `<svg viewBox="0 0 ${W} ${H}" data-h="${H}" data-t="${T}" data-b="${B}" role="img" `+
+          `aria-label="cumulative API value per ${LIMIT} window">`;
+  s += `<defs><clipPath id="tcclip-rl"><rect x="${L}" y="0" width="${PLOT}" height="${H}"/>`+
+       `</clipPath></defs>`;
+  // horizontal guides + left axis (measured) + right axis (reported)
+  [0,.25,.5,.75,1].forEach(f=>{
+    const yy = y(VMAX*f);
+    s += `<line x1="${L}" y1="${yy.toFixed(1)}" x2="${W-RM}" y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="1"/>`;
+    if(USD) s += `<text x="${L-8}" y="${(yy+4).toFixed(1)}" text-anchor="end" fill="var(--dim)" font-size="11">${usd(VMAX*f, VMAX >= 100)}</text>`;
+    s += `<text x="${W-RM+8}" y="${(yp(100*f)+4).toFixed(1)}" fill="var(--warn)" font-size="11">${Math.round(100*f)}%</text>`;
+  });
+  s += axis(H, T, B, tk);
+
+  s += `<g clip-path="url(#tcclip-rl)">`;
+  const mk = [];
+  // Window boundaries carry the date they opened.  On a narrow screen, or zoomed out far
+  // enough that three windows share fifty pixels, those labels collide into a smear -- so a
+  // label is drawn only where there is room for it.  The boundary line is always drawn.
+  let lastLbl = -1e9;
+  WINS.forEach((w, wi)=>{
+    const pts = w.cum_points||[], pcs = w.pct_points||[], ups = w.usd_points||[];
+    const start = w.reset_at!=null ? w.reset_at : (pts.length?pts[0][0]:null);
+    if(start==null) return;
+    let hi = start;
+    if(pts.length) hi = Math.max(hi, pts[pts.length-1][0]);
+    if(pcs.length) hi = Math.max(hi, pcs[pcs.length-1][0]);
+    if(hi < VIEW[0] || start > VIEW[1]) return;    // no part of this window is on screen
+    // Reset boundary: the instant the replacement window was first reported.
+    s += `<line x1="${X(start).toFixed(1)}" y1="${T}" x2="${X(start).toFixed(1)}" y2="${H-B}" `+
+         `stroke="var(--dim)" stroke-dasharray="3 3" stroke-width="1"/>`;
+    if(X(start) - lastLbl >= 46){
+      lastLbl = X(start);
+      s += `<text x="${(X(start)+3).toFixed(1)}" y="${T+10}" fill="var(--dim)" font-size="10">${esc(day(start))}</text>`;
+    }
+    const tip = `<title>window opened ${esc(when(start))}
+reset quoted ${esc(w.resets_at_iso||'--')}
+`+
+           `peak reported ${w.peak_pct==null?'--':w.peak_pct+'%'}
+`+
+           `API value ${usd(w.usd)}
+`+
+           `${winInput(w)} over ${w.tokens.responses} responses
+`+
+           `uncached ${big(w.tokens.uncached)} | output ${big(w.tokens.output)}`+
+           (TK ? ' (recorded by Codex)' : '')+
+           (w.late_points ? `
+${w.late_points} later reading(s) not drawn: the next window `+
+                            `had already opened` : '')+`</title>`;
+    if(ups.length){
+      const line = [[X(start), y(0)]].concat(ups.map(p=>[X(p[0]), y(p[1])]));
+      mk.push({t:'area', pts:line, base:y(0), c:'--uncached', a:.16, win:wi},
+              {t:'line', pts:line, w:1.8, c:'--uncached', win:wi});
+      const d = [`M ${X(start).toFixed(1)} ${y(0).toFixed(1)}`]
+        .concat(ups.map(p=>`L ${X(p[0]).toFixed(1)} ${y(p[1]).toFixed(1)}`));
+      const last = ups[ups.length-1];
+      s += `<path d="${d.join(' ')} L ${X(last[0]).toFixed(1)} ${y(0).toFixed(1)} Z" `+
+           `fill="var(--uncached)" fill-opacity=".16" class="mk"/>`;
+      s += `<path d="${d.join(' ')}" fill="none" stroke="var(--uncached)" stroke-width="1.8" class="mk">`+
+           `${tip}</path>`;
+    } else if(pts.length){
+      // Nothing in this window could be priced: no curve, rather than one claiming $0.  It
+      // keeps its tooltip, and a flat mark the scene hangs its reset and hover target on.
+      const x1 = X(pts[pts.length-1][0]);
+      mk.push({t:'area', pts:[[X(start), y(0)], [x1, y(0)]], base:y(0), c:'--uncached', a:.16, win:wi});
+      s += `<rect x="${X(start).toFixed(1)}" y="${T}" width="${Math.max(0, x1-X(start)).toFixed(1)}" `+
+           `height="${H-B-T}" fill="transparent">${tip}</rect>`;
+    }
+    if(pcs.length){
+      const d = pcs.map((p,i)=>`${i?'L':'M'} ${X(p[0]).toFixed(1)} ${yp(p[1]).toFixed(1)}`);
+      s += `<path d="${d.join(' ')}" fill="none" stroke="var(--warn)" stroke-width="1.4" stroke-dasharray="5 3" class="mk"/>`;
+      mk.push({t:'line', pts:pcs.map(p=>[X(p[0]), yp(p[1])]), w:1.4, c:'--warn', dash:[5,3], win:wi});
+    }
+  });
+  s += `</g>`;
+  s += `<line x1="${L}" y1="${H-B}" x2="${W-RM}" y2="${H-B}" stroke="var(--line)"/>`;
+  s += '</svg>';
+  host.innerHTML = s;
+  marks(host, ()=>host.querySelector('svg'), [W, H], [L, 0, PLOT, H], mk, [L, T, PLOT, H-B-T]);
+}
+
+""",
+    'kicker_clinical': '"Codex usage, recounted locally"',
+    'kicker_matisse': '"Papiers d\\00E9 coup\\00E9 s \\00B7  Codex usage, cut from local records"',
+    'kicker_nocturne': '"Nocturne in blue and gold \\00B7  Codex usage, recounted locally"',
+    'composition_empty_range': "'No tokenized content in the visible range.'",
+    'composition_empty': "'No content in range.'",
+    'composition_pie': "'tokens in view', 'content composition by category'",
+    'gl_points': "    } else if(m.t === 'pie'){",
+    'scene_limit_legend': "[{s: 'cumulative API value', c: '--uncached'}, {s: LIMIT, c: '--warn'}]",
+    'scene_limit_axis': 'usd(info.vmax*f, info.vmax >= 100)',
+    'scene_points': '      const pts = clipX(m.pts.map(at));',
+    'scene_composition_title': "'What filled the window'",
+    'scene_empty_limits': "'No weekly-limit snapshots in range.'",
+    'scene_limit_tooltip': "      return [at(`window opened ${t0 == null ? '--' : when(t0)}  ·  API value ${usd(w.usd)}  ·  peak reported ${w.peak_pct == null ? '--' : w.peak_pct + '%'}`, 0, '--fg'),\n              at(`${winInput(w)} over ${w.tokens.responses.toLocaleString()} responses  ·  uncached ${big(w.tokens.uncached)}`, 1, '--dim')];\n",
+    'scene_notes': '',
+}
+
+
+def render(model, public=False, style=None, *, profile=None):
     """The page: the headline numbers, three time charts over one shared, zoomable range
     (limit windows, daily input, response time by day), and the composition pies.
 
@@ -3668,13 +3876,21 @@ def render(model, public=False, style=None):
     t = model['totals']
     rl = model.get('rate_limits') or {}
     domain = _domain(model)
+    text = lambda key, default: esc(profile[key]) if profile else default
+    title = text('title', 'Codex Token Report')
+    chart_windows = rl.get('windows') or []
+    if profile:
+        chart_windows = [w for w in chart_windows if w.get('kind') == 'weekly_all']
+        if domain and chart_windows:
+            domain[0] = min(domain[0], min(w['reset_at'] for w in chart_windows))
+            domain[1] = max(domain[1], max(w['resets_at'] for w in chart_windows))
 
     # The weekly figure is the server's own percentage, not a token count of ours, and it
     # keeps that wording so a reader cannot take it for something this page measured.  Once
     # its window has reset, the last reading describes a week that is over, and nothing has
     # been read since: it is not shown as the current figure.
     cur = rl.get('current') or {}
-    limit = limit_name(rl)
+    limit = profile['weekly_label'] if profile else limit_name(rl)
     wk_pct = cur.get('last_pct')
     wk_next, wk_now = cur.get('resets_at'), rl.get('now')
     if cur.get('expired'):
@@ -3684,6 +3900,9 @@ def render(model, public=False, style=None):
     else:
         wk_note = (f'resets in {rel(wk_next - wk_now)}'
                    if (wk_now and wk_next and wk_next > wk_now) else 'reported by the server')
+    if profile:
+        wk_note = text('missing_weekly' if not cur else
+                       'expired_reading' if cur.get('expired') else 'limit_source_note', wk_note)
 
     sc = model.get('scope') or {}
     cat_note = None
@@ -3697,6 +3916,8 @@ def render(model, public=False, style=None):
     elif sc.get('metrics_only'):
         cat_note = ('Not counted: this report was produced with --metrics-only, which reads '
                     'the usage records and does not tokenize anything.')
+    if profile:
+        cat_note = profile['metrics_only_note'] if sc.get('metrics_only') else None
 
     # Input is shown as tiktoken counted it when the run tokenized (analyze, §5.7), and as
     # Codex recorded it otherwise.  Output and caching are always Codex's: reasoning tokens
@@ -3712,7 +3933,7 @@ def render(model, public=False, style=None):
         where = os.path.basename((top.get('cwd') or '').rstrip('/\\'))
         top_note = '' if public else ' &middot; '.join(html.escape(x) for x in
                                                        (str(top['session_id'])[:8], where) if x)
-        top_tile = [tile('Longest session', big(top[shown]), top_note)]
+        top_tile = [tile(text('largest_session_label', 'Longest session'), big(top[shown]), top_note)]
 
     # The third time chart: response time by day, on the same axis as the other two.  When
     # nothing was timed its place says why, as the limit chart's does.
@@ -3753,16 +3974,17 @@ def render(model, public=False, style=None):
     tiles = ''.join([
         (tile('Input', big(t['tiktoken_input']),
               f"counted with tiktoken &middot; {t['responses']:,} responses") if tk else
-         tile('Recorded input', big(t['input']), f"{t['responses']:,} responses")),
-        tile('Output', big(t['output']),
-             f"{big(t['reasoning'])} reasoning" + (' &middot; recorded by Codex' if tk else '')),
+         tile(text('input_tile_label', 'Recorded input'), big(t['input']),
+              text('input_tile_note', f"{t['responses']:,} responses"))),
+        tile(text('output_tile_label', 'Output'), big(t['output']),
+             text('output_tile_note', f"{big(t['reasoning'])} reasoning" + (' &middot; recorded by Codex' if tk else ''))),
         # Measured against Codex's own input, never the tiktoken count: that one misses what
         # the logs do not keep, and cached would then exceed the input it is a share of.
-        tile('Cache hit', pct(t['cache_hit']),
-             f"{big(t['cached'])} of {big(t['input'])} recorded by Codex" if tk
-             else f"{big(t['cached'])} cached"),
-    ] + [x for x in (api_tile(model.get('api_value')),) if x] + [
-        tile('Sessions', f"{t['sessions']:,}", f"{t['threads']:,} threads"),
+        tile(text('cache_tile_label', 'Cache hit'), pct(t['cache_hit']),
+             text('cache_tile_note', f"{big(t['cached'])} of {big(t['input'])} recorded by Codex" if tk
+             else f"{big(t['cached'])} cached")),
+    ] + [x for x in (api_tile(model.get('api_value'), profile=profile),) if x] + [
+        tile('Sessions', f"{t['sessions']:,}", text('sessions_unit', f"{t['threads']:,} threads")),
     ] + top_tile + lat_tile + ([tile(f'{limit[0].upper()}{limit[1:]} limit used',
                '&mdash;' if wk_pct is None else f'{wk_pct:g}%', wk_note)]
          if rl.get('available') else []))
@@ -3778,10 +4000,19 @@ def render(model, public=False, style=None):
     <span><i style="background:var(--warn)"></i>{limit} limit</span>
   </div>
 </div>"""
+    if profile:
+        missing = profile['missing_limits'] if not rl.get('available') else profile['missing_weekly']
+        rl_chart = (f'<div class="panel"><div class="chart" id="rlchart">'
+                    + (f'<p class="sub">{esc(missing)}</p>' if not chart_windows else '')
+                    + '</div><div class="legend">'
+                    + '<span><i style="background:var(--uncached)"></i>'
+                    + f'<span id="limitmetriclabel">{esc(profile["limit_metric_labels"][profile["limit_metric"]])}</span></span>'
+                    + '<span><i style="background:var(--warn)"></i>'
+                    + esc(profile['percentage_legend']) + '</span></div></div>')
 
     # Only the limit series, the content buckets and the shared geometry are read by the
     # page's JS; the deep-dive data it used to carry went out with the section that drew it.
-    payload = _script_json({
+    data = {
         'geo': {'w': CHART_W, 'l': CHART_L, 'r': CHART_R,
                 'rl_h': RL_H, 'rl_t': RL_T, 'rl_b': RL_B, 'lat_h': LAT_H},
         'domain': domain,
@@ -3796,7 +4027,7 @@ def render(model, public=False, style=None):
                          ('index', 'reset_at', 'reset_at_iso', 'resets_at', 'resets_at_iso',
                           'peak_pct', 'last_pct', 'tokens', 'pct_points', 'cum_points',
                           'usd', 'usd_points', 'late_points')}
-                        for w in (rl.get('windows') or [])],
+                        for w in chart_windows],
         },
         'cats': {
             'series': model.get('cat_series') or [],
@@ -3820,32 +4051,60 @@ def render(model, public=False, style=None):
                      for d in model['daily']
                      if d.get('start') is not None and d.get('end') is not None],
         },
-    })
+    }
+    if profile:
+        data['profile'] = {k: v for k, v in profile.items() if k != 'brand_link'}
+        data['rate_limits']['available'] = rl.get('available', False)
+        for item, window in zip(data['rate_limits']['windows'], chart_windows):
+            item.update({k: window.get(k) for k in ('reset_inferred', 'anchor_inferred',
+                'observation_start', 'observation_end')})
+            item['readings'] = [{k: r[k] for k in ('ts', 'percent', 'source')}
+                                for r in window.get('readings', [])]
+        # Current window is a chart aggregate, never an entire captured ledger window.
+        data['rate_limits']['current'] = next((w for w in data['rate_limits']['windows']
+            if cur and w['index'] == cur['index']), None)
+    payload = _script_json(data)
 
     # The masthead's one line of context, written here so it reads the same with JS off.
     fmt = lambda ts: time.strftime('%b %d, %Y', time.localtime(ts))
     dek = ' &middot; '.join(x for x in (
         f'{fmt(domain[0])} &ndash; {fmt(domain[1])}' if domain else '',
         f"{t['sessions']:,} sessions", f"{t['responses']:,} responses") if x)
+    if profile and not public and (model.get('account') or {}).get('email'):
+        dek += ' &middot; ' + esc(model['account']['email'])
     at = next((i for i, (sid, _) in enumerate(STYLES) if sid == style), 0)
     first, nxt = STYLES[at], STYLES[(at + 1) % len(STYLES)]
 
     # Marked when --style chose it, so the page opens in it over a style remembered from
     # another report (initStyles).
     pinned = ' data-style-set' if any(sid == style for sid, _ in STYLES) else ''
+    selector, notes, composition, timing = '', '', '', ''
+    if profile:
+        selector = ('<label class="limit-selector">' + esc(profile['weekly_label'])
+                    + ' <select id="limitmetric" aria-label="Limit chart metric">'
+                    + ''.join(f'<option value="{esc(k)}"' + (' selected' if k == profile['limit_metric'] else '')
+                              + f'>{esc(profile["limit_metric_labels"][k])}</option>'
+                              for k in profile['limit_metric_choices']) + '</select></label>')
+        notes = '<div class="standing-notes">' + ''.join(
+            f'<p class="sub">{esc(n)}</p>' for n in profile['standing_notes'] + [profile['price_source_note']]) + '</div>'
+        composition = f'<div class="composition-note"><h2>{esc(profile["composition_title"])}</h2><p class="sub">{esc(profile["composition_note"])}</p></div>'
+        timing = f'<p class="sub">{esc(profile["timing_note"])}</p>'
+    style_css = _template(STYLE_CSS, profile)
+    if profile:
+        style_css += '\n.limit-selector{font-size:12px;pointer-events:auto;margin-right:14px}.limit-selector select{background:var(--panel);color:var(--fg);border:1px solid var(--line);padding:5px}.composition-note{grid-column:1/-1}.standing-notes{margin-top:28px}[data-s3d] .limit-selector{position:fixed;top:22px;left:24px;z-index:10}\n'
 
     return f"""<!doctype html>
 <html lang="en" data-style="{first[0]}"{pinned}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Codex Token Report</title>
-<style>{CSS}{STYLE_CSS}</style></head><body>
+<title>{title}</title>
+<style>{CSS}{style_css}</style></head><body>
 <div class="deco" aria-hidden="true">{_matisse()}<div class="wipe"></div></div>
-<nav class="bar"><div class="brand"><a href="https://tokenusage.dev">tokenusage.dev</a></div><div><button id="stylebtn" type="button" data-next="{nxt[0]}" aria-label="Switch to the {esc(nxt[1])} style"><span class="sdot" aria-hidden="true"></span></button></div></nav>
+<nav class="bar"><div class="brand"><a href="https://tokenusage.dev">tokenusage.dev</a></div><div>{selector}<button id="stylebtn" type="button" data-next="{nxt[0]}" aria-label="Switch to the {esc(nxt[1])} style"><span class="sdot" aria-hidden="true"></span></button></div></nav>
 <div class="wrap">
 
 <header class="mast">
   <div class="kicker"></div>
-  <h1>Codex Token Report</h1>
+  <h1>{title}</h1>
   <p class="dek">{dek}</p>
 </header>
 
@@ -3856,14 +4115,14 @@ def render(model, public=False, style=None):
 
 <div class="panel"><div class="chart" id="dailychart">{_daily_svg(
     model['daily'], [m['model'] for m in model['models']], domain or [0, 1],
-    tiktoken=tk)}</div></div>
+    tiktoken=tk, profile=profile)}</div></div>
 
-{lat_chart}
-<div class="panel pies"><div id="catpie"></div><div id="modelpie"></div></div>
+{lat_chart}{timing}
+<div class="panel pies">{composition}<div id="catpie"></div><div id="modelpie"></div></div>
 
-
+{notes}
 </div>
 <script>window.__TC__ = {payload};</script>
-<script>{JS}{GL_JS}{SCENE_JS}{STYLE_JS}</script>
+<script>{_template(JS, profile)}{_template(GL_JS, profile)}{_template(SCENE_JS, profile)}{STYLE_JS}</script>
 </body></html>
 """

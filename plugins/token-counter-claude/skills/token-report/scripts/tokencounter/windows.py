@@ -189,7 +189,14 @@ def plan_for_interval(start, end, account_snapshots) -> tuple:
     predecessor = [s for s in mapped if start is not None and s[0] < start]
     latest_before = predecessor[-1:]  # one latest predecessor, if present
     applicable = latest_before + [s for s in mapped if start is not None and s[0] >= start]
-    for _t, _s, _p, diagnostics in applicable:
+    # Every run captures a snapshot, so one account state recurs many times; its mapping
+    # diagnostics describe that state, counted once per distinct state per decision.
+    states = set()
+    for _t, snapshot, _p, diagnostics in applicable:
+        state = (snapshot.get('organization_type'), snapshot.get('rate_limit_tier'))
+        if state in states:
+            continue
+        states.add(state)
         for name, value in diagnostics.items():
             bump(counters, name, value)
     known = {p for _t, _s, p, _d in applicable if p is not None}

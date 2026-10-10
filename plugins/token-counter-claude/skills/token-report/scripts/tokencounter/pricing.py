@@ -212,6 +212,11 @@ def price_row(row, prices) -> RowPrice:
 
 
 def summarize(rows, prices) -> dict:
+    return _summarize(rows, prices, price_row)
+
+
+def _summarize(rows, prices, quote_row):
+    """Aggregate quotes; analysis supplies its call-local price cache."""
     table, reason = prices if isinstance(prices, tuple) else (prices, None)
     counters = collections.Counter()
     if table is None:
@@ -225,7 +230,7 @@ def summarize(rows, prices) -> dict:
         if _excluded(row):
             continue
         responses += 1
-        value = price_row(row, table)
+        value = quote_row(row, table)
         for name, count in value['counters'].items():
             bump(counters, name, count)
         calls += value['web_search_calls']
@@ -265,6 +270,10 @@ def summarize(rows, prices) -> dict:
 
 def crosscheck(cost_checks, rows, prices) -> dict:
     """Reported snapshots beside same-source/model/context captured counts and value."""
+    return _crosscheck(cost_checks, rows, prices, price_row)
+
+
+def _crosscheck(cost_checks, rows, prices, quote_row):
     table = prices[0] if isinstance(prices, tuple) else prices
     by_key = collections.defaultdict(list)
     # Price every row once; a source's cost snapshots each cover most of its rows.
@@ -273,7 +282,7 @@ def crosscheck(cost_checks, rows, prices) -> dict:
         by_key[(row['source_id'], canonical_model(row.get('raw_model') or row['model'], table)[0],
                 row['context_1m'])].append(row)
         if not _excluded(row):
-            priced[id(row)] = price_row(row, table)
+            priced[id(row)] = quote_row(row, table)
     checks, unmatched = [], []
     for fact in cost_checks:
         end = epoch(fact['ts'])

@@ -1,10 +1,13 @@
 """Claude timing/events and local analyzer acceptance, using invented fixtures only."""
 import copy
+import contextlib
 import datetime
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
+from unittest import mock
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -14,6 +17,23 @@ sys.modules[spec.name] = fixtures
 spec.loader.exec_module(fixtures)
 analyze, cases, corpus = fixtures.analyze, fixtures.cases, fixtures.corpus
 ledger, worker, pricing = fixtures.ledger, fixtures.worker, fixtures.pricing
+from claude_counter import account, history, index, paths, render, rollout
+
+
+def _report_module():
+    aliases = {name.replace('claude_counter', 'tokencounter', 1): module
+               for name, module in list(sys.modules.items())
+               if name == 'claude_counter' or name.startswith('claude_counter.')}
+    saved = list(sys.path)
+    try:
+        with mock.patch.dict(sys.modules, aliases):
+            return fixtures._load('claude_report_cli', fixtures.LIB.parent / 'report.py')
+    finally:
+        sys.path[:] = saved
+
+
+report = _report_module()
+NOW = datetime.datetime(2026, 9, 11, tzinfo=datetime.timezone.utc).timestamp()
 RESULTS = []
 
 
@@ -119,8 +139,13 @@ def test_analyzer_W():
                (.0069, [.000448, .001344, .002778, .00466, .0069]))
         expect('W latency captured account plan', (model['latency']['plan'], model['latency']['plan_source']), ('claude:max-5x', 'account'))
         public = analyze.public_model(model)
-        expect('public W window wire fields only', set(public['rate_limits']['windows'][0]),
-               set(('start', 'window_minutes', 'plan', 'first_pct', 'peak_pct', 'responses', 'input', 'cached', 'output', 'reasoning', 'split')))
+        safe = public['rate_limits']['windows'][0]
+        expect('public W preserves wire fields and chart aggregates',
+               set(('start', 'window_minutes', 'plan', 'first_pct', 'peak_pct', 'responses', 'input', 'cached', 'output', 'reasoning', 'split')).issubset(safe)
+               and safe['cum_points'] == window['cum_points'] and safe['usd_points'] == window['usd_points']
+               and safe['anchor_inferred'], True)
+        expect('public W reading provenance is allow-listed',
+               all(set(r) <= {'ts', 'percent', 'source'} for r in safe['readings']), True)
         encoded = json.dumps(public)
         sentinels = [window['window_key']] + [r['reading_key'] for r in result['limits']] + [r['response_key'] for r in result['rows']]
         expect('public W strips reading and response identities', any(s in encoded for s in sentinels), False)
@@ -452,6 +477,179 @@ def test_first_family_day_survives_filter():
         row.update(local_day='2026-09-11', day_start=2, day_end=3)
         report = analyze.analyze(result, since='2026-09-11', now=_ts(100))
         expect('daily sessions use first captured family day', (report['daily'][0]['input'], report['daily'][0]['sessions']), (155, 0))
+
+
+def _account_file(root):
+    (root / '.claude.json').write_text(json.dumps({'oauthAccount': {
+        'organizationType': 'claude_max', 'organizationRateLimitTier': 'default_claude_max_5x',
+        'subscriptionCreatedAt': '2026-09-01T00:00:00Z', 'emailAddress': 'invented-identity<&>@example.invalid',
+        'organizationName': 'invented-organization'}}), encoding='utf-8')
+
+
+def _cli(root, *extra):
+    stdout, stderr = io.StringIO(), io.StringIO()
+    args = ['--sessions-root', str(root / 'projects'), '--procs', '1', '--no-open', '--quiet',
+            '--out', str(root / 'page.html'), '--json', str(root / 'model.json')] + list(extra)
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+            mock.patch.object(report.time, 'time', return_value=NOW), \
+            mock.patch.object(report, '_open', side_effect=AssertionError('browser attempted')):
+        try:
+            code = report.main(args)
+        except SystemExit as exc:
+            code = exc.code
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_report_B_and_W():
+    for label, case in (('B', fixtures._b()), ('W', cases.quota_W_timed())):
+        with corpus(case) as (_built, _files, root):
+            _account_file(root)
+            code, stdout, stderr = _cli(root)
+            model = json.loads((root / 'model.json').read_text(encoding='utf-8'))
+            page = (root / 'page.html').read_text(encoding='utf-8')
+            expect('CLI fixture outputs ' + label, (code, model['totals']['responses'] > 0,
+                   'recorded input' in stdout, 'Claude Code Token Report' in page, stderr), (0, True, True, True, ''))
+            expect('CLI escaped local account ' + label,
+                   'invented-identity&lt;&amp;&gt;@example.invalid' in page and 'invented-identity<&>' in stdout, True)
+            expect('CLI complete thinking note ' + label, 'recorded thinking tokens · unavailable' in page, False)
+            expect('CLI postcommit history coverage ' + label,
+                   (model['coverage']['history_available'], model['coverage']['history_committed'],
+                    model['coverage']['safe_months']), (True, True, ['2026-09']))
+            code, stdout, _stderr = _cli(root, '--json', '-')
+            expect('CLI JSON stdout only ' + label, (code, json.loads(stdout)['totals'], stdout.rstrip().endswith('}')), (0, model['totals'], True))
+            code, stdout, _stderr = _cli(root, '--public')
+            public = (root / 'model.json').read_text(encoding='utf-8')
+            page = (root / 'page.html').read_text(encoding='utf-8')
+            expect('CLI public identity excluded ' + label, (code, any(s in public+page+stdout for s in
+                   ('invented-identity', 'invented-organization', str(root)))), (0, False))
+            code, _stdout, _stderr = _cli(root, '--metrics-only')
+            minimal = json.loads((root / 'model.json').read_text(encoding='utf-8'))
+            expect('CLI metrics-only usage ' + label,
+                   (code, minimal['totals']['input'], minimal['totals']['bytes'], minimal['api_value']['usd']),
+                   (0, model['totals']['input'], 0, model['api_value']['usd']))
+
+
+def test_report_index_rebuild_and_warm():
+    with corpus(fixtures._b()) as (_built, _files, root):
+        with mock.patch.object(worker, 'extract', wraps=worker.extract) as extract:
+            expect('CLI rebuild success', _cli(root, '--rebuild')[0], 0)
+            expect('CLI rebuild fully extracts', extract.call_count, 1)
+            cold = json.loads((root / 'model.json').read_text(encoding='utf-8'))
+            extract.reset_mock()
+            expect('CLI warm success', _cli(root)[0], 0)
+            warm = json.loads((root / 'model.json').read_text(encoding='utf-8'))
+            expect('CLI warm reuses index without extraction', extract.call_count, 0)
+            expect('CLI warm complete JSON equality', warm, cold)
+            extract.reset_mock()
+            _cli(root, '--no-cache')
+            expect('CLI no-cache extracts', extract.call_count, 1)
+
+
+def test_report_prefix_and_options():
+    case = fixtures._b()
+    case['files'] = {name.replace('synthetic-session-B', 'synthetic-session-B-extended'): records
+                     for name, records in case['files'].items()}
+    for records in case['files'].values():
+        for record in records:
+            record['sessionId'] = 'synthetic-session-B-extended'
+    case['files'].update(cases.quota_W_timed()['files'])
+    with corpus(case) as (_built, _files, root):
+        expect('CLI unique family prefix accepted', _cli(root, '--session', 'synthetic-session-B')[0], 0)
+        code, _stdout, stderr = _cli(root, '--session', 'synthetic-session-')
+        expect('CLI ambiguous prefix names candidate families',
+               (code, 'synthetic-session-B' in stderr, 'synthetic-session-W' in stderr), (2, True, True))
+        expect('CLI include-archived live-only conflict', _cli(root, '--live-only', '--include-archived')[0], 2)
+        expect('CLI fast procs conflict', _cli(root, '--fast')[0], 2)
+        options = report.parse_args(['--live-only', '--no-open'])
+        expect('CLI live-only default alias accepted', (options.live_only, options.include_archived), (True, False))
+        with mock.patch.object(report.os, 'cpu_count', return_value=8):
+            expect('CLI worker defaults', (report.parse_args([]).procs, report.parse_args(['--fast']).procs), (4, 8))
+    with corpus(fixtures._case([_error()])) as (_built, _files, root):
+        expect('CLI refusal-only family prefix accepted', _cli(root, '--session', 'A')[0], 0)
+        model = json.loads((root / 'model.json').read_text())
+        expect('CLI refusal-only family keeps its event', (model['totals']['responses'], model['limit_events']['total']), (0, 1))
+
+
+def test_report_retention_and_no_account():
+    with corpus(fixtures._b()) as (_built, _files, root):
+        _account_file(root)
+        _cli(root, '--no-account')
+        resolved = paths.resolve_paths(root / 'projects')
+        with history.History(resolved['history_path']) as store:
+            expect('CLI no-account captures no snapshot', store.load()[3], [])
+        for file in (root / 'projects').rglob('*.jsonl'):
+            file.unlink()
+        code, stdout, stderr = _cli(root, '--no-account')
+        model = json.loads((root / 'model.json').read_text(encoding='utf-8'))
+        expect('CLI pruned file durable coverage', (code, model['totals']['input'], stderr), (0, 255, ''))
+        expect('CLI retained coverage terminal line', 'captured history: 2 responses from transcripts no longer on disk' in stdout, True)
+        _cli(root, '--live-only', '--no-account')
+        expect('CLI live-only excludes archive', json.loads((root / 'model.json').read_text())['totals']['responses'], 0)
+
+
+def test_report_history_failure_and_doctor():
+    with corpus(fixtures._b()) as (_built, _files, root):
+        resolved = paths.resolve_paths(root / 'projects')
+        resolved['state_dir'].mkdir(parents=True)
+        resolved['history_path'].write_bytes(b'invented-corrupt-history')
+        before = resolved['history_path'].read_bytes()
+        code, _stdout, stderr = _cli(root)
+        model = json.loads((root / 'model.json').read_text())
+        expect('CLI history failure degrades without reset',
+               (code, model['totals']['input'], model['scope']['live_only'], resolved['history_path'].read_bytes()), (0, 255, True, before))
+        expect('CLI quiet retains history warning and counter',
+               (report.HISTORY_WARNING in stderr, model['quality'].get('history_unavailable')), (True, 1))
+        _account_file(root)
+        before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob('*') if p.is_file()}
+        code, stdout, _stderr = _cli(root, '--doctor')
+        after = {str(p): (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob('*') if p.is_file()}
+        expect('CLI doctor unavailable is read-only', (code, after == before), (1, True))
+        expect('CLI doctor no account identity', 'invented-identity' in stdout or 'invented-organization' in stdout, False)
+    with corpus(fixtures._b()) as (_built, _files, root):
+        expect('CLI doctor healthy corpus without state', _cli(root, '--doctor')[0], 0)
+        expect('CLI doctor creates no state', paths.resolve_paths(root / 'projects')['state_dir'].exists(), False)
+        expect('CLI version exits zero', _cli(root, '--version')[0], 0)
+        expect('CLI version creates no state', paths.resolve_paths(root / 'projects')['state_dir'].exists(), False)
+
+
+def test_analysis_prices_each_row_once():
+    with corpus(fixtures._b()) as (built, _files, _root):
+        with mock.patch.object(pricing, 'price_row', wraps=pricing.price_row) as quote:
+            analyze.analyze(built, now=NOW)
+            expect('one price_row per row per analysis', quote.call_count, len(built['rows']))
+
+
+def page_fixtures(destination):
+    """Invented CLI pages for the Node counterpart; no live data or browser."""
+    root, case, timed = Path(destination), fixtures._b(), cases.quota_W_timed()
+    for record in next(iter(timed['files'].values())):
+        if record['type'] == 'assistant':
+            record['message']['usage'].pop('output_tokens_details', None)
+    next(iter(timed['files'].values())).append(cases.quota_429('2026-09-10T20:30:00Z'))
+    case['files'].update(timed['files'])
+    cases.write_corpus(root / 'projects', case)
+    _account_file(root)
+    with fixtures.offline():
+        for public in (False, True):
+            for style, _label in render.STYLES:
+                suffix = style + ('-public' if public else '-local')
+                code, _stdout, _stderr = _cli(root, '--style', style,
+                    '--out', str(root / (suffix + '.html')), '--json', str(root / (suffix + '.json')),
+                    *(['--public'] if public else []))
+                if code:
+                    raise AssertionError('page fixture CLI failed')
+        _cli(root, '--metrics-only', '--out', str(root / 'metrics.html'))
+        _cli(root, '--since', '2026-10-01', '--out', str(root / 'empty.html'))
+        _cli(root, '--session', 'synthetic-session-B', '--out', str(root / 'complete.html'))
+        with mock.patch.dict(globals(), NOW=NOW+8*86400):
+            _cli(root, '--out', str(root / 'expired.html'))
+        scoped = copy.deepcopy(cases.quota_W_timed())
+        for record in next(iter(scoped['files'].values())):
+            if 'usageReport' in record:
+                record['usageReport']['rate_limits']['limits'][0]['kind'] = 'session'
+        scoped_root = root / 'scoped'
+        cases.write_corpus(scoped_root / 'projects', scoped)
+        _cli(scoped_root, '--out', str(root / 'weekly-missing.html'))
 
 
 def main():
