@@ -1223,9 +1223,488 @@ def _windows_main():
     return 1 if bad else 0
 
 
+# Round 8: independent share manifest. The four preceding sections are unchanged.
+SHARE_MANIFEST = {}
+
+
+def share_pair(name, test, function, mutation, assertion):
+    def decorate(factory):
+        SHARE_MANIFEST[name] = dict(test=test, function=function, mutation=mutation,
+                                    assertion=assertion, factory=factory)
+        return factory
+    return decorate
+
+
+def _share_source(original, old, new, all_occurrences=False):
+    source = inspect.getsource(original)
+    if old not in source or not all_occurrences and source.count(old) != 1:
+        raise ValueError('mutation source witness changed')
+    namespace = dict(original.__globals__)
+    exec(compile(source.replace(old, new), '<share mutation>', 'exec'), namespace)
+    return namespace[original.__name__]
+
+
+def _share_guard_flag(field):
+    def factory(original):
+        def changed(view, submissions):
+            view = copy.deepcopy(view)
+            view['coverage'][field] = True
+            return original(view, submissions)
+        return changed
+    return factory
+
+
+for _field in ('history_available', 'history_committed', 'token_bound'):
+    share_pair('month_guard_' + _field, 'test_month_guard_steps', 'history._month_failures',
+        'trust unchecked ' + _field, 'month guard ' + _field)(_share_guard_flag(_field))
+
+
+for _field in ('history_integrity_failed', 'history_schema_unsupported', 'history_commit_failed'):
+    def _share_integrity_counter_factory(original, field=_field):
+        def changed(view, submissions):
+            view = copy.deepcopy(view)
+            view['counters'][field] = 0
+            return original(view, submissions)
+        return changed
+    share_pair('month_guard_' + _field, 'test_month_guard_steps', 'history._month_failures',
+        'ignore the ' + _field + ' decision', 'month guard ' + _field)(_share_integrity_counter_factory)
+
+
+def _share_ignore_decrease(field):
+    def factory(original):
+        def changed(view, submissions):
+            submissions = copy.deepcopy(submissions)
+            for receipt in submissions:
+                for month in receipt['contributors']['months'].values():
+                    for row in month['responses'].values():
+                        row.get('counts', {})[field] = 0
+            return original(view, submissions)
+        return changed
+    return factory
+
+
+for _field in ('input', 'cached', 'output', 'reasoning'):
+    share_pair('month_guard_decreased_' + _field, 'test_month_guard_steps', 'history._month_failures',
+        'ignore submitted ' + _field + ' decreases', 'month guard decrease ' + _field)(_share_ignore_decrease(_field))
+
+
+@share_pair('month_guard_missing', 'test_month_guard_steps', 'history._month_failures',
+            'discard missing prior contributors', 'month guard missing contributor')
+def _share_missing(original):
+    def changed(view, submissions):
+        view, submissions = copy.deepcopy(view), copy.deepcopy(submissions)
+        keys = {r['response_key'] for r in view['rows']}
+        view['_retention']['captured'] = {k: v for k, v in view['_retention']['captured'].items() if k in keys}
+        for receipt in submissions:
+            for month in receipt['contributors']['months'].values():
+                month['responses'] = {k: v for k, v in month['responses'].items() if k in keys}
+                for session in month['sessions']:
+                    session['responses'] = [k for k in session['responses'] if k in keys]
+        return original(view, submissions)
+    return changed
+
+
+@share_pair('month_guard_calendar', 'test_month_guard_steps', 'history._month_failures',
+            'rewrite the prior frozen calendar', 'month guard frozen calendar')
+def _share_calendar(original):
+    def changed(view, submissions):
+        submissions = copy.deepcopy(submissions)
+        rows = {r['response_key']: r for r in view['rows']}
+        snapshot = original.__globals__['_row_snapshot']
+        for receipt in submissions:
+            for month in receipt['contributors']['months'].values():
+                for key, row in month['responses'].items():
+                    if key in rows:
+                        row['calendar'] = snapshot(rows[key])['calendar']
+        return original(view, submissions)
+    return changed
+
+
+@share_pair('month_guard_session_rows', 'test_month_guard_steps', 'history._month_failures',
+            'forget prior session evidence', 'month guard selected session evidence')
+@share_pair('month_guard_session_facts', 'test_month_guard_steps', 'history._month_failures',
+            'forget prior session facts', 'month guard selected session facts')
+def _share_session_evidence(original):
+    def changed(view, submissions):
+        submissions = copy.deepcopy(submissions)
+        for receipt in submissions:
+            for month in receipt['contributors']['months'].values():
+                month['sessions'] = []
+        return original(view, submissions)
+    return changed
+
+
+@share_pair('month_guard_unknown', 'test_month_guard_steps', 'history._month_failures',
+            'ignore outcome-unknown prepared receipts', 'unknown preparation guards decreased counts')
+def _share_unknown(original):
+    def changed(view, submissions):
+        submissions = [r for r in submissions if r['status'] != 'unknown']
+        return original(view, submissions)
+    return changed
+
+
+@share_pair('month_guard_retired', 'test_month_guard_steps', 'history._month_failures',
+            'keep deleted receipts active', 'retired receipts do not guard')
+def _share_retired(original):
+    return lambda view, submissions: original(view, [dict(r, status='confirmed') for r in submissions])
+
+
+@share_pair('month_withholding', 'test_month_withholding', 'share.build_payload',
+            'submit rows from a withheld month', 'unsafe month withheld whole')
+def _share_unsafe_month(original):
+    def changed(view, coverage, **kwargs):
+        coverage = dict(coverage, safe_months=sorted({r['local_day'][:7] for r in view['rows'] if r['local_day']}))
+        return original(view, coverage, **kwargs)
+    return changed
+
+
+@share_pair('windows_guard_coverage', 'test_window_omission_preserves_store_semantics', 'windows.wire_windows',
+            'replace windows despite unsafe coverage', 'unsafe windows omit whole key')
+def _share_unsafe_windows(original):
+    return _share_source(original, 'return None, reasons', "return [_wire_entry(w) for w in windows if w['shareable']], reasons")
+
+
+@share_pair('windows_retained_union', 'test_window_omission_preserves_store_semantics', 'share._window_union',
+            'drop published intervals on a new decline', 'published interval retained across new decline')
+@share_pair('windows_missing_evidence', 'test_window_advancement_decisions', 'share._window_union',
+            'ignore missing retained readings', 'unreproduced retained union omitted whole')
+def _share_no_retained_union(original):
+    return _share_source(original, "for receipt in coverage.get('_published', []):", 'for receipt in []:')
+
+
+@share_pair('windows_preserve_plan', 'test_window_union_and_plan_reassessment', 'share._window_union',
+            'keep a stale retained plan', 'retained window reevaluates plan')
+def _share_stale_plan(original):
+    def changed(entries, built, coverage, view):
+        out, evidence = original(entries, built, coverage, view)
+        old = {}
+        scope = original.__globals__
+        for r in coverage.get('_published', []):
+            for w in scope['json'].loads(r['payload']).get('windows', []):
+                old[scope['epoch'](w['start'])] = w.get('plan')
+        for w in out or []:
+            if scope['epoch'](w['start']) in old:
+                w['plan'] = old[scope['epoch'](w['start'])]
+        return out, evidence
+    return changed
+
+
+@share_pair('windows_new_union', 'test_window_union_and_plan_reassessment', 'share._window_union',
+            'prune new comparison windows from the union', 'window union retains W1 and adds W2')
+def _share_prune_union(original):
+    def changed(*args):
+        out, evidence = original(*args)
+        return out[:1] if out else out, evidence[:1]
+    return changed
+
+
+@share_pair('windows_advancement', 'test_window_advancement_decisions', 'share._advances',
+            'accept decreased window contributions', 'window cannot decrease input')
+@share_pair('windows_split_advancement', 'test_window_advancement_decisions', 'share._advances',
+            'accept decreased cache creation', 'window split cannot decrease cache_write_1h')
+def _share_ignore_advancement(original):
+    return lambda new, old: True
+
+
+@share_pair('windows_withheld_month', 'test_retained_window_touching_withheld_month', 'share._window_in_months',
+            'include window rows from withheld months', 'retained window cannot use withheld month')
+def _share_window_months(original):
+    return lambda window, rows, safe: True
+
+
+for _name, _limit, _assertion in [('count', 'MAX_WINDOWS', 'window count budget'),
+        ('rows', 'MAX_SPLIT_ROWS', 'window union budget is whole list'),
+        ('total', 'MAX_SPLIT_TOTAL', 'window total split budget')]:
+    def _window_cap_factory(original, limit=_limit):
+        return _share_source(original, 'share_validate.' + limit, '1000000000')
+    share_pair('windows_budget_' + _name, 'test_window_omission_preserves_store_semantics', 'share._window_budget',
+        'ignore the complete union ' + _name + ' cap', _assertion)(_window_cap_factory)
+
+
+@share_pair('windows_budget_in_builder', 'test_full_window_union_budget', 'share._window_budget',
+            'disable the complete window-list budget', 'oversized full union diagnostic')
+def _share_ignore_window_budget(original):
+    return lambda entries: False
+
+
+@share_pair('session_top_union', 'test_session_top_union', 'share.select_sessions',
+            'keep only the top active families', 'top ten union selects 1-10 and 12-21')
+def _share_top_active_only(original):
+    return _share_source(original, 'for s in active + tokens', 'for s in active')
+
+
+@share_pair('session_first_family_counts', 'test_session_top_union', 'share._days',
+            'erase first-capture family counts', 'top fixture daily counts')
+def _share_erase_day_sessions(original):
+    return _share_source(original, "sum(f['local_day'] == day for f in ledger['families'].values())", '0')
+
+
+@share_pair('session_domain', 'test_session_top_union', 'share.session_hash',
+            'use a different session hash domain', 'session domain separation')
+def _share_wrong_hash_domain(original):
+    return lambda family: original('wrong-domain:' + family)
+
+
+@share_pair('session_accepted_gaps', 'test_session_top_union', 'share.active_seconds',
+            'count every idle gap', 'unique end gaps and idle bound')
+def _share_all_gaps(original):
+    return _share_source(original, 'if 0 <= b - a <= 1800', 'if True')
+
+
+@share_pair('session_global_budget', 'test_session_selection_and_budgets', 'share.select_sessions',
+            'remove the global session cap', 'global session budget')
+def _share_no_session_cap(original):
+    return _share_source(original, 'return selected[:share_validate.MAX_SESSIONS]', 'return selected')
+
+
+@share_pair('session_newest_months', 'test_session_selection_and_budgets', 'share.select_sessions',
+            'rank oldest months first', 'newest first months win global cap')
+def _share_old_months(original):
+    return _share_source(original, 'sorted(months, reverse=True)', 'sorted(months)')
+
+
+@share_pair('session_span', 'test_session_selection_and_budgets', 'share._session_summary',
+            'include out-of-bounds spans', 'out of bounds sessions omitted')
+@share_pair('session_span_pure', 'test_session_summary_bounds_and_model', 'share._session_summary',
+            'include spans above 400 days', 'pure session span bound')
+def _share_no_span_cap(original):
+    return _share_source(original, 'end - start > share_validate.MAX_SPAN_S', 'False')
+
+
+@share_pair('session_active_cap', 'test_session_summary_bounds_and_model', 'share._session_summary',
+            'include more than 30 days of active time', 'pure session active bound')
+def _share_no_active_cap(original):
+    return _share_source(original, 'active > share_validate.MAX_ACTIVE_S', 'False')
+
+
+@share_pair('session_model_tie', 'test_session_summary_bounds_and_model', 'share._session_summary',
+            'reverse the dominant model tie-break', 'session dominant model lexical tie')
+def _share_model_tie(original):
+    return _share_source(original, 'model = min(models,', 'model = max(models,')
+
+
+@share_pair('payload_body_budget', 'test_payload_size_whole_month', 'share.build_payload',
+            'ignore both payload byte budgets', 'oversized month withheld whole')
+def _share_no_payload_cap(original):
+    return _share_source(original, 'share_validate.MAX_BODY_BYTES', '2000000000000', all_occurrences=True)
+
+
+@share_pair('payload_day_budget', 'test_payload_size_whole_month', 'share.build_payload',
+            'ignore both whole-month day budgets', 'day budget withholds oldest whole month')
+def _share_no_day_cap(original):
+    return _share_source(original, 'share_validate.MAX_DAYS', '1000000', all_occurrences=True)
+
+
+@share_pair('payload_input_bound', 'test_payload_size_whole_month', 'share.build_payload',
+            'keep a month over the per-day input cap', 'input bound withholds whole month')
+def _share_no_input_cap(original):
+    return _share_source(original, "d['input'] > 20000000000", 'False')
+
+
+@share_pair('cache_creation', 'test_cache_creation_subset', 'share_validate.validate_payload',
+            'skip cache creation within uncached input', 'cache creation rejected')
+def _share_no_cache_check(original):
+    return lambda *args, **kwargs: [i for i in original(*args, **kwargs) if i != 'split_cache_write']
+
+
+@share_pair('tier_parent', 'test_known_tier_subset', 'share_validate.validate_payload',
+            'allow a tier above the day input', 'tier counts within parent')
+def _share_no_tier_check(original):
+    return lambda *args, **kwargs: [i for i in original(*args, **kwargs) if i != 'tier_input_total']
+
+
+@share_pair('speed_partition', 'test_unknown_speed_shared_count', 'share._days',
+            'default missing recorded speed to Standard', 'known day tier is partial')
+def _share_standard_default(original):
+    return _share_source(original, "r['tier'] == t", "(r['tier'] or 'standard') == t", all_occurrences=True)
+
+
+@share_pair('speed_disclosure', 'test_unknown_speed_shared_count', 'share.build_payload',
+            'hide unrecorded shared speed', 'dry run missing speed count')
+def _share_hide_speed(original):
+    def changed(*args, **kwargs):
+        payload, notes = original(*args, **kwargs)
+        notes['speed_unrecorded'] = 0
+        return payload, notes
+    return changed
+
+
+@share_pair('latency_group_budget', 'test_latency_group_budgets', 'share._latency_with_counters',
+            'remove the mixed-group cap', 'independent latency group budgets')
+def _share_no_mixed_cap(original):
+    return _share_source(original, "lat['groups'][:50]", "lat['groups']")
+
+
+@share_pair('latency_tier_group_budget', 'test_latency_group_budgets', 'share._latency_with_counters',
+            'remove the tier-group cap', 'independent latency group budgets')
+def _share_no_tier_group_cap(original):
+    return _share_source(original, "lat['tier_groups'][:50]", "lat['tier_groups']")
+
+
+@share_pair('latency_diagnostics', 'test_shared_timing_diagnostics', 'share._latency_with_counters',
+            'discard shared timing diagnostics', 'shared timing unknown speed diagnostic')
+def _share_drop_timing_diagnostics(original):
+    def changed(*args, **kwargs):
+        value, _counters = original(*args, **kwargs)
+        return value, {}
+    return changed
+
+
+@share_pair('validator_json_integer_values', 'test_json_number_and_instant_semantics', 'share_validate._number',
+            'reject integral JSON floats', 'JSON integer floats mirror JavaScript')
+@share_pair('report_json_literal_value', 'test_json_number_and_instant_semantics', 'share_validate._number',
+            'reject schema 1.0 despite JSON numeric equality', 'report JSON literal numeric equality')
+def _share_reject_json_integral_floats(original):
+    def changed(value, *args, **kwargs):
+        if kwargs.get('integer') and type(value) is float:
+            return False
+        return original(value, *args, **kwargs)
+    return changed
+
+
+@share_pair('validator_boolean_zero_turn', 'test_json_number_and_instant_semantics', 'share_validate._latency_shape',
+            'interpret false as a zero-turn summary', 'Boolean zero turn is rejected')
+def _share_bool_zero_turn(original):
+    return _share_source(original, "_number(t.get('n')) and ", '')
+
+
+@share_pair('validator_instant_milliseconds', 'test_json_number_and_instant_semantics', 'share_validate._instant',
+            'compare microseconds beyond Date.parse precision', 'server millisecond future boundary')
+def _share_microsecond_precision(original):
+    return _share_source(original, 'delta.microseconds // 1000', 'delta.microseconds / 1000')
+
+
+@share_pair('validator_year_zero', 'test_json_number_and_instant_semantics', 'share_validate._instant',
+            'reject the server ISO year-zero calendar', 'ISO year zero follows server calendar')
+def _share_no_year_zero(original):
+    return lambda value: None if isinstance(value, str) and value.startswith('0000') else original(value)
+
+
+@share_pair('withheld_session_diagnostics', 'test_withheld_session_diagnostic_selection', 'share._withheld_session_count',
+            'count an unselected family as withheld', 'withheld sessions count selected family 110')
+def _share_count_all_withheld_families(original):
+    return lambda rows, families, safe: len({r['family_id'] for r in rows if r['family_id'] is not None
+                                          and (not r['local_day'] or r['local_day'][:7] not in safe)})
+
+
+@share_pair('endpoint_token_separation', 'test_endpoint_binding_decisions', 'share._endpoint_entry',
+            'reuse another endpoint token', 'pure endpoint token separation')
+def _share_first_endpoint(original):
+    return lambda state, endpoint: next(iter(state['endpoints'].values()), {})
+
+
+@share_pair('history_uuid_binding', 'test_endpoint_binding_decisions', 'share._check_binding',
+            'trust a token from different history', 'mismatched history UUID refuses')
+@share_pair('history_receipt_binding', 'test_endpoint_binding_decisions', 'share._check_binding',
+            'trust a receipt binding mismatch', 'unbound receipt refuses')
+def _share_ignore_binding(original):
+    return lambda entry, store, coverage: True
+
+
+@share_pair('endpoint_normalization', 'test_normalized_endpoint_decisions', 'share.normalize_endpoint',
+            'keep endpoint aliases separate', 'pure endpoint normalization')
+def _share_no_normalization(original):
+    return lambda value: value
+
+
+@share_pair('endpoint_https', 'test_normalized_endpoint_decisions', 'share.normalize_endpoint',
+            'allow HTTP beyond loopback', 'HTTP outside loopback refuses')
+def _share_http_nonloopback(original):
+    return _share_source(original, "u.scheme == 'http' and not loopback", 'False')
+
+
+def _evaluate_share(suite, entry, factory=None):
+    def run():
+        suite.RESULTS.clear()
+        try:
+            with suite.offline():
+                getattr(suite, entry['test'])()
+        except BaseException as exc:
+            return list(suite.RESULTS), exc.__class__.__name__
+        return list(suite.RESULTS), None
+    before, error = run()
+    named = entry['assertion']
+    if error or not before or any(not ok for _n, ok, _d in before) or not any(n == named for n, _ok, _d in before):
+        return False, 'invalid mutation: baseline did not pass its designated assertion'
+    module_name, function_name = entry['function'].split('.')
+    module = {'share': suite.share, 'share_validate': suite.share_validate,
+              'history': suite.history, 'windows': suite.windows}[module_name]
+    original = getattr(module, function_name)
+    state = {'calls': 0, 'error': None}
+    try:
+        mutation = (factory or entry['factory'])(original)
+    except BaseException as exc:
+        return False, 'invalid mutation: setup ' + exc.__class__.__name__
+    def instrumented(*args, **kwargs):
+        state['calls'] += 1
+        try:
+            return mutation(*args, **kwargs)
+        except BaseException as exc:
+            state['error'] = exc.__class__.__name__
+            raise
+    setattr(module, function_name, instrumented)
+    try:
+        after, error = run()
+    finally:
+        setattr(module, function_name, original)
+    if state['error'] or error:
+        return False, 'invalid mutation: exception ' + (state['error'] or error)
+    if not state['calls']:
+        return False, 'invalid mutation: decision did not execute'
+    if not any(n == named and not ok for n, ok, _d in after):
+        return False, 'invalid mutation: designated assertion did not fail'
+    return True, 'caught by: ' + named
+
+
+def _share_main():
+    spec = importlib.util.spec_from_file_location('test_claude_share', str(Path(__file__).with_name('test_claude_share.py')))
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    for issue, test in suite.VALIDATION_DECISIONS.items():
+        def factory(original, clause=issue):
+            return lambda *args, **kwargs: [i for i in original(*args, **kwargs) if i != clause]
+        share_pair('validator_' + issue, test, 'share_validate.validate_payload',
+            'skip the ' + issue + ' clause', 'local validation rejects ' + issue)(factory)
+    for issue, test in suite.REPORT_VALIDATION_DECISIONS.items():
+        def factory(original, clause=issue):
+            return lambda *args, **kwargs: [i for i in original(*args, **kwargs) if i != clause]
+        share_pair('report_validator_' + issue, test, 'share_validate.validate_report',
+            'skip the ' + issue + ' clause', 'local report validation rejects ' + issue)(factory)
+    missing = set(suite.SHARE_DECISIONS) - {entry['test'] for entry in SHARE_MANIFEST.values()}
+    if missing:
+        print('[FAIL] missing share mutation pairs: ' + ', '.join(sorted(missing)))
+        return 1
+    witness = SHARE_MANIFEST['endpoint_token_separation']
+    for exception in (RuntimeError, ImportError):
+        def factory(original):
+            def crash(*args, **kwargs):
+                raise exception('invented mutation failure')
+            return crash
+        ok, reason = _evaluate_share(suite, witness, factory)
+        if ok or 'invalid mutation: exception ' not in reason:
+            print('[FAIL] share mutation exception self-test')
+            return 1
+    noop, _ = _evaluate_share(suite, witness, lambda original: original)
+    unrelated_entry = dict(witness, function='share._check_binding')
+    unrelated, unrelated_reason = _evaluate_share(suite, unrelated_entry, lambda original: lambda *args: True)
+    if noop or unrelated or unrelated_reason != 'invalid mutation: designated assertion did not fail':
+        print('[FAIL] share mutation sensitivity self-test')
+        return 1
+    print('[PASS] crashes, import errors, no-ops and unrelated failures are invalid mutations')
+    bad = 0
+    for name, entry in sorted(SHARE_MANIFEST.items()):
+        ok, reason = _evaluate_share(suite, entry)
+        bad += int(not ok)
+        print('[%s] %s -> %s -> %s\n        %s' %
+              ('PASS' if ok else 'FAIL', name, entry['function'], entry['mutation'], reason))
+    print('\n%d/%d share mutations caught' % (len(SHARE_MANIFEST) - bad, len(SHARE_MANIFEST)))
+    return 1 if bad else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--section', choices=('ledger', 'retention', 'pricing', 'windows'), default='ledger')
+    parser.add_argument('--section', choices=('ledger', 'retention', 'pricing', 'windows', 'share'), default='ledger')
     args = parser.parse_args(argv)
     if args.section == 'retention':
         return _retention_main()
@@ -1233,6 +1712,8 @@ def main(argv=None) -> int:
         return _pricing_main()
     if args.section == 'windows':
         return _windows_main()
+    if args.section == 'share':
+        return _share_main()
     missing = set(tests.LEDGER_TESTS) - set(MANIFEST)
     if missing:
         print('[FAIL] missing ledger mutation pairs: ' + ', '.join(sorted(missing)))

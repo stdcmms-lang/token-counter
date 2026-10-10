@@ -2,6 +2,7 @@
 """Claude Code Token Report: captured local usage, timing and offline API list value."""
 import argparse
 import concurrent.futures as cf
+import contextvars
 import datetime
 import functools
 import json
@@ -22,6 +23,7 @@ from tokencounter.models import LedgerResult, bump  # noqa: E402
 
 DEFAULT_ENDPOINT = 'https://tokenusage.dev/api'
 HISTORY_WARNING = 'History unavailable: showing live captured usage only; sharing is disabled.'
+RECEIPT_ENDPOINT = contextvars.ContextVar('claude_share_endpoint', default=None)
 
 
 def parse_args(argv=None):
@@ -105,18 +107,29 @@ def _extract(files, options):
 
 
 def _receipt_binding(resolved):
-    """Only endpoint and opaque receipt binding are needed; tokens never enter a model."""
+    """Read share.py's schema-1 state; only the opaque binding enters coverage.
+
+    A share selects its endpoint for this collection through RECEIPT_ENDPOINT. A
+    normal report uses the last saved active endpoint. No legacy key guessing.
+    """
+    endpoint = RECEIPT_ENDPOINT.get() or DEFAULT_ENDPOINT
     try:
         with open(resolved['share_state_path'], 'rb') as fh:
             state = json.load(fh)
-        endpoint = state.get('endpoint') or state.get('api') or DEFAULT_ENDPOINT
-        binding = state.get('token_binding')
-        entry = (state.get('endpoints') or {}).get(endpoint) or {}
-        binding = entry.get('token_binding', binding)
-        return (endpoint if isinstance(endpoint, str) and endpoint else DEFAULT_ENDPOINT,
-                binding if isinstance(binding, str) else None)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return DEFAULT_ENDPOINT, None
+        if (not isinstance(state, dict) or set(state) != {'schema', 'active_endpoint', 'endpoints'}
+                or type(state['schema']) is not int or state['schema'] != 1
+                or not isinstance(state['endpoints'], dict)
+                or not isinstance(state['active_endpoint'], str) or not state['active_endpoint']):
+            return endpoint, None
+        if RECEIPT_ENDPOINT.get() is None:
+            endpoint = state['active_endpoint']
+        entry = state['endpoints'].get(endpoint, {})
+        if (not isinstance(entry, dict) or set(entry) != {'token', 'handle', 'history_uuid', 'token_binding'}
+                or any(not isinstance(v, str) or not v for v in entry.values())):
+            return endpoint, None
+        return endpoint, entry['token_binding']
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return endpoint, None
 
 
 def collect(options, *, now=None) -> LedgerResult:
