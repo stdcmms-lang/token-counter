@@ -435,11 +435,11 @@ local-only checks relative to this harness. The parity suite records that limita
 explicitly; passing it does not verify route authentication, storage, deployment,
 live estimator behavior or actual transport.
 
-The schema-1 Claude observation-span meaning below is an **owner decision that
-has been put to the owner and is assumed accepted** by this client. Codex's meanings
-remain established. `docs/share-protocol.md` belongs to the tokenusage.dev repository
-and is not created here. These exact amendment paragraphs from owner questions
-1–5 are quoted for the owner to paste into that protocol document:
+The schema-1 Claude observation-span meaning below is an **owner decision,
+accepted by the owner on 2026-10-11**. Codex's meanings remain established.
+`docs/share-protocol.md` belongs to the tokenusage.dev repository and is not
+created here; these exact amendment paragraphs from owner questions 1–5 are
+the accepted text for that protocol document under schema 1:
 
 > For clients `claude-usage` and `claude-usage-example`, a weekly-all entry describes a captured observation interval within one reset cluster. `start` is the nominal seven-day quota anchor inferred as the canonical reset minus seven days; it is not proof that the quota opened at that instant. `window_minutes` is 10080. `first_pct` is the earliest sourced percentage and `peak_pct` is the highest sourced percentage. Responses and token counts include only captured canonical responses ending strictly after the first observation and at or before the earliest observation attaining the peak. Repeated plateau readings do not extend this interval. Missing endpoints, declining or conflicting readings, partial response usage and unavailable nonzero cache-write TTL splits are not submitted as new comparison windows. Missing recorded speed remains unknown; those responses stay in totals but outside recognized splits.
 
