@@ -567,8 +567,12 @@ conditional, not bounds on missing/unpriced activity. Partial speed partitions c
 exclude a valid shared window from the current estimator. Known server pricing
 defects remain owner corrections (§11/§13).
 
-The new remote CI matrix has not been executed during this local round; the local
-acceptance run does not verify every configured runner/interpreter combination.
+The remote CI matrix first ran on the merge of PR #3 (2026-10-11). The four Ubuntu
+cells passed; the macOS cell and both Windows cells failed four assertions in
+`test_claude_ledger.py` whose expected paths were spelled unresolved while the code
+resolves (`/private/var` behind `/var` on macOS, the 8.3 name `RUNNER~1` in the Windows
+runner's temp directory). Those tests now resolve the temp directory first. The local
+acceptance run still does not verify every configured runner/interpreter combination.
 
 Implementation differences from the plan, kept explicit:
 
