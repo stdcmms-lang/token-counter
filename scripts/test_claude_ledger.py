@@ -539,6 +539,9 @@ def test_paths_default() -> None:
 
 def test_paths_config_dir() -> None:
     with tempfile.TemporaryDirectory() as temp:
+        # resolve_paths() resolves its inputs; a temp root under a symlink (/var on macOS) or
+        # an 8.3 short name (RUNNER~1 on Windows runners) must be compared in resolved form.
+        temp = Path(temp).resolve()
         home, config = Path(temp) / 'home', Path(temp) / 'config'
         resolved = paths.resolve_paths(env={'CLAUDE_CONFIG_DIR': str(config)}, home=home)
         expect('configured paths', (resolved['sessions_root'], resolved['account_path'], resolved['state_dir']),
@@ -549,6 +552,7 @@ def test_paths_config_dir() -> None:
 
 def test_paths_explicit_namespace() -> None:
     with tempfile.TemporaryDirectory() as temp:
+        temp = Path(temp).resolve()  # as in test_paths_config_dir
         home, root = Path(temp) / 'home', Path(temp) / 'copy/projects'
         resolved = paths.resolve_paths(root, env={'CLAUDE_CONFIG_DIR': str(home)}, home=home)
         # Q10: SHA256 of normcase(resolved root), first 12 hex characters.
@@ -916,6 +920,9 @@ def test_facts_contain_no_content() -> None:
 
 def test_discover_outside_root_links() -> None:
     with tempfile.TemporaryDirectory() as temp:
+        # discover() walks the resolved root, so the simulated link below must be spelled the
+        # way resolve() spells it, or the patch never matches it (see test_paths_config_dir).
+        temp = Path(temp).resolve()
         root = Path(temp) / 'projects'
         written = cases.write_corpus(root, _case([_r1()]))
         link = root / 'synthetic-project/outside.jsonl'
