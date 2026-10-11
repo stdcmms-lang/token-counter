@@ -511,7 +511,7 @@ def test_report_B_and_W():
                    'recorded input' in stdout, 'Claude Code Token Report' in page, stderr), (0, True, True, True, ''))
             expect('CLI escaped local account ' + label,
                    'invented-identity&lt;&amp;&gt;@example.invalid' in page and 'invented-identity<&>' in stdout, True)
-            expect('CLI complete thinking note ' + label, 'recorded thinking tokens · unavailable' in page, False)
+            expect('CLI one-line thinking note ' + label, ('thinking tokens</div>' in page, 'unavailable for' in page), (True, False))
             expect('CLI postcommit history coverage ' + label,
                    (model['coverage']['history_available'], model['coverage']['history_committed'],
                     model['coverage']['safe_months']), (True, True, ['2026-09']))

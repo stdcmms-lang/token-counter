@@ -364,11 +364,16 @@ it does not compensate or withhold otherwise shareable windows for those differe
 
 ## 12. Report profiles and public sanitization
 
-Claude's profile supplies title/kickers, recorded input/cache/output notes,
-largest-session label, API list-value wording, UTF-8 inventory labels and fixed
-coverage/price/plan assumptions. Legacy `profile=None` remains byte-identical to
-the frozen Codex renderer. Clinical, Matisse and Nocturne share the same data,
-viewport and interactions. Sparse quota marks stay points. The limit metric
+Claude's profile supplies title/kickers, one-line tile notes (response count,
+thinking-token and cache-read totals, list-price wording, stream count and the
+expired-reading text), the largest-session label and the UTF-8 inventory labels.
+The page has no standing-notes block: the coverage, price and plan assumptions
+live in this document, the JSON counters and the terminal summary. Legacy
+`profile=None` remains byte-identical to the frozen Codex renderer. Clinical,
+Matisse and Nocturne share the same data, viewport and interactions. Sparse quota
+marks stay points; the inferred nominal start is a dashed boundary, and the share's
+observation span (§9, §13) is a JSON and share fact that the chart does not draw.
+The limit metric
 selector opens on recorded tokens and can show API list value, both across the
 nominal interval; it is not a new panel. Curves are bounded/downsampled to 120
 points per window while sourced reading points are retained. No quality/history
@@ -588,6 +593,13 @@ Implementation differences from the plan, kept explicit:
 - The planned `scripts/verify_claude_schema.py` shape survey is not in
   the round-8 tree. This round does not add a new corpus survey; tests and existing
   captured evidence are the basis for documented shape claims.
+- At the owner's request after the first installed run (2026-10-11), the page
+  omits the plan's fixed standing notes and historical-plan notes, keeps every
+  tile note to one line, and no longer draws the observation span along the limit
+  chart's baseline, where it read as a 0% line. The span timestamps left the page
+  payload with it. The span, the cache-write split, the responses without recorded
+  thinking and the pricing assumptions remain in the JSON model, the terminal
+  summary and this document.
 - Report `--quiet` suppresses its own progress/timing text, so the prescribed quiet
   report commands have no CLI timing line. Wall-clock timing is reported separately;
   share's collection/total line remains present. Output bytes are not changed to

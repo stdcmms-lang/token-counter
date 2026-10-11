@@ -518,7 +518,6 @@ class RenderProfile(TypedDict):
     limit_source_note: str
     expired_reading: str
     anchor_tooltip: str
-    observation_tooltip: str
     refusal_tooltip: str
     percentage_legend: str
     limit_metric: str
@@ -528,7 +527,6 @@ class RenderProfile(TypedDict):
     timing_note: str
     price_source_note: str
     brand_link: Optional[str]
-    standing_notes: List[str]
 
 
 class ReportModel(TypedDict):

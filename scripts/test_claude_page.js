@@ -52,28 +52,18 @@ const legacy = ['Codex Token Report','Codex usage','recorded by Codex','Longest 
 const exact = ['Claude Code Token Report','Claude Code usage, recorded locally',
   'Papiers découpés — Claude Code usage, cut from local records',
   'Nocturne in blue and gold — Claude Code usage, recorded locally',
-  'base input + cache writes + cache reads · 7 responses',
-  '7 recorded thinking tokens · unavailable for 5 responses',
-  '690 read · 40 5m writes · 170 1h writes · 0 writes with unknown TTL',
-  '2 streams','Largest session','API list value',
-  'captured usage at Anthropic list prices; assumptions and exclusions in JSON and the terminal summary',
+  '<div class="n">7 responses</div>','<div class="n">7 thinking tokens</div>','<div class="n">690 cache reads</div>',
+  '2 streams','Largest session','API list value','<div class="n">at Anthropic list prices</div>',
   'Visible text inventory','UTF-8 bytes in view','visible text inventory by category',
   'No captured text bytes in the visible range.','Text inventory was skipped with --metrics-only.',
   'weekly all-model','No weekly all-model readings in range.','No structured limit readings in range.',
-  'last recorded weekly reading','Reset since the last weekly reading; no current percentage recorded.',
+  'last recorded weekly reading','no reading since the reset',
   'nominal seven-day start, inferred from reset',
-  'captured usage between the first reading and the first peak reading',
   'recorded /usage and weekly 429 points','weekly 429 refusal: 100%, assumed all-model',
   'Recorded tokens','cumulative recorded input and output per nominal weekly window',
   'Response time is the interval from the last known prompt-side record to the last response record.',
   'Anthropic API price table · 2026-10-10 · vendored locally',
-  'Byte shares describe captured text and saved snapshots. They are not Claude token shares or a reconstruction of the full API prompt.',
-  'Recorded input includes base input, cache creation and cache reads. Recorded output already includes thinking when that subset is available.',
-  'Captured usage can omit calls without transcript usage, activity on other devices, and transcripts removed before the first capture.',
-  'Quota points are sparse recorded readings. The report does not derive quota percentages from tokens.',
-  'API list value is a comparison at the vendored price table, not a bill. Missing settings, fees and unpriced models are shown separately.',
-  'Historical plan labels use captured account observations and subscriptionCreatedAt; they are not plan records recovered from transcripts.',
-  'A plan change that leaves subscriptionCreatedAt unchanged is not detectable until a later run observes the new tier. A window that ended before that run can therefore carry the old plan.'];
+  'Byte shares describe captured text and saved snapshots. They are not Claude token shares or a reconstruction of the full API prompt.'];
 try {
   const py = `import sys\nsys.path.insert(0, ${JSON.stringify(path.join(REPO,'scripts'))})\nimport test_claude_pipeline as tp\ntp.page_fixtures(${JSON.stringify(temp)})`;
   execFileSync(process.env.PYTHON || 'python',['-I','-S','-B','-c',py],{cwd:REPO,stdio:'inherit'});
@@ -84,6 +74,8 @@ try {
     check(label+' exact Claude strings',exact.every(s=>html.includes(s)));
     if(exact.some(s=>!html.includes(s))) console.log('        missing: '+exact.filter(s=>!html.includes(s)).join(' | '));
     check(label+' legacy strings absent',legacy.every(s=>!html.includes(s)));
+    check(label+' no standing notes and no observation span',!html.includes('standing-notes')&&!html.includes('standing_notes')
+      &&!html.includes('observation_tooltip')&&!html.includes('data-observation'));
     const anchor='<a href="https://tokenusage.dev">tokenusage.dev</a>';
     check(label+' fixed brand anchor exactly once',html.split(anchor).length===2 && (html.match(/<a\s+href=/g)||[]).length===1);
     check(label+' no external runtime reference',!(/https?:\/\/|<script[^>]+src\s*=|\bimport\s*\(|\bfetch\s*\(|XMLHttpRequest|WebSocket|sendBeacon|<form[^>]*(?:action|target)/i.test(html.replace(anchor,''))));
@@ -95,13 +87,13 @@ try {
     const pointCount=wins.reduce((n,w)=>n+w.pct_points.length,0);
     check(label+' safe embedded chart data',data.profile.sparse_limit_points && data.profile.limit_metric==='tokens'
       && wins.every(w=>w.anchor_inferred&&w.reset_inferred&&w.cum_points.every(p=>p.length===4)
-        && w.observation_start!=null&&w.observation_end!=null));
+        && w.observation_start===undefined&&w.observation_end===undefined));
     check(label+' nominal cumulative input plus output',JSON.stringify(run('metricPoints(WINS[0]).map(p=>p[1])'))==='[110,330,660,1100,1650]');
     check(label+' sparse percentage circles, no interpolated quota path',scene().list.filter(m=>m.t==='point').length===pointCount
-      && !scene().list.some(m=>m.t==='line'&&m.c==='--warn'&&!m.observation)
+      && !scene().list.some(m=>m.t==='line'&&m.c==='--warn')
       && (hosts.rlchart.innerHTML.match(/data-limit-point=/g)||[]).length===pointCount);
-    check(label+' inferred nominal mark and observation mark',scene().list.some(m=>m.nominal)&&scene().list.some(m=>m.observation)
-      && hosts.rlchart.innerHTML.includes('data-nominal="inferred"')&&hosts.rlchart.innerHTML.includes('data-observation="span"'));
+    check(label+' inferred nominal mark, no observation mark',scene().list.some(m=>m.nominal)&&!scene().list.some(m=>m.observation)
+      && hosts.rlchart.innerHTML.includes('data-nominal="inferred"')&&!hosts.rlchart.innerHTML.includes('data-observation'));
     check(label+' sourced 429 tooltip',hosts.rlchart.innerHTML.includes('weekly 429 refusal: 100%, assumed all-model'));
     const refusal=wins[0].readings.find(r=>r.source==='quota_429');
     wins[0].readings.unshift({...refusal,source:'usage_report'});run('redraw()');flush();
@@ -109,9 +101,14 @@ try {
     const N3=run('N3'),cx={col:()=>[1,1,1,1],measure:(s,f,h)=>String(s).length*h*.55};
     const mesh=N3.windows(scene(),{vmax:run('VMAX'),wins,tk:[],view:run('VIEW')},cx);
     check(label+' Nocturne discrete point geometry and inferred marks',mesh.hits.filter(h=>h.reading!=null).length===pointCount
-      && mesh.hits.some(h=>h.nominal)&&mesh.hits.some(h=>h.observation)&&mesh.solid.length>0);
-    const longNotes=[data.profile.input_tile_note,data.profile.output_tile_note,data.profile.cache_tile_note,
-      data.profile.api_tile_note,data.profile.sessions_unit,data.profile.api_tile_note];
+      && mesh.hits.some(h=>h.nominal)&&!mesh.hits.some(h=>h.observation)&&mesh.solid.length>0);
+    // The page's own notes are one line each now; the scene must still wrap a long one.
+    const longNotes=['base input plus cache writes plus cache reads over 7 responses',
+      '7 recorded thinking tokens, unavailable for 5 responses',
+      '690 read, 40 five-minute writes, 170 one-hour writes, 0 writes with unknown TTL',
+      'captured usage at list prices; assumptions and exclusions in the JSON and the terminal summary',
+      data.profile.sessions_unit,
+      'captured usage at list prices; assumptions and exclusions in the JSON and the terminal summary'];
     const ledgerMesh=N3.ledger({title:data.profile.title,kicker:'k',dek:'d',brand:'tokenusage.dev',
       tiles:longNotes.map((n,i)=>({k:'tile'+i,v:'123',n}))},cx);
     const tileNotes=ledgerMesh.words.filter(w=>w.h===.25&&w.y>0);
@@ -151,9 +148,9 @@ try {
   check('missing weekly tile never claims a last weekly reading',weeklyHtml.includes('<div class="n">No weekly all-model readings in range.</div>')
     && !weeklyHtml.includes('<div class="n">last recorded weekly reading</div>'));
   const complete=fs.readFileSync(path.join(temp,'complete.html'),'utf8');
-  check('complete recorded thinking note',complete.includes('<div class="n">7 recorded thinking tokens</div>'));
+  check('complete thinking note is one line',complete.includes('<div class="n">7 thinking tokens</div>')&&!complete.includes('unavailable for'));
   const expired=fs.readFileSync(path.join(temp,'expired.html'),'utf8');
-  check('expired reading tile',expired.includes('<div class="v">&mdash;</div><div class="n">Reset since the last weekly reading; no current percentage recorded.</div>'));
+  check('expired reading tile',expired.includes('<div class="v">&mdash;</div><div class="n">no reading since the reset</div>'));
 } finally {
   // The only recursive deletion is the exact temporary directory created above.
   if(path.dirname(path.resolve(temp))!==path.resolve(os.tmpdir())) throw Error('temporary boundary');

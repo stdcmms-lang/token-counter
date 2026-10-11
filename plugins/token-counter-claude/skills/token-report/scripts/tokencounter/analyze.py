@@ -13,6 +13,7 @@ import time
 from . import composition, latency, pricing, windows
 from .ledger import _day, _day_span, _family_summary, _iso, _local_day, epoch
 from .models import COUNTER_NAMES, RenderProfile, ReportModel, bump
+from .render import big
 
 CAT_BUCKET_S = 3600
 MAX_POINTS = 120        # chart points per window, as Codex's analyzer caps them
@@ -541,20 +542,7 @@ def claude_profile(model) -> RenderProfile:
     """All Claude wording and chart choices, kept out of the shared defaults."""
     t = model['totals']
     number = lambda n: format(n or 0, ',')
-    output_note = '{n} recorded thinking tokens'.format(n=number(t['reasoning']))
-    if t.get('thinking_unavailable'):
-        output_note += ' · unavailable for {m} responses'.format(m=number(t['thinking_unavailable']))
-    notes = [
-        'Recorded input includes base input, cache creation and cache reads. Recorded output already includes thinking when that subset is available.',
-        'Captured usage can omit calls without transcript usage, activity on other devices, and transcripts removed before the first capture.',
-        'Quota points are sparse recorded readings. The report does not derive quota percentages from tokens.',
-        'API list value is a comparison at the vendored price table, not a bill. Missing settings, fees and unpriced models are shown separately.',
-    ]
-    if model.get('latency', {}).get('plan') or model.get('rate_limits', {}).get('plans'):
-        notes.extend([
-            'Historical plan labels use captured account observations and subscriptionCreatedAt; they are not plan records recovered from transcripts.',
-            'A plan change that leaves subscriptionCreatedAt unchanged is not detectable until a later run observes the new tier. A window that ended before that run can therefore carry the old plan.',
-        ])
+    # Every tile note is one short line; the counters behind it stay in the JSON.
     return {
         'vendor': 'claude', 'title': 'Claude Code Token Report',
         'kickers': {
@@ -563,15 +551,14 @@ def claude_profile(model) -> RenderProfile:
             'nocturne': 'Nocturne in blue and gold — Claude Code usage, recorded locally',
         },
         'recorded_by': 'Claude Code', 'input_tile_label': 'Recorded input',
-        'input_tile_note': 'base input + cache writes + cache reads · {n} responses'.format(n=number(t['responses'])),
-        'output_tile_label': 'Output', 'output_tile_note': output_note,
+        'input_tile_note': '{n} responses'.format(n=number(t['responses'])),
+        'output_tile_label': 'Output',
+        'output_tile_note': '{n} thinking tokens'.format(n=big(t['reasoning'] or 0)),
         'cache_tile_label': 'Cache hit',
-        'cache_tile_note': '{reads} read · {w5} 5m writes · {w1} 1h writes · {unknown} writes with unknown TTL'.format(
-            reads=number(t['cached']), w5=number(t.get('cache_write_5m')),
-            w1=number(t.get('cache_write_1h')), unknown=number(t.get('cache_write_unknown'))),
+        'cache_tile_note': '{n} cache reads'.format(n=big(t['cached'] or 0)),
         'sessions_unit': '{n} streams'.format(n=number(t['threads'])),
         'largest_session_label': 'Largest session', 'api_tile_label': 'API list value',
-        'api_tile_note': 'captured usage at Anthropic list prices; assumptions and exclusions in JSON and the terminal summary',
+        'api_tile_note': 'at Anthropic list prices',
         'composition_title': 'Visible text inventory', 'composition_unit': 'UTF-8 bytes in view',
         'composition_accessibility': 'visible text inventory by category',
         'composition_empty': 'No captured text bytes in the visible range.',
@@ -581,9 +568,8 @@ def claude_profile(model) -> RenderProfile:
         'missing_weekly': 'No weekly all-model readings in range.',
         'missing_limits': 'No structured limit readings in range.',
         'limit_source_note': 'last recorded weekly reading',
-        'expired_reading': 'Reset since the last weekly reading; no current percentage recorded.',
+        'expired_reading': 'no reading since the reset',
         'anchor_tooltip': 'nominal seven-day start, inferred from reset',
-        'observation_tooltip': 'captured usage between the first reading and the first peak reading',
         'refusal_tooltip': 'weekly 429 refusal: 100%, assumed all-model',
         'percentage_legend': 'recorded /usage and weekly 429 points',
         'limit_metric': 'tokens', 'limit_metric_choices': ['tokens', 'usd'],
@@ -592,5 +578,5 @@ def claude_profile(model) -> RenderProfile:
         'timing_note': 'Response time is the interval from the last known prompt-side record to the last response record.',
         'price_source_note': 'Anthropic API price table · {as_of} · vendored locally'.format(
             as_of=model['api_value'].get('as_of') or 'unavailable'),
-        'brand_link': 'https://tokenusage.dev', 'standing_notes': notes,
+        'brand_link': 'https://tokenusage.dev',
     }

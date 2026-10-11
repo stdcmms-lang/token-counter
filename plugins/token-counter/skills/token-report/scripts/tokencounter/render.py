@@ -3613,12 +3613,6 @@ function drawRL(tk){
       s += `<path d="${d} L ${line[line.length-1][0]} ${y(0)} Z" fill="var(--uncached)" fill-opacity=".16" class="mk"/>`;
       s += `<path d="${d}" fill="none" stroke="var(--uncached)" stroke-width="1.8" class="mk"><title>${esc(tip)}</title></path>`;
     }
-    if(w.observation_start != null && w.observation_end != null){
-      const a = X(w.observation_start), b = X(w.observation_end), yy = H-B-5;
-      const obsTip = `${PF.observation_tooltip}\n${when(w.observation_start)} — ${when(w.observation_end)}`;
-      s += `<line data-observation="span" x1="${a}" y1="${yy}" x2="${b}" y2="${yy}" stroke="var(--warn)" stroke-width="3"><title>${esc(obsTip)}</title></line>`;
-      mk.push({t:'line', pts:[[a,yy],[b,yy]], w:3, c:'--warn', win:wi, observation:true});
-    }
     (w.pct_points || []).forEach((p, i) => {
       const matching = (w.readings || []).filter(r => Math.abs(Date.parse(r.ts)/1000-p[0]) < .001 && r.percent === p[1]);
       const reading = matching.find(r => r.source === 'quota_429') || matching[0];
@@ -3659,14 +3653,14 @@ def _template(template, profile):
             'scene_ledger_position': '      const x = x0 + (i % cols)*cw, y = top - .6 - rowOffsets[Math.floor(i/cols)];',
             'scene_tile_notes': """      tileNotes[i].forEach((line,j) =>
         W.push(word(line, .25, x, y - 1.5 - j*.35, 0, {c:'--dim'})));""",
-            'scene_pick_hit': """        const precise = h.reading != null || h.nominal || h.observation;
+            'scene_pick_hit': """        const precise = h.reading != null || h.nominal;
         if(N3.rayBox(best.lo, best.ld, h.box) !== null || (!precise && q
            && q[0] >= h.box[0] && q[0] <= h.box[3] && q[1] >= 0 && q[1] <= h.box[4] + .3)){
           best.id = h.id; best.hit = h; break;
         }""",
             'scene_hover': """      const id = h && h.ex === ex && i === F ? h.id : -1;
       const hit = h && h.ex === ex && i === F ? h.hit : null;
-      const hotKey = hit ? [id, hit.reading == null ? '' : hit.reading, !!hit.nominal, !!hit.observation].join(':') : String(id);
+      const hotKey = hit ? [id, hit.reading == null ? '' : hit.reading, !!hit.nominal].join(':') : String(id);
       if(ex.hot !== id || ex.hotKey !== hotKey){
         ex.hotKey = hotKey;""",
             'gl_points': """    } else if(m.t === 'point'){
@@ -3677,7 +3671,7 @@ def _template(template, profile):
             p[0]+r*Math.cos(b), p[1]+r*Math.sin(b), c);
       }
     } else if(m.t === 'pie'){""",
-            'scene_points': """      if(m.t === 'point' || m.nominal || m.observation){
+            'scene_points': """      if(m.t === 'point' || m.nominal){
         const p = at(m.pts[0]), q = at(m.pts[m.pts.length-1]), z = FIN/2+.35;
         if(m.t === 'point'){
           if(p[0] < 0 || p[0] > 1) continue;
@@ -3690,7 +3684,7 @@ def _template(template, profile):
           const a = run[0], b = run[1];
           tube(G, [[a[0]*PW,a[1]*H,z],[b[0]*PW,b[1]*H,z]], .025,
                cx.col(m.c), m.win, .7);
-          hits.unshift({id:m.win, nominal:m.nominal, observation:m.observation,
+          hits.unshift({id:m.win, nominal:m.nominal,
             box:[a[0]*PW-.05,Math.min(a[1],b[1])*H-.05,z-.05,b[0]*PW+.05,Math.max(a[1],b[1])*H+.05,z+.05]});
         }
         continue;
@@ -3701,12 +3695,10 @@ def _template(template, profile):
         return [at(hit.source === 'quota_429' ? PF.refusal_tooltip : `recorded /usage: ${p[1]}%`, 0, '--warn'),
                 at(when(p[0]), 1, '--dim')];
       }
-      if(hit.observation) return [at(PF.observation_tooltip, 0, '--fg'),
-        at(`${when(w.observation_start)} — ${when(w.observation_end)}`, 1, '--dim')];
       return [at(`${PF.anchor_tooltip} · ${when(t0)}`, 0, '--fg'),
               at(`${metricLabel()} ${LIMIT_METRIC === 'usd' ? usd(w.usd) : big(w.tokens.input+w.tokens.output)}`, 1, '--dim')];
 """,
-            'scene_notes': """    const notes = [PF.composition_note, PF.timing_note, PF.price_source_note].concat(PF.standing_notes);
+            'scene_notes': """    const notes = [PF.composition_note, PF.timing_note, PF.price_source_note];
     let ny = -.95;
     notes.forEach(n => wrap(n, 80).forEach(l => {
       W.push(word(l, .25, x0, ny, 0, {c:'--dim'})); ny -= .36;
@@ -4056,8 +4048,7 @@ def render(model, public=False, style=None, *, profile=None):
         data['profile'] = {k: v for k, v in profile.items() if k != 'brand_link'}
         data['rate_limits']['available'] = rl.get('available', False)
         for item, window in zip(data['rate_limits']['windows'], chart_windows):
-            item.update({k: window.get(k) for k in ('reset_inferred', 'anchor_inferred',
-                'observation_start', 'observation_end')})
+            item.update({k: window.get(k) for k in ('reset_inferred', 'anchor_inferred')})
             item['readings'] = [{k: r[k] for k in ('ts', 'percent', 'source')}
                                 for r in window.get('readings', [])]
         # Current window is a chart aggregate, never an entire captured ledger window.
@@ -4085,13 +4076,11 @@ def render(model, public=False, style=None, *, profile=None):
                     + ''.join(f'<option value="{esc(k)}"' + (' selected' if k == profile['limit_metric'] else '')
                               + f'>{esc(profile["limit_metric_labels"][k])}</option>'
                               for k in profile['limit_metric_choices']) + '</select></label>')
-        notes = '<div class="standing-notes">' + ''.join(
-            f'<p class="sub">{esc(n)}</p>' for n in profile['standing_notes'] + [profile['price_source_note']]) + '</div>'
         composition = f'<div class="composition-note"><h2>{esc(profile["composition_title"])}</h2><p class="sub">{esc(profile["composition_note"])}</p></div>'
         timing = f'<p class="sub">{esc(profile["timing_note"])}</p>'
     style_css = _template(STYLE_CSS, profile)
     if profile:
-        style_css += '\n.limit-selector{font-size:12px;pointer-events:auto;margin-right:14px}.limit-selector select{background:var(--panel);color:var(--fg);border:1px solid var(--line);padding:5px}.composition-note{grid-column:1/-1}.standing-notes{margin-top:28px}[data-s3d] .limit-selector{position:fixed;top:22px;left:24px;z-index:10}\n'
+        style_css += '\n.limit-selector{font-size:12px;pointer-events:auto;margin-right:14px}.limit-selector select{background:var(--panel);color:var(--fg);border:1px solid var(--line);padding:5px}.composition-note{grid-column:1/-1}[data-s3d] .limit-selector{position:fixed;top:22px;left:24px;z-index:10}\n'
 
     return f"""<!doctype html>
 <html lang="en" data-style="{first[0]}"{pinned}><head><meta charset="utf-8">
