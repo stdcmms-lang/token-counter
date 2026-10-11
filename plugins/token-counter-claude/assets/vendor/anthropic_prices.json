@@ -1,0 +1,280 @@
+{
+  "schema": 1,
+  "vendor": "anthropic",
+  "as_of": "2026-10-10",
+  "source_url": "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "units": "USD per million tokens",
+  "models": {
+    "claude-fable-5": {
+      "input": 10.0,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "cached": 1.0,
+      "output": 50.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-fable-5-1": {
+      "input": 10.0,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "cached": 0.25,
+      "output": 50.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-haiku-3-5": {
+      "input": 0.8,
+      "cache_write_5m": 1.0,
+      "cache_write_1h": 1.6,
+      "cached": 0.08,
+      "output": 4.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": false,
+      "image_tier": "standard"
+    },
+    "claude-haiku-4-5": {
+      "input": 1.0,
+      "cache_write_5m": 1.25,
+      "cache_write_1h": 2.0,
+      "cached": 0.1,
+      "output": 5.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": false,
+      "image_tier": "standard"
+    },
+    "claude-haiku-5-5": {
+      "input": 0.1,
+      "cache_write_5m": 0.125,
+      "cache_write_1h": 0.2,
+      "cached": 0.01,
+      "output": 0.5,
+      "long_context_threshold": 100000,
+      "long_context": {
+        "input": 0.5,
+        "cache_write_5m": 0.625,
+        "cache_write_1h": 1.0,
+        "cached": 0.05,
+        "output": 2.5
+      },
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-mythos-5": {
+      "input": 10.0,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "cached": 1.0,
+      "output": 50.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-mythos-5-1": {
+      "input": 10.0,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "cached": 0.25,
+      "output": 50.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-opus-4": {
+      "input": 15.0,
+      "cache_write_5m": 18.75,
+      "cache_write_1h": 30.0,
+      "cached": 1.5,
+      "output": 75.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": false,
+      "image_tier": "standard"
+    },
+    "claude-opus-4-1": {
+      "input": 15.0,
+      "cache_write_5m": 18.75,
+      "cache_write_1h": 30.0,
+      "cached": 1.5,
+      "output": 75.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": false,
+      "image_tier": "standard"
+    },
+    "claude-opus-4-5": {
+      "input": 5.0,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "cached": 0.5,
+      "output": 25.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": false,
+      "image_tier": "standard"
+    },
+    "claude-opus-4-6": {
+      "input": 5.0,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "cached": 0.5,
+      "output": 25.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "standard"
+    },
+    "claude-opus-4-7": {
+      "input": 5.0,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "cached": 0.5,
+      "output": 25.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-opus-4-8": {
+      "input": 5.0,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "cached": 0.5,
+      "output": 25.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": {
+        "input": 10.0,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0,
+        "cached": 1.0,
+        "output": 50.0
+      },
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-opus-5": {
+      "input": 5.0,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "cached": 0.5,
+      "output": 25.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": {
+        "input": 10.0,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0,
+        "cached": 1.0,
+        "output": 50.0
+      },
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-opus-5-5": {
+      "input": 4.0,
+      "cache_write_5m": 5.0,
+      "cache_write_1h": 8.0,
+      "cached": 0.2,
+      "output": 20.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": {
+        "input": 8.0,
+        "cache_write_5m": 10.0,
+        "cache_write_1h": 16.0,
+        "cached": 0.4,
+        "output": 40.0
+      },
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-sonnet-4": {
+      "input": 3.0,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "cached": 0.3,
+      "output": 15.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": false,
+      "image_tier": "standard"
+    },
+    "claude-sonnet-4-5": {
+      "input": 3.0,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "cached": 0.3,
+      "output": 15.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": false,
+      "image_tier": "standard"
+    },
+    "claude-sonnet-4-6": {
+      "input": 3.0,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "cached": 0.3,
+      "output": 15.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "standard"
+    },
+    "claude-sonnet-5": {
+      "input": 2.0,
+      "cache_write_5m": 2.5,
+      "cache_write_1h": 4.0,
+      "cached": 0.2,
+      "output": 10.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-sonnet-5-5": {
+      "input": 2.0,
+      "cache_write_5m": 2.5,
+      "cache_write_1h": 4.0,
+      "cached": 0.1,
+      "output": 10.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    }
+  },
+  "aliases": {
+    "claude-haiku-4-5-20251001": "claude-haiku-4-5"
+  },
+  "fees": {
+    "web_search_request": 0.01,
+    "web_fetch_request": 0
+  }
+}

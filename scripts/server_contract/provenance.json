@@ -1,0 +1,16 @@
+{
+  "server_commit": "9afabc0",
+  "copy_date": "2026-10-10",
+  "typescript": "5.9.3",
+  "zod": "4.6.5",
+  "files": {
+    "schema.ts": {
+      "source": "server_schema.ts",
+      "sha256": "61152fa71832a2565174e390041e0db8c2932b6c324d57fc799bd55288c69882"
+    },
+    "validate.ts": {
+      "source": "server_validate.ts",
+      "sha256": "8cf76f0d71c5371633f9d47419ff0073daa5fc7b1dd09da114a35c553f5cded5"
+    }
+  }
+}
