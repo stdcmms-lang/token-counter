@@ -1,0 +1,9 @@
+{
+  "name": "token-counter-server-contract-tests",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "typescript": "5.9.3",
+    "zod": "4.6.5"
+  }
+}

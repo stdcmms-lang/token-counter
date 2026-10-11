@@ -2099,3 +2099,7 @@ Built, installed and verified as `token-counter@stdcmms-lang` on Codex CLI
 Not built, and deliberately: incremental byte-offset tailing (§3.2), a reconstructed bill
 (the API value is list price for recorded usage, §5.9), fetching prices at run time, and any
 conversion of tokens into rate-limit consumption (§1, non-goals).
+
+## 12. Claude Code edition
+
+Sections 1–11 describe the Codex plugin. The Claude Code edition is specified in `CLAUDE_ARCHITECTURE.md`. Shared renderer changes must pass executable frozen-baseline comparison, its sensitivity self-test, and unchanged Codex suites.

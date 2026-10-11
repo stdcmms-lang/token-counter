@@ -66,6 +66,152 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: node scripts/test_page.js
 
+      # The contract harness uses the committed exact-version npm lockfile.
+      - name: Install server contract dependencies
+        id: contract
+        if: ${{ !cancelled() }}
+        run: npm ci --prefix scripts/server_contract
+
+      - name: test_claude_ledger.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_ledger.py
+
+      - name: test_claude_pipeline.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_pipeline.py
+
+      - name: test_claude_retention.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_retention.py
+
+      - name: test_claude_windows.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_windows.py
+
+      - name: test_claude_pricing.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_pricing.py
+
+      - name: test_claude_share.py
+        if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
+        run: python -B scripts/test_claude_share.py
+
+      - name: test_claude_mutations.py --section ledger
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section ledger
+
+      - name: test_claude_mutations.py --section retention
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section retention
+
+      - name: test_claude_mutations.py --section pricing
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section pricing
+
+      - name: test_claude_mutations.py --section windows
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section windows
+
+      - name: test_claude_mutations.py --section share
+        if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
+        run: python -B scripts/test_claude_mutations.py --section share
+
+      - name: test_claude_page.js
+        if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
+        run: node scripts/test_claude_page.js
+
+      - name: check_manifests.py
+        if: ${{ !cancelled() }}
+        run: python -B scripts/check_manifests.py
+
+      - name: sync_shared.py --check
+        if: ${{ !cancelled() }}
+        run: python -B scripts/sync_shared.py --check
+
+      - name: test_codex_compat.py
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: python -B scripts/test_codex_compat.py
+
+  claude_macos:
+    name: Claude (macos-14, Python 3.14)
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        if: ${{ !cancelled() }}
+
+      - uses: actions/setup-python@v7
+        if: ${{ !cancelled() }}
+        with:
+          python-version: '3.14'
+
+      - uses: actions/setup-node@v7
+        if: ${{ !cancelled() }}
+        with:
+          node-version: '22'
+
+      # The contract harness uses the committed exact-version npm lockfile.
+      - name: Install server contract dependencies
+        id: contract
+        if: ${{ !cancelled() }}
+        run: npm ci --prefix scripts/server_contract
+
+      - name: test_claude_ledger.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_ledger.py
+
+      - name: test_claude_pipeline.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_pipeline.py
+
+      - name: test_claude_retention.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_retention.py
+
+      - name: test_claude_windows.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_windows.py
+
+      - name: test_claude_pricing.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_pricing.py
+
+      - name: test_claude_share.py
+        if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
+        run: python -B scripts/test_claude_share.py
+
+      - name: test_claude_mutations.py --section ledger
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section ledger
+
+      - name: test_claude_mutations.py --section retention
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section retention
+
+      - name: test_claude_mutations.py --section pricing
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section pricing
+
+      - name: test_claude_mutations.py --section windows
+        if: ${{ !cancelled() }}
+        run: python -B scripts/test_claude_mutations.py --section windows
+
+      - name: test_claude_mutations.py --section share
+        if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
+        run: python -B scripts/test_claude_mutations.py --section share
+
+      - name: test_claude_page.js
+        if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
+        run: node scripts/test_claude_page.js
+
+      - name: check_manifests.py
+        if: ${{ !cancelled() }}
+        run: python -B scripts/check_manifests.py
+
+      - name: sync_shared.py --check
+        if: ${{ !cancelled() }}
+        run: python -B scripts/sync_shared.py --check
+
   vocabulary:
     name: vocabulary and manifests
     runs-on: ubuntu-24.04

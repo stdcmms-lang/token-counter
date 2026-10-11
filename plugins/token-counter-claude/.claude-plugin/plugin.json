@@ -1,0 +1,21 @@
+{
+  "name": "token-counter-claude",
+  "displayName": "Token Counter for Claude Code",
+  "version": "0.1.0",
+  "description": "Report Claude Code's recorded usage locally; optionally share sanitized totals and the report page to tokenusage.dev.",
+  "author": {
+    "name": "hao.he@giga.ai"
+  },
+  "homepage": "https://github.com/stdcmms-lang/token-counter",
+  "repository": "https://github.com/stdcmms-lang/token-counter",
+  "license": "MIT",
+  "keywords": [
+    "tokens",
+    "usage",
+    "Claude Code",
+    "prompt cache",
+    "dashboard",
+    "share",
+    "response time"
+  ]
+}
