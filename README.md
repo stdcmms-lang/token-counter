@@ -321,7 +321,7 @@ and the installed plugin was not the reviewed code.
 
 ## Claude Code
 
-The Claude Code edition is the separate **token-counter-claude 0.1.0** plugin. Its
+The Claude Code edition is the separate **token-counter-claude 0.2.0** plugin. Its
 version, local state and share token are separate from the Codex plugin's. It reads
 Claude Code's recorded usage and retained capture history; it ships no tokenizer,
 downloads nothing and installs no packages. See [CLAUDE_ARCHITECTURE.md](CLAUDE_ARCHITECTURE.md)
@@ -341,11 +341,12 @@ claude plugin marketplace add <path to this checkout>
 claude plugin install token-counter-claude@stdcmms-lang
 ```
 
-The two skills are:
+The three skills are:
 
 ```text
 /token-counter-claude:token-report
 /token-counter-claude:token-share
+/token-counter-claude:token-film
 ```
 
 Claude Code substitutes `${CLAUDE_SKILL_DIR}` in each skill's text with the installed
@@ -365,6 +366,71 @@ the completed HTML with the platform handler. The default page is `report.html` 
 the resolved Claude state directory. `--json PATH` writes the complete model;
 `--json -` writes only JSON to stdout. Read the terminal's quality counters when
 quoting figures. A local report sends nothing and does not authorize a share.
+
+### Create a token film
+
+Ask Claude Code to film a named session, this session, or the longest recent
+session. The token-film skill writes one self-contained HTML page with the
+vertical token animation and synthesized sound.
+
+From the repository root on Windows:
+
+```powershell
+python plugins/token-counter-claude/skills/token-film/scripts/film.py --session PREFIX --no-open
+python plugins/token-counter-claude/skills/token-film/scripts/film.py --current --no-open
+python plugins/token-counter-claude/skills/token-film/scripts/film.py --list
+```
+
+Use python3 on macOS/Linux. Open the generated HTML; it starts paused on a
+poster. Select Play to start from the beginning, then Save MP4. The script
+does not upload anything.
+
+The film shows one currently present main transcript. It does not load
+captured history or continuations. Subagent usage is reported separately in
+the terminal and optional JSON. Counts use the same worker and ledger as the
+report; dollar figures are API list value, not spend or a bill.
+
+The default page is films/film-<public-data-hash>-v0.2.0.html under the resolved
+state directory. The page and MP4 omit conversation content, private paths,
+account identity and raw session IDs. Tool chips retain only closed
+allow-listed built-in labels; MCP and custom tools become MCP and tool.
+
+Same transcript bytes, plugin version and price table produce byte-identical
+HTML. Within one browser engine and OS, the same frame index draws the same
+call sequence and the same sample index gives the same sample. Font
+rasterization and anti-aliasing can change pixels across engines; libm
+differences can change samples' last bits. Cross-engine pixel/sample equality
+is not promised or a release gate. Encoded MP4 bytes may vary by encoder.
+
+`CLAUDE_CODE_SESSION_ID` was verified by the owner in a Claude Code Bash
+subprocess on Windows, where it equals the current transcript's stem. Automatic
+Bash/PowerShell setting supports `--current`; POSIX subprocess behavior remains
+**UNVERIFIED**. If the variable is unavailable, choose an explicit session prefix.
+
+| Film option | Default and behavior |
+| --- | --- |
+| `--session PREFIX` | Select exactly one main transcript by case-sensitive stem prefix; ambiguous prefixes list candidates |
+| `--current` | Select the stem in `CLAUDE_CODE_SESSION_ID`; an unset variable exits 2 |
+| `--list` | List up to ten newest-modified main transcripts with local start, countable span, steps, tokens and compactions; creates no state |
+| `--sessions-root PATH` | Resolved Claude projects root; explicit-root state namespace as below |
+| `--prices PATH` | Vendored offline Anthropic table; same-format override; unavailable/invalid prices produce token-only output |
+| `--out PATH` | `films/film-<public-data-hash>-v0.2.0.html`; requires `.html` and rejects plugin/input/report-state collisions |
+| `--json PATH` | No JSON file; `.json` diagnostic wrapper; `-` writes only JSON to stdout and summary to stderr |
+| `--no-open` | Off; otherwise opens the completed page with the platform handler |
+| `--version` | Prints `token-counter-claude 0.2.0` before collection |
+
+The three selection options are mutually exclusive; one is required. `--list`
+rejects `--out`, `--json` and `--prices`. A film needs at least one nonzero main
+response. Repeated identical public data replaces the same artifact atomically.
+Making a film never invokes sharing. Export uses H.264 and supported AAC first,
+otherwise supported Opus. AAC retains priming/padding; Opus retains encoder
+PreSkip (or zero without a description). Verified by the owner on 2026-10-13 in
+Chrome for Testing 149 headless shell on Windows 11 from a file:// page: font
+loading, paused poster, playback clock, frames matching the reference stills,
+and a Save MP4 export with H.264 Constrained Baseline + AAC LC that ffmpeg decodes
+without errors (moov before mdat). Still **UNVERIFIED**: other engines (Firefox,
+Safari), the Opus path and its MP4 playback, hardware encoders, and audible
+playback in a headed browser. Offline tests do not establish browser support.
 
 ### Share Claude Code usage
 
@@ -420,8 +486,10 @@ Recovery preserves capture history. There is no token-import or `--forget` optio
 
 ### What the Claude plugin needs
 
-Python **3.8+**, including its standard-library SQLite, is the only runtime
-requirement. No tiktoken, vocabulary, price download, dependency installer or
+Python 3.8+ and its standard library are the collection runtime requirements.
+Film playback requires a browser with Canvas 2D, binary FontFace and Web Audio;
+MP4 export additionally requires supported WebCodecs codecs.
+No tiktoken, vocabulary, price download, dependency installer or
 background collector is used. A writable state directory is needed to retain
 history; sharing refuses if history cannot be committed. A failed index or process
 pool falls back to extraction or one process. Unavailable history permits a live
@@ -446,7 +514,7 @@ are not usage sources. **Never open `~/.claude/.credentials.json` or another
 credentials file**, external tool-result files or image URLs.
 
 Mutable files are `index-cache.db`, `history.db`, `report.html`,
-`report-shared.html` and `claude-share.json`. None is stored in the installed plugin
+`report-shared.html`, `claude-share.json` and `films/film-<public-data-hash>-v0.2.0.html`. None is stored in the installed plugin
 or `${CLAUDE_PLUGIN_DATA}`, so uninstall cleanup does not remove capture history.
 
 ### Claude options
@@ -475,7 +543,7 @@ unless the table states otherwise; no date or session filter is applied by defau
 | `--fast` | Off; all cores, Windows maximum 61; conflicts with `--procs` |
 | `--quiet` | Off; suppresses progress, preserves warnings and summary |
 | `--doctor` | Off; read-only path/parser/state diagnostics, no capture or network |
-| `--version` | Prints `token-counter-claude 0.1.0`, then exits |
+| `--version` | Prints `token-counter-claude 0.2.0`, then exits |
 
 | Share option | Default and behavior |
 | --- | --- |
@@ -494,8 +562,9 @@ unless the table states otherwise; no date or session filter is applied by defau
 | `--quiet` | Off; suppresses collection progress, preserves decisions and warnings |
 | `--version` | Prints product/version, then exits |
 
-Share has no date, session or live-only filter. Neither CLI accepts plan
-declarations, tokenizer/vocabulary options or a dependency-install option.
+Share has no date, session or live-only filter. The report and share CLIs accept
+neither plan declarations nor tokenizer/vocabulary/dependency-install options.
+The film CLI also has no account, capture-history, upload or dependency-install operation.
 
 ### Where Claude's numbers come from
 
@@ -612,6 +681,8 @@ python -I -S -B scripts/test_claude_pipeline.py
 python -I -S -B scripts/test_claude_retention.py
 python -I -S -B scripts/test_claude_windows.py
 python -I -S -B scripts/test_claude_pricing.py
+python -I -S -B scripts/test_claude_film.py
+node scripts/test_claude_film_page.js
 python -B scripts/test_claude_share.py
 python -B scripts/test_claude_mutations.py
 node scripts/test_claude_page.js
@@ -621,7 +692,7 @@ python -B scripts/fetch_anthropic_prices.py --from scripts/fixtures/anthropic_pr
 The manifest checker requires both marketplaces, versions, contained paths,
 byte-identical shared files, offline price parity, frozen fixture hashes and
 server provenance/lockfile pins. It runs the compatibility sensitivity self-test
-and a synthetic installed-copy report/share smoke with no sibling checkout,
+and a synthetic installed-copy report/share/film smoke with no sibling checkout,
 network or token, including both interpreter variants and skill-dir substitution.
 `--existing-only` permits unfinished packaging while checking present surfaces.
 Claude's stdlib suites run with site packages disabled; the development-only
@@ -634,7 +705,7 @@ Claude suites/checks to them, and adds a Claude-only macOS-14/Python 3.14/Node 2
 cell. Each independent check still runs after another check fails. The contract
 lockfile is installed in CI with `npm ci --prefix scripts/server_contract`.
 
-Both report pages have no external runtime dependencies or networking. The fixed
+Report pages and film pages have no external runtime dependencies or networking. The fixed
 `<a href="https://tokenusage.dev">tokenusage.dev</a>` is a deliberate navigational
 brand link; rendering/opening a report itself sends nothing. All other external
 references and network primitives are rejected by self-containment tests.

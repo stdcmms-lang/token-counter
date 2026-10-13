@@ -4,3 +4,5 @@ scripts/fixtures/codex_2aebba1/** -text
 scripts/server_contract/schema.ts -text
 scripts/server_contract/validate.ts -text
 scripts/fixtures/anthropic_pricing.md -text
+# Vendored film fonts and their licences are pinned by SHA-256 and embedded in film pages.
+plugins/token-counter-claude/assets/vendor/fonts/** -text
