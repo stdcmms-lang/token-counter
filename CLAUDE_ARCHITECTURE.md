@@ -1,15 +1,15 @@
 # Token Counter for Claude Code — Architecture
 
-This describes `token-counter-claude` **0.1.0** as implemented after rounds 1–8,
-fix round 4b and the final round 9 packaging/performance pass. The agreed source is
-the amended implementation plan `result2.md` of 2026-10-10. Evidence is a snapshot
-of one development corpus, not a guarantee about future Claude Code records.
+This describes token-counter-claude 0.2.0. The 0.1.0 usage, capture and sharing
+contracts remain in force; 0.2.0 adds the deterministic token-film skill.
+Evidence is a snapshot of development corpora, not a guarantee about future
+Claude Code records.
 
 ## 1. Scope and relationship to the Codex product
 
 Claude's headline is recorded usage, not independently tokenized content. Its
 visible composition is a UTF-8 byte inventory. The product has its own marketplace
-entry, manifest, two skills, package version, state and endpoint-specific share
+entry, manifest, three skills, package version, state and endpoint-specific share
 token. Codex remains `token-counter` 1.10.0 with its existing counting contract.
 
 Four checked-in files are byte-identical across the products: `render.py`,
@@ -26,7 +26,9 @@ that byte. No Codex runtime or test file changes in round 9.
 
 There is no daemon, hook, MCP server, agent or continuous capture process. Normal
 report/share collection runs capture evidence on demand. Python 3.8+ and its
-standard library are the runtime requirements. No tokenizer, vocabulary,
+standard library are the collection runtime requirements. Film playback needs
+Canvas 2D, binary FontFace and Web Audio; MP4 export also needs supported
+WebCodecs codecs. No tokenizer, vocabulary,
 dependency installation or runtime price fetching exists in the Claude product.
 
 ## 2. Evidence and shape dispatch
@@ -186,8 +188,10 @@ are local JSON only, excluded from public models.
 
 `reconciliation`, `resend_cost`, `amplification` and `cache_leads` each carry
 `available: false` and the reason "Claude transcripts do not establish per-content
-token attribution." There is no residual, byte-to-token estimate, resend price,
-cache-prefix lead or TTL causation claim.
+token attribution." Report analytics make no residual, byte-to-token estimate,
+resend-price, cache-prefix-lead or TTL-causation claim. The film's Cache expired!
+sticker is an illustration selected by the documented cache-rewrite threshold,
+not a measured cause.
 
 ## 8. Durable capture history and replacement coverage
 
@@ -393,9 +397,14 @@ beacon/form primitives are prohibited. Price provenance is plain text. Rendering
 and opening a report makes no network request; following the brand link is a user
 navigation. No browser is needed for the page tests.
 
+Film pages use a separate public projection. They retain no raw identities,
+paths, content or account data. Their tool labels use the closed film
+allow-list; MCP and custom labels become MCP and tool. Report public_model()
+and share sanitization remain unchanged.
+
 ## 13. Share schema1 mapping and server limitations
 
-Schema 1 with client `claude-usage` 0.1.0 carries whole safe captured months of
+Schema 1 with client `claude-usage` 0.2.0 carries whole safe captured months of
 recorded daily counts and known-speed partial tier partitions, selected session
 hashes, a retained-safe union of weekly-all observation windows and 30-day timing.
 Session IDs are the first 16 hex characters of domain-separated SHA-256 over family
@@ -479,7 +488,8 @@ account token quota or guaranteed subscription allowance.
 Default state is `C/token-counter/`. Explicit roots use
 `R.parent/token-counter/<root-hash>/`, first 12 hex SHA-256 characters of the
 resolved platform-normalized root path. State files are `index-cache.db`,
-`history.db`, `report.html`, `report-shared.html` and `claude-share.json`. No mutable
+`history.db`, `report.html`, `report-shared.html`, `claude-share.json` and
+`films/film-<public-data-hash>-v0.2.0.html`. No mutable
 state is in the installed directory or `${CLAUDE_PLUGIN_DATA}`. Uninstall cleanup
 therefore does not remove capture history. Claude token format has exactly schema,
 active endpoint and endpoint entries containing token, handle, history UUID and
@@ -503,7 +513,9 @@ Claude plugin contains everything it needs. The isolated packaging smoke copies
 only that plugin, uses paths with spaces, temporary corpus/account/state, `-I -S -B`,
 both substituted interpreter variants and a network guard. It rejects checkout
 entries on `sys.path`, imports outside the installed plugin, missing fixture counts,
-missing preview or any dry-run token. No sibling repository is present.
+missing preview/film or any dry-run token. The report/share/film smoke checks film
+counts/value and guards account/history/index access for film. Film creates none
+of those state files. No sibling repository is present.
 
 Share collection retains its verified history handle through payload/preview and
 preparation, then closes it in `finally`; ordinary reports close after collection.
@@ -536,7 +548,7 @@ authentication or private corpus.
 
 The four existing Ubuntu 24.04/Windows Python 3.8/3.14 cells and Codex steps stay
 unchanged. Claude stdlib suites use `python -I -S -B`; share/mutations use `python -B`;
-Node 22 runs the embedded-page suite. Each section/check has a failure-independent
+Node 22 runs the embedded-page suites. Each section/check has a failure-independent
 `!cancelled()` condition; contract-dependent steps additionally require successful
 lockfile installation. Full manifests, synchronization and frozen compatibility
 checks are included. The added macOS-14/Python 3.14/Node 22 cell runs only Claude
@@ -546,7 +558,24 @@ CI installs the development harness with `npm ci --prefix scripts/server_contrac
 there is no new runtime dependency. The unchanged Codex pipeline's synthetic local
 wheel installer test remains an offline test obligation.
 
+Film suites are `python -I -S -B scripts/test_claude_film.py` and
+`node scripts/test_claude_film_page.js`, in both the matrix and macOS jobs.
+They cover invented extraction/privacy/installed artifacts, hand-calculated
+model/score arithmetic, every fixture frame, paused player controls, fake codecs,
+and independently parsed synthetic MP4 structure. Python sections are data and
+integration; Node sections are model, draw and runtime. These are test-only
+selectors. Font/license bytes have pinned SHA-256 packaging checks.
+
 ## 16. Known limitations and unverified behaviors
+
+Film checks were verified by the owner on 2026-10-13 in Chrome for Testing 149
+headless shell on Windows 11 from a file:// page: font loading, paused poster,
+playback clock, frames matching the reference stills, and a Save MP4 export with
+H.264 Constrained Baseline + AAC LC that ffmpeg decodes without errors (moov before
+mdat). Still UNVERIFIED: other engines (Firefox, Safari), the Opus path and its MP4
+playback, hardware encoders, and audible playback in a headed browser.
+AAC retains encoder priming and padding. Cross-engine pixels and last sample bits
+may differ; cross-engine pixel/PCM hash equality is not a release gate.
 
 Calendar/account activity completeness is unknown. Transcripts removed before the
 first capture, unlogged background/compaction/advisor calls and other devices or
@@ -633,3 +662,120 @@ variation is run noise. Reusing history then saves 3.758 s on counts-only and
 prints no internal timing line. A fingerprint-changing edit requires one initial
 re-extraction; that warm-up is excluded from the warm measurements. These are
 sequential guarded measurements of a live corpus, not universal timings.
+
+## 17. Deterministic session films
+
+token-film selects one currently present main transcript. It freezes a bounded
+byte prefix in a temporary snapshot, runs unchanged metrics-only worker
+extraction and a main-only ledger with history=None, then joins a content-free
+second pass by worker response identity and collapsed physical block identity.
+Pass 2 stops at the worker's last_complete_line. Live append-only growth is
+accepted; shrink or captured-prefix change retries once, then fails without
+artifacts. Temporary snapshots are removed. Parser fingerprints, fact shapes,
+capture history, report models and share payloads remain unchanged.
+
+All-zero canonical rows remain ledger responses but are omitted from animation
+steps. Subagents are separately deduplicated and disclosed in terminal/JSON
+output; they do not affect HTML bytes. Report comparisons require matching
+evidence scope.
+
+The script is Python 3.8+ standard library only. It writes one self-contained
+HTML page with embedded public data, fonts, Canvas renderer, synthesized score,
+player and WebCodecs MP4 exporter. No runtime network resource or dependency
+installation is used.
+
+The public projection contains numeric counts, relative time, closed block and
+tool labels, validated compaction sizes and aggregate pricing. It contains no
+conversation text, private path/title/account data, absolute session dates or
+raw session ID. No account file is opened.
+
+HTML has canonical serialization and no generated timestamp. The same
+transcript bytes, plugin version and price table produce byte-identical HTML.
+Within one browser engine and OS, a frame index gives the same drawing call
+sequence and a sample index gives the same sample. Rendering is indexed at
+30 fps and sound at 48 kHz, with fixed jitter/noise seeds. Player clocks choose
+indices without changing those functions. Cross-engine pixels and samples may
+differ and are not equality gates. Encoder/container timestamps are zero;
+encoded MP4 bytes need not match.
+
+The ordinary act-2 budget is capped at 500 frames. Dense compactions may extend
+it under the exact three-frame-minimum, run-minimum and 40-percent-pause rule.
+Missing boundary metadata uses disclosed neighboring-context display fallbacks.
+Window labels are closed display inferences, not independently verified model
+configuration.
+
+Thinking remains present when null-thinking positive-output steps account for
+at most one percent of total output. Those steps contribute zero displayed
+Thinking and all their output to Writing. Above that threshold, Thinking is
+omitted and all output becomes Writing. JSON and terminal output disclose
+missing response/output counts. Unpriced token counts remain visible; API list
+value covers priced tokens and recorded search fees. Receipt cents use stable
+largest-remainder allocation. The value is not spend or a bill.
+
+Verified by the owner on 2026-10-13 in Chrome for Testing 149 headless shell on
+Windows 11 from a file:// page: font loading, paused poster, playback clock,
+frames matching the reference stills, and a Save MP4 export with H.264 Constrained
+Baseline + AAC LC that ffmpeg decodes without errors (moov before mdat). Still
+UNVERIFIED: other engines (Firefox, Safari), the Opus path and its MP4 playback,
+hardware encoders, and audible playback in a headed browser. AAC encoder priming
+is retained. Opus dOps copies encoder PreSkip, or zero without a description.
+No track has edts. Node tests establish structure and repeatability, not real
+codec interoperability.
+
+Film schema 1 is independent of share/history schemas. Counts and cumulative
+totals must fit Number.MAX_SAFE_INTEGER. The content address is the first 12
+hex SHA-256 characters of sorted compact ASCII-escaped public JSON before its
+artifact_tag is added. Embedded JSON also escapes `<`, `>` and `&`. The optional
+JSON wrapper contains closed ledger/pricing/film counters and omitted subagent
+measurements; it is not embedded. Subagents, mtimes and local calendar displays
+therefore cannot change the HTML. Closed display_evidence fields carry aggregate
+context_1m, recorded cache_ttl (1h/5m/mixed) and read_discounted so the page can
+apply its scale/TTL/price explanation rules without model names or identities.
+Omitted-subagent quality uses the additional nonnegative family-ledger counters
+introduced by child evidence and pricing counters for child-owned rows; the
+main transcript's existing warnings are not attributed to omitted children.
+If the unchanged float pricing engine cannot represent child-owned usage value,
+that diagnostic value is unavailable with film_subagent_pricing_unavailable;
+the main film remains independent of child evidence.
+
+The first 20 steps use the reference durations, truncated for shorter sessions.
+Act-1 boundaries add six-frame pauses, with 46 frames for the first manual and
+42 for the first automatic boundary anywhere. Act-2 positive runs have minima
+38, then seven frames. B0=min(500,max(sum(minima),ceil(30*log2(1+N2))+8*C2)).
+Try ordinary pauses 6,5,4,3 in order, requiring pauses <=40% of B0 and enough
+remaining run frames. Otherwise use three and extend B to
+max(B0,ceil(pauses/.4),pauses+sum(minima)). Proportional constrained allocation
+uses half-up duration rounding and stable signed-error residue correction.
+Consecutive active presses override retracts; the last retract remains four
+frames. frameOfStep preserves the reference arrival convention at integer cuts.
+
+Context is reads+writes+base. Missing/inconsistent boundary sizes use clamped
+neighboring-context displays and named film counters. A known display limit is
+1M when any context/pre exceeds 200K or context_1m is recorded; otherwise 200K
+when an automatic recorded pre is positive and below 200K; otherwise unknown.
+niceAbove uses the smallest strictly higher 1/2/5 power-of-ten value. The tube
+retains the reference 26-frame logarithmic zoom and .88/.85 alarm/sweat ratios.
+The smallest power-of-ten ball unit limits whole balls to 1800; positive smaller
+categories get reserved specks/lenses, and categories with 1–20 balls get rings.
+Cache-rewrite illustration uses write>60000 and write>.5*context; its sticker
+threshold is .2 of the display limit/maximum, not evidence of TTL causation.
+
+Typed-prompt bubbles use strict physical intervals between retained responses'
+first collapsed blocks; zero/excluded/quarantined responses do not consume
+prompts. Safe block kinds are k/t and the fixed film tool list. Unknown tools
+become tool; mcp__ names become MCP. Sticker interruption is per teach/compact/
+recache/ball/speck slot; other slots and normal seven-frame fading tails coexist.
+Relative time uses days at >=2 days, hours at >=2 hours, otherwise minutes;
+the count is floor(elapsed/unit)+1. Missing times remain unavailable.
+
+Playback initializes paused at min(60,DURATION-1). Play starts the untouched
+poster at zero; explicit #f and seeks resume their selected frame. AudioContext
+is created/resumed from a Play gesture. Export pauses playback and draws every
+integer frame on a separate canvas. Quality H.264 probes prefer avc1.42E028 then
+avc1.420028; audio probes prefer mp4a.40.2 then opus, 48kHz stereo. Encoder queues
+are bounded at eight, cancellation/errors clean up objects/waiters, and encoded
+payload accumulation is limited to 512 MiB. Video durations are 3000/90000 ticks;
+audio tables use chunk durations or validated AAC/Opus packet durations.
+AAC padding/priming is untrimmed; movie duration is the maximum raw track duration
+converted to 90000 ticks. moov precedes mdat, dates are zero, and no edit boxes,
+private metadata, calibration or runtime downloads of dependencies exist.

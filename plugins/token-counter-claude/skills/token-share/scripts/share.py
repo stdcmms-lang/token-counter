@@ -31,7 +31,7 @@ from tokencounter import analyze, history, paths, pricing, render, share_validat
 from tokencounter.models import COUNTER_NAMES, bump  # noqa: E402
 from tokencounter.worker import epoch  # noqa: E402
 
-CLIENT = {'name': 'claude-usage', 'version': '0.1.0'}
+CLIENT = {'name': 'claude-usage', 'version': '0.2.0'}
 SCHEMA = 1
 DEFAULT_API = 'https://tokenusage.dev/api'
 RECOVERY = 'Recovery: run share.py --delete --yes using the retained token, then start a fresh first share with share.py --handle HANDLE --yes.'

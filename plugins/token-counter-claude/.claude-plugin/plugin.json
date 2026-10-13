@@ -1,8 +1,8 @@
 {
   "name": "token-counter-claude",
   "displayName": "Token Counter for Claude Code",
-  "version": "0.1.0",
-  "description": "Report Claude Code's recorded usage locally; optionally share sanitized totals and the report page to tokenusage.dev.",
+  "version": "0.2.0",
+  "description": "Report Claude Code's recorded usage and create deterministic local token films; optionally share sanitized totals and the report page to tokenusage.dev.",
   "author": {
     "name": "hao.he@giga.ai"
   },
@@ -16,6 +16,7 @@
     "prompt cache",
     "dashboard",
     "share",
+    "film",
     "response time"
   ]
 }

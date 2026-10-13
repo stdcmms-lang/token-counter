@@ -120,6 +120,14 @@ jobs:
         if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
         run: node scripts/test_claude_page.js
 
+      - name: test_claude_film.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_film.py
+
+      - name: test_claude_film_page.js
+        if: ${{ !cancelled() }}
+        run: node scripts/test_claude_film_page.js
+
       - name: check_manifests.py
         if: ${{ !cancelled() }}
         run: python -B scripts/check_manifests.py
@@ -203,6 +211,14 @@ jobs:
       - name: test_claude_page.js
         if: ${{ !cancelled() && steps.contract.outcome == 'success' }}
         run: node scripts/test_claude_page.js
+
+      - name: test_claude_film.py
+        if: ${{ !cancelled() }}
+        run: python -I -S -B scripts/test_claude_film.py
+
+      - name: test_claude_film_page.js
+        if: ${{ !cancelled() }}
+        run: node scripts/test_claude_film_page.js
 
       - name: check_manifests.py
         if: ${{ !cancelled() }}

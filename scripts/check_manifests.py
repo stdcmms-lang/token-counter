@@ -30,6 +30,10 @@ SHARED = ("render.py", "latency.py", "index.py", "images.py")
 SCRIPT_DIR = "skills/token-report/scripts"
 PINS = {"typescript": "5.9.3", "zod": "4.6.5"}
 HASHES = {
+    "plugins/token-counter-claude/assets/vendor/fonts/Fredoka.ttf": "2ba02e68b152868aef9ba28e24b3648c7d457fe6f25c761f2c2c53fb61a73fc8",
+    "plugins/token-counter-claude/assets/vendor/fonts/SpaceMono-Bold.ttf": "405e73d41afb7e5906efce206a326af5c956f38e255f35421c260e861e599c59",
+    "plugins/token-counter-claude/assets/vendor/fonts/OFL-Fredoka.txt": "5c9e7eee5c6b25f4b05b8d53b2e470ea4962f9ced742d044a98f7d95d1375bab",
+    "plugins/token-counter-claude/assets/vendor/fonts/OFL-SpaceMono.txt": "8e4ee42b2553e1e01504e61cb0d46d148cd8c9e5eacaa3622a7df2d4f2955b9f",
     "scripts/fixtures/codex_2aebba1/render.py": "c4dc9e6592e4cc0948218b0313fde45d60ebe738a38c8f0af20df412b2b8f303",
     "scripts/server_contract/schema.ts": "61152fa71832a2565174e390041e0db8c2932b6c324d57fc799bd55288c69882",
     "scripts/server_contract/validate.ts": "8cf76f0d71c5371633f9d47419ff0073daa5fc7b1dd09da114a35c553f5cded5",
@@ -124,7 +128,7 @@ def _frontmatter(repo, relative, skill):
         raise ValueError(skill + ": description and argument-hint are required")
     if fields.get("disable-model-invocation", "false") != "false":
         raise ValueError(skill + ": model invocation must be enabled")
-    script = "report.py" if skill == "token-report" else "share.py"
+    script = {"token-report": "report.py", "token-share": "share.py", "token-film": "film.py"}[skill]
     path = '"${CLAUDE_SKILL_DIR}/scripts/' + script + '"'
     if "python " + path not in text or "python3 " + path not in text:
         raise ValueError(skill + ": missing quoted Windows/POSIX interpreter variants")
@@ -135,7 +139,7 @@ def _frontmatter(repo, relative, skill):
         if command_path != "${CLAUDE_SKILL_DIR}/scripts/" + script:
             raise ValueError(skill + ": command outside its skill scripts")
         _local_path(repo, (repo / relative).parent, "./scripts/" + script)
-    if skill == "token-report" and fields.get("disable-model-invocation") != "false":
+    if skill in ("token-report", "token-film") and fields.get("disable-model-invocation") != "false":
         raise ValueError(skill + ": explicit model invocation setting missing")
     if skill == "token-share" and "disable-model-invocation" in fields:
         raise ValueError(skill + ": use default model invocation, without a disabling field")
@@ -155,7 +159,7 @@ def _installed_smoke(repo):
         cases.write_corpus(sessions, cases.baseline_B())
         # -I -S and a temp cwd remove the repository/sibling from the import path.
         # Block network inside each child as well as in the outer test harness.
-        wrapper = ("import pathlib, runpy, socket, sys, urllib.request\n"
+        wrapper = ("import builtins, io, pathlib, runpy, socket, sys, urllib.request\n"
                    "def deny(*a, **k): raise AssertionError('installed smoke attempted network')\n"
                    "socket.socket = socket.create_connection = socket.getaddrinfo = deny\n"
                    "urllib.request.urlopen = deny\n"
@@ -167,16 +171,31 @@ def _installed_smoke(repo):
                    "def imports_stay_installed():\n"
                    "    assert not any(within(pathlib.Path(p), checkout) for p in sys.path), 'checkout on sys.path'\n"
                    "    for name, module in list(sys.modules.items()):\n"
-                   "        if name == 'report' or name == 'tokencounter' or name.startswith('tokencounter.'):\n"
+                   "        if name in ('report', 'film') or name == 'tokencounter' or name.startswith('tokencounter.'):\n"
                    "            assert within(pathlib.Path(module.__file__), installed), 'import outside installed plugin'\n"
                    "imports_stay_installed()\n"
                    "sys.argv = sys.argv[1:]\n"
+                   "if pathlib.Path(sys.argv[0]).name == 'film.py':\n"
+                   "    import sqlite3\n"
+                   "    sqlite3.connect = deny\n"
+                   "    original_open = builtins.open\n"
+                   "    original_io_open = io.open\n"
+                   "    def guarded_open(file, *a, **k):\n"
+                   "        if isinstance(file, (str, bytes, pathlib.Path)) and pathlib.Path(file).name in ('.claude.json', 'credentials.json', '.credentials.json', 'history.db', 'index-cache.db', 'claude-share.json'):\n"
+                   "            raise AssertionError('film opened account/history/index/token')\n"
+                   "        return original_open(file, *a, **k)\n"
+                   "    builtins.open = guarded_open\n"
+                   "    def guarded_io_open(file, *a, **k):\n"
+                   "        if isinstance(file, (str, bytes, pathlib.Path)) and pathlib.Path(file).name in ('.claude.json', 'credentials.json', '.credentials.json', 'history.db', 'index-cache.db', 'claude-share.json'):\n"
+                   "            raise AssertionError('film opened account/history/index/token')\n"
+                   "        return original_io_open(file, *a, **k)\n"
+                   "    io.open = guarded_io_open\n"
                    "try: runpy.run_path(sys.argv[0], run_name='__main__')\n"
                    "except SystemExit as exc:\n"
                    "    if exc.code not in (None, 0): raise\n"
                    "imports_stay_installed()\n")
-        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(root / "config"), TOKEN_COUNTER_NO_INSTALL="1")
-        for skill in ("token-report", "token-share"):
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(root / "config"), TOKEN_COUNTER_NO_INSTALL="1", CLAUDE_CODE_SESSION_ID='synthetic-session-B')
+        for skill in ("token-film", "token-report", "token-share"):
             text = (installed / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
             skill_dir = (installed / "skills" / skill).as_posix()
             for interpreter in ("python", "python3"):
@@ -184,9 +203,13 @@ def _installed_smoke(repo):
                 assert match is not None, "missing skill interpreter command"
                 args = shlex.split(match.group(0).replace("${CLAUDE_SKILL_DIR}", skill_dir))
                 args = ["synthetic-smoke" if arg == "HANDLE" else arg for arg in args[1:]]
-                artifact = root / (interpreter + ("-model.json" if skill == "token-report" else "-payload.json"))
-                args += ["--sessions-root", str(sessions), "--no-account", "--procs", "1", "--quiet"]
-                args += ["--json", str(artifact)] if skill == "token-report" else ["--out", str(artifact)]
+                artifact = root / (interpreter + '-' + skill + '.json')
+                args += ["--sessions-root", str(sessions)]
+                if skill == 'token-film':
+                    args += ['--json', str(artifact)]
+                else:
+                    args += ["--no-account", "--procs", "1", "--quiet"]
+                    args += ["--json", str(artifact)] if skill == "token-report" else ["--out", str(artifact)]
                 # Test both documented command variants using this CI cell's Python,
                 # including skill-text substitution and paths containing spaces.
                 command = [sys.executable, "-I", "-S", "-B", "-c", wrapper, str(repo), str(installed)] + args
@@ -196,6 +219,20 @@ def _installed_smoke(repo):
                     raise ValueError("isolated installed-copy " + skill + "/" + interpreter +
                                      " failed (exit %d)" % result.returncode)
                 value = json.loads(artifact.read_bytes())
+                if skill == 'token-film':
+                    data = value['film']
+                    totals = {k: sum(s[k] for s in data['steps']) for k in ('read', 'write', 'input', 'output', 'thinking')}
+                    assert data['counts']['responses'] == data['counts']['steps'] == 2, 'installed film response counts'
+                    assert (totals['read'] + totals['write'] + totals['input'], totals['read'], totals['output'], totals['thinking'], totals['input'], totals['write'], totals['output'] - totals['thinking']) == (255, 90, 18, 7, 15, 150, 11), 'installed film B counts'
+                    assert sum(totals[k] for k in ('read', 'write', 'input', 'output')) == 273, 'installed film grand'
+                    assert data['pricing']['total_usd_micro'] == 11578, 'installed film value'
+                    films = list((root / 'config').rglob('film-*-v0.2.0.html'))
+                    assert len(films) == 1, 'installed default film missing'
+                    html = films[0].read_bytes()
+                    assert html.lower().startswith(b'<!doctype html>'), 'installed film doctype'
+                    assert b'"fredoka":' in html and b'"mono":' in html and b'synthetic-' not in html and b'abcd' not in html, 'installed film fonts/privacy'
+                    assert not list(root.rglob('history.db')) and not list(root.rglob('index-cache.db')) and not list(root.rglob('claude-share.json')), 'film wrote unrelated state'
+                    continue
                 counts = value['totals'] if skill == 'token-report' else {
                     key: sum(d[key] for d in value['days']) for key in ('responses', 'input', 'cached', 'output', 'reasoning')}
                 assert tuple(counts[k] for k in ('responses', 'input', 'cached', 'output', 'reasoning')) == (2, 255, 90, 18, 7), "installed B counts differ"
@@ -305,7 +342,7 @@ def _run(repo, existing_only=False):
             assert name not in RESERVED_MARKETPLACES and name not in RESERVED_NAMES, "reserved marketplace name"
             assert name == "stdcmms-lang", "wrong marketplace name"
             assert isinstance(marketplace["owner"]["name"], str) and marketplace["owner"]["name"], "missing owner name"
-            assert marketplace['metadata']['version'] == '0.1.0', 'wrong Claude marketplace version'
+            assert marketplace['metadata']['version'] == '0.2.0', 'wrong Claude marketplace version'
             entries = marketplace["plugins"]
             assert isinstance(entries, list) and len(entries) == 1, "expected one Claude plugin entry"
             names = set()
@@ -316,20 +353,20 @@ def _run(repo, existing_only=False):
                 target = _local_path(repo, repo, entry["source"])
                 if entry["name"] == "token-counter-claude":
                     assert target == repo / CLAUDE, "wrong Claude source"
-                    assert entry["version"] == "0.1.0", "wrong Claude entry version"
+                    assert entry["version"] == "0.2.0", "wrong Claude entry version"
             assert "token-counter-claude" in names, "Claude marketplace entry missing"
         attempt("Claude marketplace rules", marketplace_check)
     if manifest is not None:
         def manifest_check():
             assert _name(manifest["name"]) and manifest["name"] == "token-counter-claude", "invalid/reserved Claude name"
             assert manifest["displayName"] == "Token Counter for Claude Code", "wrong display name"
-            assert manifest["version"] == "0.1.0", "wrong Claude manifest version"
+            assert manifest["version"] == "0.2.0", "wrong Claude manifest version"
             assert "skills" not in manifest, "default skill discovery needs no manifest path"
             assert not any(k in manifest for k in ("hooks", "mcpServers", "agents")), "unexpected runtime components"
             plugin = (repo / CLAUDE).resolve()
             assert _within(plugin, repo), "Claude plugin outside repository"
             _tree_within(plugin)
-            assert {p.name for p in (plugin / 'skills').iterdir() if p.is_dir()} == {'token-report', 'token-share'}, 'expected exactly two Claude skills'
+            assert {p.name for p in (plugin / 'skills').iterdir() if p.is_dir()} == {'token-report', 'token-share', 'token-film'}, 'expected exactly three Claude skills'
             for name in ("skills", "commands", "hooks", "agents"):
                 assert not (plugin / ".claude-plugin" / name).exists(), "components must be at plugin root"
             for key in ("commands", "icon"):
@@ -343,12 +380,20 @@ def _run(repo, existing_only=False):
     share_path = CLAUDE + "/skills/token-share/scripts/share.py"
     if optional(package_path, required):
         version = attempt("Claude package version", lambda: _assignment(repo, package_path, "__version__"))
-        if version is not None and version != "0.1.0":
-            errors.append("Claude package version must be 0.1.0")
+        if version is not None and version != "0.2.0":
+            errors.append("Claude package version must be 0.2.0")
     if optional(share_path, required):
         client = attempt("Claude CLIENT", lambda: _assignment(repo, share_path, "CLIENT"))
-        if client is not None and client != {"name": "claude-usage", "version": "0.1.0"}:
-            errors.append("Claude CLIENT must be claude-usage 0.1.0")
+        if client is not None and client != {"name": "claude-usage", "version": "0.2.0"}:
+            errors.append("Claude CLIENT must be claude-usage 0.2.0")
+    validate_path = CLAUDE + '/' + SCRIPT_DIR + '/tokencounter/share_validate.py'
+    if optional(validate_path, required):
+        client = attempt('Claude validator CLIENT', lambda: _assignment(repo, validate_path, 'CLIENT'))
+        if client is not None and client != {'name': 'claude-usage', 'version': '0.2.0'}:
+            errors.append('Claude validator CLIENT must be claude-usage 0.2.0')
+    for relative in (CLAUDE + '/skills/token-film/scripts/film.py', CLAUDE + '/skills/token-film/assets/film.html',
+                     'scripts/test_claude_film.py', 'scripts/test_claude_film_page.js', 'scripts/fixtures/claude_film_cases.py'):
+        optional(relative, required)
     for name in SHARED:
         dest = CLAUDE + "/" + SCRIPT_DIR + "/tokencounter/" + name
         if optional(dest, required):
@@ -367,7 +412,7 @@ def _run(repo, existing_only=False):
             expected = parser.parse_prices(markdown, as_of=table["as_of"], source_url=table["source_url"])
             assert expected == table, "offline price fixture differs from vendored table"
         attempt("Claude offline price parity", price_check)
-    for skill in ("token-report", "token-share"):
+    for skill in ("token-report", "token-share", "token-film"):
         path = CLAUDE + "/skills/" + skill + "/SKILL.md"
         if optional(path, required):
             attempt(skill + " frontmatter/commands", lambda path=path, skill=skill: _frontmatter(repo, path, skill))
@@ -380,7 +425,7 @@ def _run(repo, existing_only=False):
     if manifest is not None and report_exists and (repo / share_path).exists() and not errors:
         attempt("Claude isolated installed-copy smoke", lambda: _installed_smoke(repo))
         if not errors:
-            notes.append('Claude installed-copy smoke: report/share, python/python3 substitution, isolated imports, no network/token')
+            notes.append('Claude installed-copy smoke: report/share/film, python/python3 substitution, isolated imports, no network/token')
     elif manifest is None:
         notes.append("not present: Claude isolated installed-copy smoke (plugin manifest absent)")
     return errors, notes

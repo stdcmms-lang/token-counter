@@ -14,7 +14,7 @@ import re
 import zlib
 from typing import List
 
-CLIENT = {'name': 'claude-usage', 'version': '0.1.0'}
+CLIENT = {'name': 'claude-usage', 'version': '0.2.0'}
 MAX_BODY_BYTES = 2000000
 MAX_DAYS = 4000
 MAX_SESSIONS = 3000
