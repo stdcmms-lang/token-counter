@@ -3,8 +3,11 @@
   "version": "1.10.0",
   "description": "Independently tokenize your Codex session history and report cached vs uncached input as a local HTML dashboard; optionally share the totals to the tokenusage.dev leaderboard.",
   "author": {
-    "name": "hao.he@giga.ai"
+    "name": "Jack H",
+    "url": "https://tokenusage.dev"
   },
+  "homepage": "https://tokenusage.dev/share",
+  "repository": "https://github.com/stdcmms-lang/token-counter",
   "license": "MIT",
   "keywords": [
     "tokens",
@@ -25,20 +28,23 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Token Counter",
-    "shortDescription": "See where your context window actually goes",
+    "shortDescription": "Where your context window goes",
     "longDescription": "Re-tokenizes Codex rollout logs locally with a vendored o200k_base vocabulary instead of trusting reported aggregates, attributes every token to a category (system prompt, tool output, user message, reasoning), measures cached against uncached input from the canonical usage ledger, and renders a self-contained HTML dashboard, with how long responses, turns and tool calls took from the logs' own timestamps. Beside the token counts it shows what the recorded usage would cost at OpenAI's API list prices, from a vendored price table that is never fetched -- a value, not a bill -- and never translates tokens into rate-limit percentages. Nothing is intercepted at runtime, and the report stays on the machine unless you share it. A separate, opt-in skill shares daily token counts, per-session summaries and weekly rate-limit usage by plan, and publishes the report page itself -- never content, paths or account identity -- to the public leaderboard at tokenusage.dev, and only after a dry run and an explicit --yes.",
-    "developerName": "hao.he@giga.ai",
+    "developerName": "Jack H",
     "category": "Engineering",
     "capabilities": [
       "Read",
       "Write"
     ],
+    "websiteURL": "https://tokenusage.dev/share",
+    "supportURL": "https://tokenusage.dev/contact",
+    "privacyPolicyURL": "https://tokenusage.dev/privacy",
+    "termsOfServiceURL": "https://tokenusage.dev/terms",
     "composerIcon": "./assets/token-counter.svg",
     "logo": "./assets/token-counter.svg",
     "logoDark": "./assets/token-counter-dark.svg",
     "defaultPrompt": [
       "Build me a token report for all my Codex sessions",
-      "Where is my context window actually going?",
       "Which sessions waste the most tokens on resent tool output?",
       "Share my token usage to the tokenusage.dev leaderboard"
     ],
