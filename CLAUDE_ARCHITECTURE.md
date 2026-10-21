@@ -10,7 +10,7 @@ of one development corpus, not a guarantee about future Claude Code records.
 Claude's headline is recorded usage, not independently tokenized content. Its
 visible composition is a UTF-8 byte inventory. The product has its own marketplace
 entry, manifest, two skills, package version, state and endpoint-specific share
-token. Codex remains `token-counter` 1.10.0 with its existing counting contract.
+token. Codex remains `token-counter` 1.10.1 with its existing counting contract.
 
 Four checked-in files are byte-identical across the products: `render.py`,
 `latency.py`, `index.py` and `images.py`. `scripts/sync_shared.py` copies bytes from
