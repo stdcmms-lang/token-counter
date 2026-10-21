@@ -1,10 +1,14 @@
 # Token Counter for Claude Code
 
-Token Counter for Claude Code builds a local HTML report of your Claude Code usage from the
-transcripts Claude Code keeps on your machine and the history the plugin retains: input,
-output, cache reads and cache writes, what that usage would cost at Anthropic's API list
-prices (from a price table bundled with the plugin, never fetched), the quota readings Claude
-Code recorded, and how long responses took. Making the report sends nothing.
+Token Counter for Claude Code shows what your Claude Code usage would cost at Anthropic's API
+list prices, and how it filled your weekly limit: it charts your usage within each weekly
+all-model limit window it observed, alongside the quota readings Claude Code recorded, and its
+JSON output attributes each window to Pro, Max 5x or Max 20x when the account observations it
+captured support that. The report is a local HTML page built from the transcripts Claude Code
+keeps on your machine and the history the plugin retains, with input, output, cache reads and
+response times. By default, prices come from a table bundled with the plugin and nothing is
+fetched, and making the report sends nothing. A Codex edition, `token-counter`, is in the same
+repository.
 
 Sharing is separate and opt-in. The token-share skill can publish your totals and a sanitized
 copy of the report page to the public leaderboard at

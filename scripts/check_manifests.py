@@ -242,11 +242,11 @@ def _run(repo, existing_only=False):
     codex = attempt("Codex manifest", lambda: _json(repo, CODEX + "/.codex-plugin/plugin.json"))
     client = attempt("Codex CLIENT", lambda: _assignment(repo, CODEX + "/skills/token-share/scripts/share.py", "CLIENT"))
     if codex is not None and client is not None:
-        if (codex.get("name") != "token-counter" or codex.get("version") != "1.10.0" or
-                client != {"name": "token-counter", "version": "1.10.0"}):
-            errors.append("Codex manifest and share CLIENT must independently agree on token-counter 1.10.0")
+        if (codex.get("name") != "token-counter" or codex.get("version") != "1.10.1" or
+                client != {"name": "token-counter", "version": "1.10.1"}):
+            errors.append("Codex manifest and share CLIENT must independently agree on token-counter 1.10.1")
         else:
-            notes.append("Codex manifest and share CLIENT: 1.10.0")
+            notes.append("Codex manifest and share CLIENT: 1.10.1")
         def codex_paths():
             market = marketplaces['.agents/plugins/marketplace.json']
             assert market['name'] == 'stdcmms-lang', 'wrong Codex marketplace name'
