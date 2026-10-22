@@ -10,6 +10,7 @@
   "homepage": "https://tokenusage.dev/share",
   "repository": "https://github.com/stdcmms-lang/token-counter",
   "license": "MIT",
+  "documentationUrl": "https://tokenusage.dev/share",
   "supportUrl": "https://tokenusage.dev/contact",
   "privacyPolicyUrl": "https://tokenusage.dev/privacy",
   "termsOfServiceUrl": "https://tokenusage.dev/terms",
