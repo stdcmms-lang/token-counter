@@ -6,7 +6,7 @@
     "name": "Jack H",
     "url": "https://tokenusage.dev"
   },
-  "homepage": "https://tokenusage.dev/share",
+  "homepage": "https://tokenusage.dev/token-report",
   "repository": "https://github.com/stdcmms-lang/token-counter",
   "license": "MIT",
   "keywords": [
@@ -36,7 +36,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://tokenusage.dev/share",
+    "websiteURL": "https://tokenusage.dev/token-report",
     "supportURL": "https://tokenusage.dev/contact",
     "privacyPolicyURL": "https://tokenusage.dev/privacy",
     "termsOfServiceURL": "https://tokenusage.dev/terms",

@@ -12,7 +12,7 @@ repository.
 
 Sharing is separate and opt-in. The token-share skill can publish your totals and a sanitized
 copy of the report page to the public leaderboard at
-[tokenusage.dev](https://tokenusage.dev/share). Its default is a dry run that sends nothing;
+[tokenusage.dev](https://tokenusage.dev/token-report). Its default is a dry run that sends nothing;
 publishing needs `--yes`.
 
 ## Install
