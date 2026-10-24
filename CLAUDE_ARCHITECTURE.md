@@ -1,23 +1,24 @@
 # Token Counter for Claude Code — Architecture
 
-This describes `token-counter-claude` **0.1.0** as implemented after rounds 1–8,
-fix round 4b and the final round 9 packaging/performance pass. The agreed source is
-the amended implementation plan `result2.md` of 2026-10-10. Evidence is a snapshot
-of one development corpus, not a guarantee about future Claude Code records.
+This describes `token-counter-claude` **0.2.0**, adding cc-api to the
+report/share implementation from rounds 1–8, fix round 4b and the final round 9 packaging/performance pass.
+The cc-api contract follows the 2026-10-24 result-plan.md with amendments B1/B2.
+Evidence is a snapshot of one development corpus, not a guarantee about future Claude Code records.
 
 ## 1. Scope and relationship to the Codex product
 
 Claude's headline is recorded usage, not independently tokenized content. Its
 visible composition is a UTF-8 byte inventory. The product has its own marketplace
-entry, manifest, two skills, package version, state and endpoint-specific share
-token. Codex remains `token-counter` 1.10.1 with its existing counting contract.
+entry, manifest, three skills, package version, state and endpoint-specific share
+token. Codex remains `token-counter` 1.11.0 with its existing counting contract.
 
-Four checked-in files are byte-identical across the products: `render.py`,
-`latency.py`, `index.py` and `images.py`. `scripts/sync_shared.py` copies bytes from
-Codex to Claude or checks them with `--check`, without following symlinks. Claude
-owns extraction, its strict count validation, ledger, history, calendar, price
-validation, window logic and share validation. Its adapters satisfy the shared
-utilities' interfaces. No runtime import reaches the sibling Codex plugin.
+Four report utility files remain byte-identical: render.py, latency.py,
+index.py and images.py. A fifth shared file is the standalone
+skills/cc-api/scripts/cc_api.py helper. scripts/sync_shared.py copies the
+canonical Codex bytes into the Claude plugin or checks them with --check.
+Each installed plugin contains real files and imports no sibling plugin.
+Claude continues to own its report extraction, validation, ledger, history,
+calendar, pricing, windows and share validation.
 
 The renderer's legacy defaults are protected by a frozen `render.py` from commit
 `2aebba1`, isolated baseline imports and complete byte comparisons. The sensitivity
@@ -26,8 +27,9 @@ that byte. No Codex runtime or test file changes in round 9.
 
 There is no daemon, hook, MCP server, agent or continuous capture process. Normal
 report/share collection runs capture evidence on demand. Python 3.8+ and its
-standard library are the runtime requirements. No tokenizer, vocabulary,
-dependency installation or runtime price fetching exists in the Claude product.
+standard library are the report/share runtime requirements. cc-api additionally
+requires installed Claude Code, an API key and network access. No tokenizer,
+vocabulary, dependency installation or runtime price fetching exists in Claude reporting/sharing.
 
 ## 2. Evidence and shape dispatch
 
@@ -395,7 +397,7 @@ navigation. No browser is needed for the page tests.
 
 ## 13. Share schema1 mapping and server limitations
 
-Schema 1 with client `claude-usage` 0.1.0 carries whole safe captured months of
+Schema 1 with client `claude-usage` 0.2.0 carries whole safe captured months of
 recorded daily counts and known-speed partial tier partitions, selected session
 hashes, a retained-safe union of weekly-all observation windows and 30-day timing.
 Session IDs are the first 16 hex characters of domain-separated SHA-256 over family
@@ -510,6 +512,18 @@ preparation, then closes it in `finally`; ordinary reports close after collectio
 This avoids the second open-time full pass. The explicit full pass before preparing
 and every subsequent network mutation remains intact.
 
+cc-api has no plugin state path. It reads only its selected key source,
+resolves the user's CLI on PATH and preserves the caller's working
+directory. Claude's skill uses the quoted CLAUDE_SKILL_DIR substitution;
+Codex resolves the absolute installed skill path without changing directory.
+The helper copies and sanitizes the child environment and changes no login
+or configuration files.
+
+The packaging smoke also copies each plugin independently and runs its
+cc-api helper with a fake PATH launcher, synthetic credentials, paths with
+spaces and both documented interpreter-command variants. The child is
+offline and no real Claude installation or account is used.
+
 ## 15. Tests, mutation obligations and CI
 
 The unchanged Claude suites cover identity/collapse/ownership, strict count types,
@@ -527,7 +541,7 @@ immutable batches and readable legacy storage. Round 8's count-success/local-sta
 failure test and its accepted stricter-than-harness parity stance are retained.
 
 Full `check_manifests.check(repo) -> List[str]` checks marketplaces, contained
-sources/components, reserved names, independent Claude/Codex versions, four shared
+sources/components, reserved names, independent Claude/Codex versions, five shared
 byte pairs, offline prices, frozen renderer/server hashes, provenance/lockfile
 pins, sensitivity self-test, skill frontmatter/substitutions/interpreter variants
 and isolated installed copy. `--existing-only` still checks every present surface
@@ -545,6 +559,19 @@ does not run Codex suites or install tiktoken. Existing vocabulary CI stays unch
 CI installs the development harness with `npm ci --prefix scripts/server_contract`;
 there is no new runtime dependency. The unchanged Codex pipeline's synthetic local
 wheel installer test remains an offline test obligation.
+
+The shared cc-api contract suite and its paired mutation suite run with
+python -I -S -B in the existing Ubuntu/Windows Python 3.8/3.14 cells and the
+existing macOS-14/Python 3.14 cell. They need neither tiktoken nor the Node
+contract harness. Fixtures supply exact argv, environment, stdin, result,
+cost, turns and model expectations. Mutation success requires a passing
+baseline, an executed decision and failure of the designated assertion;
+exceptions, import errors, no-ops and unrelated failures are invalid evidence.
+
+Manifest checks require three skills in each plugin, both cc-api
+entrypoints, their byte identity and isolated fake-child installed-copy
+execution. Product/client versions advance independently of the unchanged
+server-contract package and schema-1 protocol.
 
 ## 16. Known limitations and unverified behaviors
 
@@ -633,3 +660,8 @@ variation is run noise. Reusing history then saves 3.758 s on counts-only and
 prints no internal timing line. A fingerprint-changing edit requires one initial
 re-extraction; that warm-up is excluded from the warm measurements. These are
 sequential guarded measurements of a live corpus, not universal timings.
+
+For cc-api, complete live JSON result shape, real installed launcher
+compatibility and both agents' background-process lifecycles remain UNVERIFIED
+by the saved evidence. Anthropic's credit eligibility and actual balance deduction are external decisions; the helper
+cannot establish them from total_cost_usd.

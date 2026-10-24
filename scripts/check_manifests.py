@@ -74,7 +74,7 @@ def _name(value):
             and value not in RESERVED_NAMES and not value.startswith(RESERVED_PREFIXES))
 
 
-def _local_path(repo, base, value):
+def _local_path(repo, base, value, *, allow_missing=False):
     if not isinstance(value, str) or not value.startswith("./") or "\\" in value:
         raise ValueError("local component/source path must start with ./")
     parts = value[2:].split("/")
@@ -83,7 +83,7 @@ def _local_path(repo, base, value):
     target = (base / value[2:]).resolve()
     if not _within(target, base) or not _within(target, repo):
         raise ValueError("component/source resolves outside its permitted root")
-    if not target.exists():
+    if not target.exists() and not allow_missing:
         raise ValueError("component/source does not exist: " + value)
     return target
 
@@ -105,7 +105,7 @@ def _import_script(repo, relative, name):
     return module
 
 
-def _frontmatter(repo, relative, skill):
+def _frontmatter(repo, relative, skill, *, allow_missing_script=False):
     text = _read(repo, relative).decode("utf-8")
     match = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n", text, re.S)
     if match is None:
@@ -124,7 +124,7 @@ def _frontmatter(repo, relative, skill):
         raise ValueError(skill + ": description and argument-hint are required")
     if fields.get("disable-model-invocation", "false") != "false":
         raise ValueError(skill + ": model invocation must be enabled")
-    script = "report.py" if skill == "token-report" else "share.py"
+    script = {"token-report": "report.py", "token-share": "share.py", "cc-api": "cc_api.py"}[skill]
     path = '"${CLAUDE_SKILL_DIR}/scripts/' + script + '"'
     if "python " + path not in text or "python3 " + path not in text:
         raise ValueError(skill + ": missing quoted Windows/POSIX interpreter variants")
@@ -134,12 +134,93 @@ def _frontmatter(repo, relative, skill):
     for command_path in commands:
         if command_path != "${CLAUDE_SKILL_DIR}/scripts/" + script:
             raise ValueError(skill + ": command outside its skill scripts")
-        _local_path(repo, (repo / relative).parent, "./scripts/" + script)
+        _local_path(repo, (repo / relative).parent, "./scripts/" + script,
+                    allow_missing=allow_missing_script)
     if skill == "token-report" and fields.get("disable-model-invocation") != "false":
         raise ValueError(skill + ": explicit model invocation setting missing")
-    if skill == "token-share" and "disable-model-invocation" in fields:
+    if skill in ("token-share", "cc-api") and "disable-model-invocation" in fields:
         raise ValueError(skill + ": use default model invocation, without a disabling field")
     return text
+
+
+def _codex_cc_api_frontmatter(repo, *, allow_missing_script=False):
+    relative = CODEX + "/skills/cc-api/SKILL.md"
+    text = _read(repo, relative).decode("utf-8")
+    match = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n", text, re.S)
+    if match is None:
+        raise ValueError("Codex cc-api: missing frontmatter")
+    fields = {}
+    for line in match.group(1).splitlines():
+        key, value = line.split(":", 1)
+        if key in fields:
+            raise ValueError("Codex cc-api: duplicate frontmatter key")
+        fields[key] = value.strip()
+    if fields.get("name") != "cc-api" or not fields.get("description"):
+        raise ValueError("Codex cc-api: name/description required")
+    for interpreter in ("python", "python3"):
+        if interpreter + ' "<skill-dir>/scripts/cc_api.py" -- "TASK"' not in text:
+            raise ValueError("Codex cc-api: missing quoted absolute-path command")
+    _local_path(repo, repo / CODEX / "skills/cc-api", "./scripts/cc_api.py",
+                allow_missing=allow_missing_script)
+    return text
+
+
+def _installed_cc_api_smoke(repo) -> None:
+    cases = _import_script(repo, "scripts/fixtures/cc_api_cases.py", "manifest_cc_api_cases")
+    wrapper = ("import pathlib, runpy, socket, sys, urllib.request\n"
+               "def deny(*a, **k): raise AssertionError('cc-api smoke attempted network')\n"
+               "socket.socket = socket.create_connection = socket.getaddrinfo = deny\n"
+               "urllib.request.urlopen = deny\n"
+               "checkout = pathlib.Path(sys.argv.pop(1)).resolve()\n"
+               "installed = pathlib.Path(sys.argv.pop(1)).resolve()\n"
+               "def within(path, base):\n"
+               "    try: path.resolve().relative_to(base); return True\n"
+               "    except ValueError: return False\n"
+               "assert not any(within(pathlib.Path(p), checkout) for p in sys.path), 'checkout on sys.path'\n"
+               "sys.argv = sys.argv[1:]\n"
+               "assert within(pathlib.Path(sys.argv[0]), installed), 'helper outside installed plugin'\n"
+               "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+    # One plugin per temporary installation: neither a checkout nor a sibling is
+    # available on the isolated helper's import path.
+    for plugin in (CODEX, CLAUDE):
+        source = repo / plugin
+        _tree_within(source.resolve())
+        with tempfile.TemporaryDirectory(prefix="cc api installed smoke ") as directory:
+            root = Path(directory).resolve()
+            installed = root / "independently installed plugin"
+            shutil.copytree(str(source), str(installed), symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            fake_bin = cases.install_fake_claude(root)
+            env = cases.base_env(root, fake_bin)
+            cwd = root / "caller task directory"
+            cwd.mkdir()
+            text = (installed / "skills/cc-api/SKILL.md").read_text(encoding="utf-8")
+            skill_dir = (installed / "skills/cc-api").as_posix()
+            token = "${CLAUDE_SKILL_DIR}" if plugin == CLAUDE else "<skill-dir>"
+            for interpreter in ("python", "python3"):
+                match = re.search(r'^' + interpreter + r' "([^"\n]+)" -- "TASK"$', text, re.M)
+                assert match is not None, "missing cc-api interpreter command"
+                args = shlex.split(match.group(0).replace(token, skill_dir))[1:]
+                task = 'Installed multiline task\nwith & | " % and Unicode \u4f60\u597d'
+                args = [task if arg == "TASK" else arg for arg in args]
+                result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", wrapper,
+                                         str(repo), str(installed)] + args,
+                                        input=cases.PARENT_STDIN, cwd=str(cwd), env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                assert result.returncode == 0, "installed cc-api helper failed"
+                record = cases.read_record(Path(env["CC_API_RECORD"]))
+                assert record["argv"] == ["-p", "--output-format", "json"], "installed argv differs"
+                assert record["stdin_hex"] == task.encode("utf-8").hex(), "installed task stdin differs"
+                assert record["cwd"] == str(cwd), "installed caller cwd differs"
+                assert record["env"]["ANTHROPIC_API_KEY"] == cases.ENV_KEY, "installed key differs"
+                assert "CC_API_KEY" not in record["env"], "installed source key leaked"
+                assert "CC_API_KEY_FILE" not in record["env"], "installed file source leaked"
+                assert record["env"]["CLAUDE_CODE_GIT_BASH_PATH"] == cases.KEPT["CLAUDE_CODE_GIT_BASH_PATH"], "installed configuration lost"
+                expected = (cases.RESULT + "\ncc-api: total_cost_usd=0.2705; turns=3; model=" + cases.MODEL +
+                            "\ncc-api: Anthropic decides whether API credits apply; check Console Billing: "
+                            "https://platform.claude.com/settings/billing\n")
+                assert result.stdout.decode("utf-8").replace("\r\n", "\n") == expected, "installed result differs"
+                assert result.stderr == b"", "installed helper stderr differs"
 
 
 def _installed_smoke(repo):
@@ -242,11 +323,11 @@ def _run(repo, existing_only=False):
     codex = attempt("Codex manifest", lambda: _json(repo, CODEX + "/.codex-plugin/plugin.json"))
     client = attempt("Codex CLIENT", lambda: _assignment(repo, CODEX + "/skills/token-share/scripts/share.py", "CLIENT"))
     if codex is not None and client is not None:
-        if (codex.get("name") != "token-counter" or codex.get("version") != "1.10.1" or
-                client != {"name": "token-counter", "version": "1.10.1"}):
-            errors.append("Codex manifest and share CLIENT must independently agree on token-counter 1.10.1")
+        if (codex.get("name") != "token-counter" or codex.get("version") != "1.11.0" or
+                client != {"name": "token-counter", "version": "1.11.0"}):
+            errors.append("Codex manifest and share CLIENT must independently agree on token-counter 1.11.0")
         else:
-            notes.append("Codex manifest and share CLIENT: 1.10.1")
+            notes.append("Codex manifest and share CLIENT: 1.11.0")
         def codex_paths():
             market = marketplaces['.agents/plugins/marketplace.json']
             assert market['name'] == 'stdcmms-lang', 'wrong Codex marketplace name'
@@ -258,6 +339,8 @@ def _run(repo, existing_only=False):
             plugin = (repo / CODEX).resolve()
             _tree_within(plugin)
             _local_path(repo, plugin, codex['skills'].rstrip('/'))
+            skills = {p.name for p in (plugin / 'skills').iterdir() if p.is_dir()}
+            assert (skills | {'cc-api'} if existing_only else skills) == {'token-report', 'token-share', 'cc-api'}, 'expected exactly three Codex skills'
             for key in ('composerIcon', 'logo', 'logoDark'):
                 _local_path(repo, plugin, codex['interface'][key])
         attempt('Codex source/component paths', codex_paths)
@@ -305,7 +388,7 @@ def _run(repo, existing_only=False):
             assert name not in RESERVED_MARKETPLACES and name not in RESERVED_NAMES, "reserved marketplace name"
             assert name == "stdcmms-lang", "wrong marketplace name"
             assert isinstance(marketplace["owner"]["name"], str) and marketplace["owner"]["name"], "missing owner name"
-            assert marketplace['metadata']['version'] == '0.1.0', 'wrong Claude marketplace version'
+            assert marketplace['metadata']['version'] == '0.2.0', 'wrong Claude marketplace version'
             entries = marketplace["plugins"]
             assert isinstance(entries, list) and len(entries) == 1, "expected one Claude plugin entry"
             names = set()
@@ -316,20 +399,21 @@ def _run(repo, existing_only=False):
                 target = _local_path(repo, repo, entry["source"])
                 if entry["name"] == "token-counter-claude":
                     assert target == repo / CLAUDE, "wrong Claude source"
-                    assert entry["version"] == "0.1.0", "wrong Claude entry version"
+                    assert entry["version"] == "0.2.0", "wrong Claude entry version"
             assert "token-counter-claude" in names, "Claude marketplace entry missing"
         attempt("Claude marketplace rules", marketplace_check)
     if manifest is not None:
         def manifest_check():
             assert _name(manifest["name"]) and manifest["name"] == "token-counter-claude", "invalid/reserved Claude name"
             assert manifest["displayName"] == "Token Counter for Claude Code", "wrong display name"
-            assert manifest["version"] == "0.1.0", "wrong Claude manifest version"
+            assert manifest["version"] == "0.2.0", "wrong Claude manifest version"
             assert "skills" not in manifest, "default skill discovery needs no manifest path"
             assert not any(k in manifest for k in ("hooks", "mcpServers", "agents")), "unexpected runtime components"
             plugin = (repo / CLAUDE).resolve()
             assert _within(plugin, repo), "Claude plugin outside repository"
             _tree_within(plugin)
-            assert {p.name for p in (plugin / 'skills').iterdir() if p.is_dir()} == {'token-report', 'token-share'}, 'expected exactly two Claude skills'
+            skills = {p.name for p in (plugin / 'skills').iterdir() if p.is_dir()}
+            assert (skills | {'cc-api'} if existing_only else skills) == {'token-report', 'token-share', 'cc-api'}, 'expected exactly three Claude skills'
             for name in ("skills", "commands", "hooks", "agents"):
                 assert not (plugin / ".claude-plugin" / name).exists(), "components must be at plugin root"
             for key in ("commands", "icon"):
@@ -343,12 +427,17 @@ def _run(repo, existing_only=False):
     share_path = CLAUDE + "/skills/token-share/scripts/share.py"
     if optional(package_path, required):
         version = attempt("Claude package version", lambda: _assignment(repo, package_path, "__version__"))
-        if version is not None and version != "0.1.0":
-            errors.append("Claude package version must be 0.1.0")
+        if version is not None and version != "0.2.0":
+            errors.append("Claude package version must be 0.2.0")
     if optional(share_path, required):
         client = attempt("Claude CLIENT", lambda: _assignment(repo, share_path, "CLIENT"))
-        if client is not None and client != {"name": "claude-usage", "version": "0.1.0"}:
-            errors.append("Claude CLIENT must be claude-usage 0.1.0")
+        if client is not None and client != {"name": "claude-usage", "version": "0.2.0"}:
+            errors.append("Claude CLIENT must be claude-usage 0.2.0")
+    validator_path = CLAUDE + "/" + SCRIPT_DIR + "/tokencounter/share_validate.py"
+    if optional(validator_path, required):
+        validator_client = attempt("Claude validator CLIENT", lambda: _assignment(repo, validator_path, "CLIENT"))
+        if validator_client is not None and validator_client != {"name": "claude-usage", "version": "0.2.0"}:
+            errors.append("Claude validator CLIENT must be claude-usage 0.2.0")
     for name in SHARED:
         dest = CLAUDE + "/" + SCRIPT_DIR + "/tokencounter/" + name
         if optional(dest, required):
@@ -357,6 +446,32 @@ def _run(repo, existing_only=False):
                 assert not (repo / source).is_symlink() and not (repo / dest).is_symlink(), "shared files must be real files"
                 assert _read(repo, source) == _read(repo, dest), "shared file byte difference"
             attempt(dest, shared_check)
+    cc_helpers = [plugin + "/skills/cc-api/scripts/cc_api.py" for plugin in (CODEX, CLAUDE)]
+    cc_skills = [plugin + "/skills/cc-api/SKILL.md" for plugin in (CODEX, CLAUDE)]
+    helper_exists = [optional(path, required=True) for path in cc_helpers]
+    skill_exists = [optional(path, required=True) for path in cc_skills]
+    for path, present in zip(cc_helpers, helper_exists):
+        if present:
+            def helper_check(path=path):
+                assert not (repo / path).is_symlink(), "shared files must be real files"
+                ast.parse(_read(repo, path).decode("utf-8"), filename=path, feature_version=(3, 8))
+            attempt(path, helper_check)
+    if all(helper_exists):
+        def cc_bytes():
+            assert _read(repo, cc_helpers[0]) == _read(repo, cc_helpers[1]), "cc-api shared file byte difference"
+        attempt("cc-api shared bytes", cc_bytes)
+    if skill_exists[0]:
+        attempt("Codex cc-api frontmatter/commands", lambda: _codex_cc_api_frontmatter(
+            repo, allow_missing_script=existing_only and not helper_exists[0]))
+    if skill_exists[1]:
+        attempt("Claude cc-api frontmatter/commands", lambda: _frontmatter(
+            repo, cc_skills[1], "cc-api", allow_missing_script=existing_only and not helper_exists[1]))
+    fixture_exists = optional("scripts/fixtures/cc_api_cases.py", required=True)
+    if all(helper_exists + skill_exists) and fixture_exists:
+        before = len(errors)
+        attempt("cc-api isolated installed-copy smoke", lambda: _installed_cc_api_smoke(repo))
+        if len(errors) == before:
+            notes.append("cc-api installed-copy smoke: both plugins, python/python3 paths, fake child, inherited cwd, task on stdin then EOF, no network")
     prices_path = CLAUDE + "/assets/vendor/anthropic_prices.json"
     if optional(prices_path, required):
         def price_check():

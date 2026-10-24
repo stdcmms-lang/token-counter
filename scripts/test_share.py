@@ -530,7 +530,7 @@ def test_tier_partitions():
               p['latency'] == _f4_latency(), str(p['latency']))
         check('F4 schema, version, generation time and handle are exact',
               (p['schema'], p['client'], p['generated_at'], p['handle']) ==
-              (1, {'name': 'token-counter', 'version': '1.10.1'}, '2026-09-28T12:00:00Z', 'ada'))
+              (1, {'name': 'token-counter', 'version': '1.11.0'}, '2026-09-28T12:00:00Z', 'ada'))
         if prices[0] is None:
             check('unpriced F4 omits API value and sends null day and session values',
                   'api_value' not in p and d['api_usd'] is None

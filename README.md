@@ -14,9 +14,12 @@ list prices, from a price table that ships with the plugin (see [API value](#api
 The report makes one network call, once: if `tiktoken` is missing, the first run installs it
 from PyPI (see [Install](#install)). Nothing of yours is sent.
 
-The one exception is opt-in and separate: the `token-share` skill posts daily token counts to
-the public leaderboard at [tokenusage.dev](https://tokenusage.dev), with your report page at a
-link you can send, and only when you ask it to and confirm with `--yes`. See [Sharing](#sharing).
+Two separate skills make opt-in network requests. `token-share` posts daily
+token counts and the sanitized report to the public leaderboard at
+[tokenusage.dev](https://tokenusage.dev), when you request sharing and run
+with `--yes`; see [Sharing](#sharing). `cc-api` runs a requested task through
+your installed Claude Code CLI with your Anthropic API key; see
+[Run Claude Code with an API key](#run-claude-code-with-an-api-key).
 
 ## Install
 
@@ -82,6 +85,69 @@ codex://plugins/install/token-counter?marketplace=stdcmms-lang
 
 Start a new chat afterwards; skills load only in chats begun after the install. The skills run
 `python3` (`python` on Windows), which must be 3.8 or newer and on the app's `PATH`.
+
+## Run Claude Code with an API key
+
+The Codex plugin's `cc-api` skill delegates a task to your installed Claude
+Code CLI in your current working directory:
+
+```text
+$cc-api Read README.md and summarize it in five bullets.
+```
+
+The helper runs `claude -p --output-format json` and sends TASK on stdin.
+It reads CC_API_KEY, or the UTF-8 file named by CC_API_KEY_FILE when
+CC_API_KEY is empty, and
+strips surrounding whitespace. Configure the key privately in your shell
+profile on macOS/Linux, or using setx or your PowerShell profile on Windows.
+Restart the calling application after changing its environment. The skill
+never asks you to paste a key into chat.
+
+For a direct run, use an absolute path to the checkout or installed skill,
+keeping your task directory as the current working directory:
+
+```bash
+python3 "/path/to/token-counter/plugins/token-counter/skills/cc-api/scripts/cc_api.py" -- "Read README.md and summarize it in five bullets."
+```
+
+On Windows:
+
+```powershell
+python "C:/path/to/token-counter/plugins/token-counter/skills/cc-api/scripts/cc_api.py" -- "Read README.md and summarize it in five bullets."
+```
+
+The only task options are `--model ID` and `--allow-edits`, placed before
+`--`. The latter passes `--permission-mode acceptEdits`; it adds no other
+tool approval. The UTF-8 task goes to stdin, including for Windows .cmd
+launchers. Model IDs must match `^[A-Za-z0-9._:\[\]-]{1,100}$`.
+Python 3.8+, Claude Code on PATH, network access and an Anthropic API key
+are required. The helper installs nothing.
+
+The child receives the selected key as ANTHROPIC_API_KEY. The helper removes
+inherited credential and provider-selection variables and its own key
+settings from the child's environment before setting that key. Your calling
+Codex session keeps its login and plan. The helper changes no login or
+configuration files and writes no files of its own. Claude Code can read
+workspace context, run tools and write its normal session files.
+
+Billing belongs to the key's Claude Console organization. Anthropic's
+2026-10-24 guidance says eligible self-run claude -p requests can use monthly
+API credits claimed into that organization by a Max or Team plan. Normal
+API rates apply when those credits do not cover the run; purchased credits,
+auto-reload or invoicing may pay for it. Interactive Claude Code and extra
+plan usage are not covered. Anthropic also excludes certain app, IDE and
+GitHub Action launches. Anthropic decides eligibility: check
+[Console Billing](https://platform.claude.com/settings/billing).
+
+Output contains the final result, child-reported total_cost_usd, turns and
+model. It does not establish which balance paid for the run. A "Credit
+balance is too low" error means usable API credit did not cover that API
+run; check the key's organization and Billing page.
+
+Long tasks need the calling agent's continuing-process or background shell
+mode. The helper has no execution timeout and sends the task on stdin, then EOF.
+The skill describes the mechanism and marks agent-shell lifecycle behavior
+UNVERIFIED by this repository's evidence.
 
 ## Sharing
 
@@ -291,6 +357,8 @@ python scripts/test_ledger.py            # 13 response-identity regressions
 python scripts/test_pipeline.py          # 317 pipeline assertions
 python scripts/test_mutations.py         # every fix must fail when reverted
 python scripts/test_share.py             # the share payload, its privacy and its transport
+python -I -S -B scripts/test_cc_api.py
+python -I -S -B scripts/test_cc_api_mutations.py
 python scripts/bench.py                  # the parallelism grid
 python scripts/verify_schema.py          # schema claims against the live corpus,
                                          #   including every rate-limit structural claim
@@ -302,7 +370,9 @@ python scripts/fetch_prices.py --check   # vendored prices against the live pric
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the four test scripts and
 `node scripts/test_page.js` on every pull request and every push to `main`, on Ubuntu and
-Windows with Python 3.8 and 3.14, plus `fetch_vocab.py --verify`. The rest need a real
+Windows with Python 3.8 and 3.14, plus `fetch_vocab.py --verify`. Shared cc-api
+contract and mutation suites also run in those four cells and the macOS cell.
+The rest need a real
 `~/.codex` corpus or an installed plugin, so they stay manual. So does
 `fetch_prices.py --check`: it reads the live pricing pages, which change whenever OpenAI's
 prices do.
@@ -321,7 +391,7 @@ and the installed plugin was not the reviewed code.
 
 ## Claude Code
 
-The Claude Code edition is the separate **token-counter-claude 0.1.0** plugin. Its
+The Claude Code edition is the separate **token-counter-claude 0.2.0** plugin. Its
 version, local state and share token are separate from the Codex plugin's. It reads
 Claude Code's recorded usage and retained capture history; it ships no tokenizer,
 downloads nothing and installs no packages. See [CLAUDE_ARCHITECTURE.md](CLAUDE_ARCHITECTURE.md)
@@ -341,16 +411,38 @@ claude plugin marketplace add <path to this checkout>
 claude plugin install token-counter-claude@stdcmms-lang
 ```
 
-The two skills are:
+The three skills are:
 
 ```text
 /token-counter-claude:token-report
 /token-counter-claude:token-share
+/token-counter-claude:cc-api
 ```
 
 Claude Code substitutes `${CLAUDE_SKILL_DIR}` in each skill's text with the installed
 skill directory. It is not a Bash environment variable. The installed plugin needs
 only its own copied directory; it does not import the Codex plugin or this checkout.
+
+### Use cc-api from Claude Code
+
+```text
+/token-counter-claude:cc-api Read README.md and summarize it in five bullets.
+```
+
+This runs a separate `claude -p` process in the current working directory
+using CC_API_KEY, or the stripped contents of the UTF-8 file named by
+CC_API_KEY_FILE. Your calling Claude Code session keeps its login and plan.
+Configure the key privately; the skill never asks for it in chat.
+
+The same helper and billing rules described under
+[Run Claude Code with an API key](#run-claude-code-with-an-api-key) apply.
+The maintainer's 2026-10-24 Windows test demonstrated promotional API-credit
+consumption by a keyed print-mode child launched inside interactive Claude
+Code. Interactive keyed Claude Code did not use those credits.
+
+The Claude skill launches through Bash background execution so a long
+child is not tied to the foreground shell wait. The evidence does not
+verify that background lifecycle; the skill marks it UNVERIFIED.
 
 ### Build a local report
 
@@ -420,12 +512,16 @@ Recovery preserves capture history. There is no token-import or `--forget` optio
 
 ### What the Claude plugin needs
 
-Python **3.8+**, including its standard-library SQLite, is the only runtime
-requirement. No tiktoken, vocabulary, price download, dependency installer or
-background collector is used. A writable state directory is needed to retain
-history; sharing refuses if history cannot be committed. A failed index or process
-pool falls back to extraction or one process. Unavailable history permits a live
-local lower-bound report and disables sharing.
+For reporting and sharing, Python **3.8+**, including its standard-library
+SQLite, is the only runtime requirement. No tiktoken, vocabulary, price
+download, dependency installer or background collector is used. A writable
+state directory is needed to retain history; sharing refuses if history
+cannot be committed. A failed index or process pool falls back to extraction
+or one process. Unavailable history permits a live local lower-bound report
+and disables sharing.
+
+The separate cc-api skill additionally requires Claude Code on PATH, an
+Anthropic API key and network access.
 
 Let C be nonempty `CLAUDE_CONFIG_DIR`, otherwise `~/.claude`. The defaults are
 `C/projects` for transcripts and `C/token-counter/` for state. The only external
@@ -475,7 +571,7 @@ unless the table states otherwise; no date or session filter is applied by defau
 | `--fast` | Off; all cores, Windows maximum 61; conflicts with `--procs` |
 | `--quiet` | Off; suppresses progress, preserves warnings and summary |
 | `--doctor` | Off; read-only path/parser/state diagnostics, no capture or network |
-| `--version` | Prints `token-counter-claude 0.1.0`, then exits |
+| `--version` | Prints `token-counter-claude 0.2.0`, then exits |
 
 | Share option | Default and behavior |
 | --- | --- |
@@ -603,6 +699,8 @@ long-prompt band are owner corrections, not reasons to scale counts or relabel r
 ### Claude verification
 
 ```text
+python -I -S -B scripts/test_cc_api.py
+python -I -S -B scripts/test_cc_api_mutations.py
 python -B scripts/check_manifests.py
 python -B scripts/check_manifests.py --existing-only
 python -B scripts/sync_shared.py --check
@@ -630,7 +728,8 @@ and plausibility, not the HTTP route; stricter local-only checks are documented
 in [CLAUDE_ARCHITECTURE.md §13](CLAUDE_ARCHITECTURE.md#13-share-schema1-mapping-and-server-limitations).
 
 CI preserves the four Ubuntu/Windows Python 3.8/3.14 Codex cells and suites, adds
-Claude suites/checks to them, and adds a Claude-only macOS-14/Python 3.14/Node 22
+Claude suites/checks and the shared cc-api contract/mutation suites to them,
+and adds those shared suites to a Claude macOS-14/Python 3.14/Node 22
 cell. Each independent check still runs after another check fails. The contract
 lockfile is installed in CI with `npm ci --prefix scripts/server_contract`.
 

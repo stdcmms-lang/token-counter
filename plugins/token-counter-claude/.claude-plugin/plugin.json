@@ -1,8 +1,8 @@
 {
   "name": "token-counter-claude",
   "displayName": "Token Counter for Claude Code",
-  "version": "0.1.0",
-  "description": "Report Claude Code's recorded usage locally; optionally share sanitized totals and the report page to tokenusage.dev.",
+  "version": "0.2.0",
+  "description": "Report Claude Code usage locally, optionally share sanitized totals, and run requested tasks in print mode with an Anthropic API key.",
   "author": {
     "name": "Jack H",
     "url": "https://tokenusage.dev"

@@ -22,7 +22,11 @@ COPY = os.path.join('plugins', 'token-counter-claude', 'skills', 'token-report',
 def shared_pairs(repo) -> list:
     """``[(canonical_path, copy_path), ...]`` for every shared module."""
     return [(os.path.join(repo, CANONICAL, name), os.path.join(repo, COPY, name))
-            for name in SHARED]
+            for name in SHARED] + [
+                (os.path.join(repo, 'plugins', 'token-counter', 'skills', 'cc-api',
+                              'scripts', 'cc_api.py'),
+                 os.path.join(repo, 'plugins', 'token-counter-claude', 'skills', 'cc-api',
+                              'scripts', 'cc_api.py'))]
 
 
 def _read(path):
@@ -47,6 +51,8 @@ def synchronize(repo, *, check=False) -> int:
         differing += 1
         print(os.path.relpath(dest, repo))
         if not check:
+            if os.path.islink(dest):
+                raise OSError('shared module destination must not be a symlink: ' + dest)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, 'wb') as fh:
                 fh.write(data)
