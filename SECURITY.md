@@ -13,6 +13,8 @@ Fixes go into the latest version on `main`. Older versions are not patched.
 - The Codex plugin, `plugins/token-counter`, and the Claude Code plugin,
   `plugins/token-counter-claude`: their scripts, the reports they write and the files they keep.
 - The opt-in token-share skill in each plugin, and the requests it sends to tokenusage.dev.
+- The opt-in cc-api skill in both plugins and its launch of the user's own
+  Claude Code CLI.
 - Problems with tokenusage.dev itself, including its API and the shared report pages, can go to
   the same address.
 
@@ -40,6 +42,24 @@ Paths are the defaults; `CODEX_HOME` and `CLAUDE_CONFIG_DIR` move them.
   sent. The README's [Sharing](README.md#sharing) and
   [Share Claude Code usage](README.md#share-claude-code-usage) sections describe sharing in
   full.
+- **cc-api (both plugins)** reads CC_API_KEY, otherwise the UTF-8 file named
+  by CC_API_KEY_FILE, and strips surrounding whitespace. It runs the user's
+  own `claude -p` in the caller's working directory. That CLI sends the task
+  and the workspace/tool context it selects to Anthropic for API processing.
+  Its existing configuration and proxy behavior still apply. The helper
+  passes the selected key only through the child's ANTHROPIC_API_KEY
+  environment variable. It removes inherited credential and provider-selection
+  variables and CC_API_KEY/CC_API_KEY_FILE from the copied child environment
+  (see the exact [environment policy](ARCHITECTURE.md#62-api-key-claude-code-tasks)).
+  Other configuration, including CLAUDECODE, CLAUDE_CODE_GIT_BASH_PATH and
+  ANTHROPIC_MODEL, is inherited unchanged. It never prints the selected key, places
+  it in child arguments or writes a key/log/state file. Captured child output
+  is redacted before display. Claude Code and its tools receive the API
+  credential and can write their normal session/workspace files.
+  The helper changes no login or configuration files and sends nothing to
+  tokenusage.dev. The calling session keeps its own login and plan.
+  Anthropic determines whether monthly credits cover the API run; otherwise
+  normal API rates apply.
 - The first share returns a token, kept in `~/.codex/token-counter/share.json` (Codex) or
   `~/.claude/token-counter/claude-share.json` (Claude Code). Updates and deletions send it to
   prove the entry is yours, and anyone who holds it can change or delete that leaderboard

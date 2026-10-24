@@ -25,6 +25,40 @@ claude plugin install token-counter-claude@stdcmms-lang
 Then ask Claude Code for a usage report, or run `/token-counter-claude:token-report`.
 `/token-counter-claude:token-share` previews a share without sending anything.
 
+## Run a task with an Anthropic API key
+
+```text
+/token-counter-claude:cc-api Read README.md and summarize it in five bullets.
+```
+
+The cc-api skill runs your installed `claude -p` in the current working
+directory with CC_API_KEY, or the stripped contents of the UTF-8 file named
+by CC_API_KEY_FILE. Configure the key privately in your shell profile on
+macOS/Linux, or using setx or your PowerShell profile on Windows, and restart
+the calling application. The skill never asks for a key in chat.
+
+Options are `--model ID` and `--allow-edits`; the latter passes only
+`--permission-mode acceptEdits`. Tasks go to stdin, including multiline
+tasks on Windows .cmd launchers. Model IDs must match
+`^[A-Za-z0-9._:\[\]-]{1,100}$`. Python 3.8+, Claude Code on PATH,
+network access and an Anthropic API key are required.
+
+Billing belongs to the key's Console organization. Eligible self-run
+print-mode usage can draw on monthly API credits claimed into that
+organization by a Max or Team plan, under Anthropic's rules. Normal API
+rates apply when those credits do not cover the run. Interactive Claude
+Code and extra plan usage are not covered, and Anthropic excludes certain
+app, IDE and GitHub Action launches. Check
+[Console Billing](https://platform.claude.com/settings/billing).
+
+The calling session keeps its login and plan. The helper writes no files
+and changes no login/configuration files; the child CLI can read workspace
+context, run tools and write its own session files. It returns the final
+result, child-reported cost, turns and model.
+
+The skill uses Bash background execution for long tasks. Agent background
+lifecycle behavior is UNVERIFIED by the saved repository evidence.
+
 ## What it reads, runs and sends
 
 Paths below are the defaults. A nonempty `CLAUDE_CONFIG_DIR` moves `~/.claude` to that
@@ -39,11 +73,12 @@ directory and `~/.claude.json` into it.
 - **Writes:** in `~/.claude/token-counter/`: a history database, an index cache, the report
   pages and, after a first share, `claude-share.json`. Deleting a share keeps this local
   history.
-- **Runs:** two Python scripts, `report.py` and `share.py`, on Python 3.8 or later with the
-  standard library only; collecting can use local worker processes. The report script can open
-  the finished page with your system's default handler (`--no-open` turns that off). It
-  installs no packages and fetches nothing.
-- **Sends:** nothing, unless token-share runs with `--yes`. Then it posts JSON to
+- **Runs:** three stdlib Python entrypoints, `report.py`, `share.py` and
+  `cc_api.py`, on Python 3.8 or later. Reporting can use local worker
+  processes and open the finished page with the platform handler.
+  cc-api launches your own installed Claude Code CLI for one requested task.
+  The Python helpers install no packages.
+- **Report/share sends:** nothing, unless token-share runs with `--yes`. Then it posts JSON to
   `https://tokenusage.dev/api` (or the API base set with `--api` or `TOKENUSAGE_API`, which
   must be HTTPS, or HTTP to a loopback address for testing) and uploads the sanitized report
   page, which `--no-report` leaves out. The JSON holds your public handle, daily recorded token
@@ -56,6 +91,12 @@ directory and `~/.claude.json` into it.
   `claude-share.json`; updates and deletions send it to prove the entry is yours, so keep it
   private. `--delete-report --yes` takes the page down, and `--delete --yes` removes everything
   you shared.
+
+- **cc-api sends:** the requested task and workspace/tool context selected
+  by your installed Claude Code CLI to Anthropic for the API run. The helper
+  passes the key only in the child's ANTHROPIC_API_KEY environment variable.
+  It sends nothing to tokenusage.dev. Your CLI retains its existing
+  configuration and proxy behavior.
 
 Full documentation:
 [github.com/stdcmms-lang/token-counter](https://github.com/stdcmms-lang/token-counter#claude-code).

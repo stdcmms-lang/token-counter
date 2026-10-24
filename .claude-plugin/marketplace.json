@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Token Counter plugins for Claude Code.",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "token-counter-claude",
       "source": "./plugins/token-counter-claude",
-      "description": "Report Claude Code usage locally and optionally share sanitized totals.",
-      "version": "0.1.0",
+      "description": "Report Claude Code usage, optionally share sanitized totals, and run tasks with an Anthropic API key.",
+      "version": "0.2.0",
       "category": "productivity"
     }
   ]

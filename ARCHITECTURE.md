@@ -1239,6 +1239,9 @@ tokenCounter/
     │   ├── token-counter.svg, token-counter-dark.svg
     │   └── vendor/o200k_base.tiktoken    # 3.6 MB, sha256 446a9538...
     └── skills/
+        ├── cc-api/                       # §6.2 API-key Claude Code task
+        │   ├── SKILL.md
+        │   └── scripts/cc_api.py          # standalone stdlib helper, shared bytes
         ├── token-share/                  # §6.1 opt-in upload to tokenusage.dev
         │   ├── SKILL.md
         │   └── scripts/share.py          # imports token-report's package, no copy
@@ -1298,10 +1301,10 @@ report.py --no-install             # never install tiktoken (§4.2)
 the output — recorded ≠ billed, cached is a subset, leads are not findings, the residual does
 not validate the tokenizer — because the report is easy to over-read.
 
-No MCP server, no daemon, no background process. The report sends nothing anywhere. Its one
-network call is the first-use `tiktoken` install from PyPI (§4.2), which `--no-install` turns
-off. §6.1 is the one opt-in exception, in a skill of its own, and the only code that sends
-anything.
+There is no daemon or persistent collector. token-report's network access
+is its first-use tiktoken installation (§4.2). token-share (§6.1) publishes
+usage only with --yes. cc-api (§6.2) separately runs a requested task through
+the user's installed Claude Code CLI and Anthropic API.
 
 ### 6.1 Sharing to tokenusage.dev
 
@@ -1380,6 +1383,66 @@ It is dry-run by default and sends only with `--yes`. A damaged record with cach
 or reasoning > output is clamped and counted rather than failing the share, because the
 server rejects that arithmetic outright. The first share returns a bearer token, stored per
 API endpoint in `share.json` with mode 0600; the server keeps only its hash.
+
+---
+
+### 6.2 API-key Claude Code tasks
+
+Version 1.11.0 adds cc-api. Its standalone Python 3.8+ stdlib helper is
+byte-identical in both plugins. Codex's copy is canonical; sync_shared.py
+copies it into the Claude plugin. There are no sibling runtime imports.
+
+The helper resolves claude on PATH and runs
+`claude -p --output-format json` with inherited cwd, captured output and
+no internal timeout. The UTF-8 task goes through a stdin pipe, then EOF,
+and never appears in child arguments or the child's process-list entry.
+--model is validated against `^[A-Za-z0-9._:\[\]-]{1,100}$` and passes through;
+--allow-edits adds only --permission-mode acceptEdits.
+
+The selected key comes from stripped CC_API_KEY, otherwise the stripped
+contents of the UTF-8 file named by stripped CC_API_KEY_FILE. A copied child
+environment removes inherited credential and provider-selection variables
+and the two CC_API settings, then sets ANTHROPIC_API_KEY.
+The parent environment and login configuration are untouched. The helper writes no files and redacts the
+selected key before displaying captured output.
+
+The environment policy matches variable names case-insensitively:
+
+| Action | Variables |
+|---|---|
+| Remove, then set selected key | ANTHROPIC_API_KEY |
+| Remove | ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_PROFILE |
+| Remove (Anthropic SDK WIF auto-detection) | ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID, ANTHROPIC_SERVICE_ACCOUNT_ID, ANTHROPIC_IDENTITY_TOKEN_FILE, ANTHROPIC_IDENTITY_TOKEN, ANTHROPIC_WORKSPACE_ID |
+| Remove | Every CLAUDE_CODE_USE_* provider selector, CC_API_KEY, CC_API_KEY_FILE |
+| Keep unchanged | Everything else, including CLAUDECODE, other CLAUDE_CODE_* settings, CLAUDE_CODE_GIT_BASH_PATH, ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_*_MODEL, PATH, PATHEXT, SystemRoot, COMSPEC, HOME, USERPROFILE, TMP, TEMP, CLAUDE_CONFIG_DIR, CODEX_HOME, proxy/certificate settings and unrelated provider credentials |
+
+The maintainer's billing test inherited the parent session's CLAUDECODE and
+CLAUDE_CODE_* settings. Retaining that configuration avoids dropping
+unrelated CLI settings; removal alone does not establish credit eligibility.
+
+The final result and child-reported cost, turns and model are displayed.
+Child errors return nonzero, including successful-process JSON errors.
+Credit-balance failures retain the API error and explain that usable credit
+did not cover the run. Anthropic determines credit eligibility.
+
+The 2026-10-24 saved evidence documents eligible keyed print-mode usage and
+a maintainer run that consumed promotional credit inside interactive Claude
+Code. It excludes interactive keyed Claude Code. It does not verify every
+launch origin, future CLI behavior, agent-shell background lifecycle or the
+complete JSON result schema. The WIF variable names follow Anthropic SDK
+documentation of automatic Workload Identity Federation detection (source marked in the code comment).
+
+The skills prescribe Bash background execution in Claude Code and
+continuing-process shell sessions in Codex. Those lifecycle claims are
+UNVERIFIED by repository evidence. Windows .cmd shims use the same ordinary
+argument list as native launchers; fixed options and the validated model
+ID are the only arguments. Both
+accept multiline tasks through stdin.
+
+scripts/test_cc_api.py exercises both installed copies using invented keys
+and a fake PATH launcher. scripts/test_cc_api_mutations.py requires each
+named mutation to fail its designated semantic assertion. Both are stdlib
+suites in the existing CI cells.
 
 ---
 

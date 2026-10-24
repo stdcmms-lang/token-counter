@@ -11,10 +11,13 @@ days) and on a public profile page at `https://tokenusage.dev/u/<handle>`. It al
 the token-report page itself at `https://tokenusage.dev/r/<handle>`: the same page, charts and
 styles the user gets locally, for anyone they send the link to.
 
-This is the only part of the plugin that sends anything over the network, and it sends
-nothing unless run with `--yes`. (token-report's one other network call downloads `tiktoken`
-from PyPI when it is missing. The share never does that, so the page published on `--yes` is
-the page the dry run wrote.) The numbers come from the same canonical usage ledger as
+This skill sends usage data only when run with `--yes`. token-report can
+download tiktoken from PyPI when it is missing. The separate cc-api skill
+runs requested tasks through the user's Claude Code CLI and Anthropic API;
+it does not publish token usage.
+
+The share never installs tiktoken, so the page published on `--yes` is
+the page the dry run wrote. The numbers come from the same canonical usage ledger as
 token-report, so the leaderboard agrees day for day with the report's recorded figures. The
 report page counts input with tiktoken, so its input reads lower than the leaderboard's. If
 the user compares the two, that is why.
