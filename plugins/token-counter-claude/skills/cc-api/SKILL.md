@@ -79,3 +79,6 @@ On failure, relay the redacted child error and the helper's explanation.
 "Credit balance is too low" means usable API credit did not cover that run;
 check the key's organization and Billing page. Do not switch authentication,
 change login, launch interactive Claude Code or retry automatically.
+
+Setup guide: [Claude Max API credits](https://tokenusage.dev/claude-max-api-credits)
+on tokenusage.dev.

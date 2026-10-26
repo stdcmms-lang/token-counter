@@ -67,6 +67,6 @@ Never open `.credentials.json`, other credentials files, external tool-result fi
 or image URLs. Never inspect or repeat prompt, output, thinking or tool content.
 Do not fetch prices or install packages.
 
-For public sharing, use the separate token-share skill only when the user explicitly
-asks to share, publish, update or delete their public usage. Running this report does
-not authorize sharing.
+For public sharing on [tokenusage.dev](https://tokenusage.dev), use the separate
+token-share skill only when the user explicitly asks to share, publish, update or
+delete their public usage. Running this report does not authorize sharing.

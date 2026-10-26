@@ -6,7 +6,7 @@ argument-hint: "[share with handle, update, delete report, or delete all]"
 ---
 
 Use this skill only for an explicit request to share, publish, update or delete
-Claude Code usage on tokenusage.dev.
+Claude Code usage on [tokenusage.dev](https://tokenusage.dev).
 
 Run a dry run first. On Windows:
 
