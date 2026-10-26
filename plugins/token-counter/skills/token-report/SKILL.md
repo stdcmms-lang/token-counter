@@ -11,7 +11,7 @@ the account (id_token identity claims — never the access or refresh tokens, an
 `--no-account` skips it). Nothing is intercepted and nothing of the user's is sent anywhere.
 The API value is priced from a table of OpenAI's list prices that ships with the plugin; it
 is never fetched. The one network call is installing `tiktoken` from PyPI, once, when it is
-missing (see below). Publishing numbers to the tokenusage.dev leaderboard is
+missing (see below). Publishing numbers to the [tokenusage.dev](https://tokenusage.dev) leaderboard is
 a different skill, token-share, used only when the user asks to share.
 
 Run from this skill's directory. Use whichever interpreter name exists on the machine:

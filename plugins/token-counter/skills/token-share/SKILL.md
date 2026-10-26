@@ -5,7 +5,7 @@ description: Share Codex token usage with the public tokenusage.dev leaderboard 
 
 # Token Share
 
-Sends a summary of the user's Codex token usage to **tokenusage.dev**, where it appears on
+Sends a summary of the user's Codex token usage to **[tokenusage.dev](https://tokenusage.dev)**, where it appears on
 public leaderboards (most tokens in a month, longest session, biggest session, most active
 days) and on a public profile page at `https://tokenusage.dev/u/<handle>`. It also publishes
 the token-report page itself at `https://tokenusage.dev/r/<handle>`: the same page, charts and
