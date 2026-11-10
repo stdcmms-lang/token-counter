@@ -119,17 +119,18 @@ def _setting(**kwargs):
 
 def test_price_fixture_parse():
     fixture = HERE / 'fixtures/anthropic_pricing.md'
-    # E5's byte digest, measured before copying. CI does not depend on ignored review files.
-    expect('E5 fixture byte parity', hashlib.sha256(fixture.read_bytes()).hexdigest(),
-           '67904e280b595d31f373c857844ed380072ae79d280d8f385640b5992d337ca9')
-    table = fetch.parse_prices(fixture.read_text(encoding='utf-8'), as_of='2026-10-10', source_url=fetch.PRICING_URL)
+    # Saved 2026-11-10 page digest, measured before copying; no ignored review files in CI.
+    expect('pricing fixture byte parity', hashlib.sha256(fixture.read_bytes()).hexdigest(),
+           '4fe2b894c1ec51f87e10428bb630886489c6a668fb674bc607a2c36a6834aabb')
+    table = fetch.parse_prices(fixture.read_text(encoding='utf-8'), as_of='2026-11-10', source_url=fetch.PRICING_URL)
     expect('offline vendored table parity', table, json.loads(Path(pricing.vendor_path()).read_text(encoding='utf-8')))
     records = table['models'].values()
     expect('table cardinalities', (len(table['models']), len(table['models']) + sum(r['long_context'] is not None for r in records),
-                                   sum(r['fast'] is not None for r in records), len(table['aliases'])), (20, 21, 3, 1))
-    # Every Q7 row, in dollars per million: hand transcription, independent of the parser.
+                                   sum(r['fast'] is not None for r in records), len(table['aliases'])), (22, 23, 5, 1))
+    # Every base rate, including retained models: hand transcription, independent of the parser.
     expected = {}
     for family in ('fable', 'mythos'):
+        expected['claude-' + family + '-5-2'] = (8, 10, 16, .2, 40)
         expected['claude-' + family + '-5-1'] = (10, 12.5, 20, .25, 50)
         expected['claude-' + family + '-5'] = (10, 12.5, 20, 1, 50)
     expected['claude-opus-5-5'] = (4, 5, 8, .2, 20)
@@ -142,12 +143,13 @@ def test_price_fixture_parse():
                      'claude-haiku-3-5': (.8, 1, 1.6, .08, 4)})
     for v in ('4-6', '4-5', '4'):
         expected['claude-sonnet-' + v] = (3, 3.75, 6, .3, 15)
-    expect('every Q7 base rate', {m: tuple(r[k] for k in pricing.RATE_KEYS) for m, r in table['models'].items()}, expected)
+    expect('every base rate', {m: tuple(r[k] for k in pricing.RATE_KEYS) for m, r in table['models'].items()}, expected)
     expect('Haiku alternate rates', tuple(table['models']['claude-haiku-5-5']['long_context'][k] for k in pricing.RATE_KEYS),
            (.5, .625, 1, .05, 2.5))
-    expect('three Fast rate records', {m: tuple(r['fast'][k] for k in pricing.RATE_KEYS)
-                                      for m, r in table['models'].items() if r['fast'] is not None},
-           {'claude-opus-5-5': (8, 10, 16, .4, 40), 'claude-opus-5': (10, 12.5, 20, 1, 50),
+    expect('five Fast rate records', {m: tuple(r['fast'][k] for k in pricing.RATE_KEYS)
+                                     for m, r in table['models'].items() if r['fast'] is not None},
+           {'claude-fable-5-2': (16, 20, 32, .4, 80), 'claude-mythos-5-2': (16, 20, 32, .4, 80),
+            'claude-opus-5-5': (8, 10, 16, .4, 40), 'claude-opus-5': (10, 12.5, 20, 1, 50),
             'claude-opus-4-8': (10, 12.5, 20, 1, 50)})
     # The extractor estimates images without the price table; its model list and
     # resolution rule must say the same as the table's image_tier.
@@ -159,12 +161,22 @@ def test_price_fixture_parse():
 def test_price_fixture_offline():
     with tempfile.TemporaryDirectory() as temp, offline(), contextlib.redirect_stdout(io.StringIO()):
         out = Path(temp) / 'prices.json'
-        args = ['--from', str(HERE / 'fixtures/anthropic_pricing.md'), '--as-of', '2026-10-10', '--out', str(out)]
+        args = ['--from', str(HERE / 'fixtures/anthropic_pricing.md'), '--as-of', '2026-11-10', '--out', str(out)]
         expect('offline parser writes local output', fetch.main(args), 0)
         expect('offline check equal', fetch.main(args + ['--check']), 0)
         out.write_text('{}', encoding='utf-8')
         expect('offline check differs exit one', fetch.main(args + ['--check']), 1)
         expect('offline check does not write', out.read_text(encoding='utf-8'), '{}')
+
+
+def test_retained_haiku35_price():
+    row = _row(lambda r: r['message'].update(model='claude-haiku-3-5'))
+    table = _table()
+    # R1=(10*.8+20*1+30*1.6+40*.08+8*4)/1e6 = .0001112.
+    close('retained Haiku 35 tokens', pricing.price_row(row, table)['tokens_usd'], .0001112)
+    value = pricing.summarize([row], table)
+    expect('retained Haiku 35 priced coverage',
+           (value['usd'], value['priced'], value['unpriced'], value['unpriced_model']), (.010111, 1, 0, 0))
 
 
 def test_price_table_finite_rates():

@@ -388,7 +388,7 @@ def _run(repo, existing_only=False):
             assert name not in RESERVED_MARKETPLACES and name not in RESERVED_NAMES, "reserved marketplace name"
             assert name == "stdcmms-lang", "wrong marketplace name"
             assert isinstance(marketplace["owner"]["name"], str) and marketplace["owner"]["name"], "missing owner name"
-            assert marketplace['metadata']['version'] == '0.2.0', 'wrong Claude marketplace version'
+            assert marketplace['metadata']['version'] == '0.2.1', 'wrong Claude marketplace version'
             entries = marketplace["plugins"]
             assert isinstance(entries, list) and len(entries) == 1, "expected one Claude plugin entry"
             names = set()
@@ -399,14 +399,14 @@ def _run(repo, existing_only=False):
                 target = _local_path(repo, repo, entry["source"])
                 if entry["name"] == "token-counter-claude":
                     assert target == repo / CLAUDE, "wrong Claude source"
-                    assert entry["version"] == "0.2.0", "wrong Claude entry version"
+                    assert entry["version"] == "0.2.1", "wrong Claude entry version"
             assert "token-counter-claude" in names, "Claude marketplace entry missing"
         attempt("Claude marketplace rules", marketplace_check)
     if manifest is not None:
         def manifest_check():
             assert _name(manifest["name"]) and manifest["name"] == "token-counter-claude", "invalid/reserved Claude name"
             assert manifest["displayName"] == "Token Counter for Claude Code", "wrong display name"
-            assert manifest["version"] == "0.2.0", "wrong Claude manifest version"
+            assert manifest["version"] == "0.2.1", "wrong Claude manifest version"
             assert "skills" not in manifest, "default skill discovery needs no manifest path"
             assert not any(k in manifest for k in ("hooks", "mcpServers", "agents")), "unexpected runtime components"
             plugin = (repo / CLAUDE).resolve()
@@ -427,17 +427,17 @@ def _run(repo, existing_only=False):
     share_path = CLAUDE + "/skills/token-share/scripts/share.py"
     if optional(package_path, required):
         version = attempt("Claude package version", lambda: _assignment(repo, package_path, "__version__"))
-        if version is not None and version != "0.2.0":
-            errors.append("Claude package version must be 0.2.0")
+        if version is not None and version != "0.2.1":
+            errors.append("Claude package version must be 0.2.1")
     if optional(share_path, required):
         client = attempt("Claude CLIENT", lambda: _assignment(repo, share_path, "CLIENT"))
-        if client is not None and client != {"name": "claude-usage", "version": "0.2.0"}:
-            errors.append("Claude CLIENT must be claude-usage 0.2.0")
+        if client is not None and client != {"name": "claude-usage", "version": "0.2.1"}:
+            errors.append("Claude CLIENT must be claude-usage 0.2.1")
     validator_path = CLAUDE + "/" + SCRIPT_DIR + "/tokencounter/share_validate.py"
     if optional(validator_path, required):
         validator_client = attempt("Claude validator CLIENT", lambda: _assignment(repo, validator_path, "CLIENT"))
-        if validator_client is not None and validator_client != {"name": "claude-usage", "version": "0.2.0"}:
-            errors.append("Claude validator CLIENT must be claude-usage 0.2.0")
+        if validator_client is not None and validator_client != {"name": "claude-usage", "version": "0.2.1"}:
+            errors.append("Claude validator CLIENT must be claude-usage 0.2.1")
     for name in SHARED:
         dest = CLAUDE + "/" + SCRIPT_DIR + "/tokencounter/" + name
         if optional(dest, required):
@@ -477,7 +477,7 @@ def _run(repo, existing_only=False):
         def price_check():
             parser = _import_script(repo, "scripts/fetch_anthropic_prices.py", "manifest_price_parser")
             table = _json(repo, prices_path)
-            assert table['as_of'] == '2026-10-10' and table['source_url'] == parser.PRICING_URL, 'price provenance differs'
+            assert table['as_of'] == '2026-11-10' and table['source_url'] == parser.PRICING_URL, 'price provenance differs'
             markdown = _read(repo, "scripts/fixtures/anthropic_pricing.md").decode("utf-8")
             expected = parser.parse_prices(markdown, as_of=table["as_of"], source_url=table["source_url"])
             assert expected == table, "offline price fixture differs from vendored table"

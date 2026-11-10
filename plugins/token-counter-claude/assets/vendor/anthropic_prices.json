@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "vendor": "anthropic",
-  "as_of": "2026-10-10",
+  "as_of": "2026-11-10",
   "source_url": "https://platform.claude.com/docs/en/about-claude/pricing.md",
   "units": "USD per million tokens",
   "models": {
@@ -26,6 +26,24 @@
       "long_context_threshold": null,
       "long_context": null,
       "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-fable-5-2": {
+      "input": 8.0,
+      "cache_write_5m": 10.0,
+      "cache_write_1h": 16.0,
+      "cached": 0.2,
+      "output": 40.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": {
+        "input": 16.0,
+        "cache_write_5m": 20.0,
+        "cache_write_1h": 32.0,
+        "cached": 0.4,
+        "output": 80.0
+      },
       "us_residency_supported": true,
       "image_tier": "high"
     },
@@ -92,6 +110,24 @@
       "long_context_threshold": null,
       "long_context": null,
       "fast": null,
+      "us_residency_supported": true,
+      "image_tier": "high"
+    },
+    "claude-mythos-5-2": {
+      "input": 8.0,
+      "cache_write_5m": 10.0,
+      "cache_write_1h": 16.0,
+      "cached": 0.2,
+      "output": 40.0,
+      "long_context_threshold": null,
+      "long_context": null,
+      "fast": {
+        "input": 16.0,
+        "cache_write_5m": 20.0,
+        "cache_write_1h": 32.0,
+        "cached": 0.4,
+        "output": 80.0
+      },
       "us_residency_supported": true,
       "image_tier": "high"
     },
