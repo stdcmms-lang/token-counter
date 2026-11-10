@@ -1,7 +1,7 @@
 {
   "name": "token-counter-claude",
   "displayName": "Token Counter for Claude Code",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Report Claude Code usage locally, optionally share sanitized totals, and run requested tasks in print mode with an Anthropic API key.",
   "author": {
     "name": "Jack H",

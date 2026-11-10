@@ -1,6 +1,6 @@
 # Token Counter for Claude Code — Architecture
 
-This describes `token-counter-claude` **0.2.0**, adding cc-api to the
+This describes `token-counter-claude` **0.2.1**, adding cc-api to the
 report/share implementation from rounds 1–8, fix round 4b and the final round 9 packaging/performance pass.
 The cc-api contract follows the 2026-10-24 result-plan.md with amendments B1/B2.
 Evidence is a snapshot of one development corpus, not a guarantee about future Claude Code records.
@@ -326,10 +326,14 @@ recent selection. Complete JSON and emitted pages/counts keep their existing dat
 ## 11. Anthropic list-price parsing and per-response value
 
 The offline table is `assets/vendor/anthropic_prices.json`, schema 1, Anthropic,
-USD per million tokens, as of **2026-10-10**, parsed from the supplied pricing
-Markdown. It has 20 models, 21 price rows, three supported Fast records and a closed
-dated alias. `fetch_anthropic_prices.py --from ... --check` verifies the offline
-fixture; fetching is a separate developer action, never a runtime operation.
+USD per million tokens, as of **2026-11-10**. The current pricing Markdown supplies
+21 models and 22 price rows. A fixed `RETAINED` table keeps Haiku 3.5's last
+published rates from the 2026-10-10 fixture at `d69ebff`, giving 22 models and
+23 price rows, five supported Fast records and one closed dated alias.
+Current page entries take precedence over retained rates.
+`fetch_anthropic_prices.py --from ... --check` verifies the fixture plus retained
+rates against the complete vendored table; fetching is a separate developer
+action, never a runtime operation.
 
 The loader rejects an invalid table whole, including nonfinite/negative rates,
 wrong types, invalid thresholds/alternate records/aliases and duplicate keys.
@@ -397,7 +401,7 @@ navigation. No browser is needed for the page tests.
 
 ## 13. Share schema1 mapping and server limitations
 
-Schema 1 with client `claude-usage` 0.2.0 carries whole safe captured months of
+Schema 1 with client `claude-usage` 0.2.1 carries whole safe captured months of
 recorded daily counts and known-speed partial tier partitions, selected session
 hashes, a retained-safe union of weekly-all observation windows and 30-day timing.
 Session IDs are the first 16 hex characters of domain-separated SHA-256 over family

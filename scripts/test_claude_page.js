@@ -62,7 +62,7 @@ const exact = ['Claude Code Token Report','Claude Code usage, recorded locally',
   'recorded /usage and weekly 429 points','weekly 429 refusal: 100%, assumed all-model',
   'Recorded tokens','cumulative recorded input and output per nominal weekly window',
   'Response time is the interval from the last known prompt-side record to the last response record.',
-  'Anthropic API price table · 2026-10-10 · vendored locally',
+  'Anthropic API price table · 2026-11-10 · vendored locally',
   'Byte shares describe captured text and saved snapshots. They are not Claude token shares or a reconstruction of the full API prompt.'];
 try {
   const py = `import sys\nsys.path.insert(0, ${JSON.stringify(path.join(REPO,'scripts'))})\nimport test_claude_pipeline as tp\ntp.page_fixtures(${JSON.stringify(temp)})`;
