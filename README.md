@@ -391,7 +391,7 @@ and the installed plugin was not the reviewed code.
 
 ## Claude Code
 
-The Claude Code edition is the separate **token-counter-claude 0.2.0** plugin. Its
+The Claude Code edition is the separate **token-counter-claude 0.2.1** plugin. Its
 version, local state and share token are separate from the Codex plugin's. It reads
 Claude Code's recorded usage and retained capture history; it ships no tokenizer,
 downloads nothing and installs no packages. See [CLAUDE_ARCHITECTURE.md](CLAUDE_ARCHITECTURE.md)
@@ -571,7 +571,7 @@ unless the table states otherwise; no date or session filter is applied by defau
 | `--fast` | Off; all cores, Windows maximum 61; conflicts with `--procs` |
 | `--quiet` | Off; suppresses progress, preserves warnings and summary |
 | `--doctor` | Off; read-only path/parser/state diagnostics, no capture or network |
-| `--version` | Prints `token-counter-claude 0.2.0`, then exits |
+| `--version` | Prints `token-counter-claude 0.2.1`, then exits |
 
 | Share option | Default and behavior |
 | --- | --- |
@@ -611,8 +611,9 @@ Background/advisor and compaction calls without separately recorded usage cannot
 be recovered; cost-state and `/usage` cost figures are cross-checks only.
 
 **API list value** prices each captured response at the offline Anthropic table of
-**2026-10-10**, including the whole-prompt Haiku 5.5 band above 100,000 tokens,
-recorded speed, exact known write TTLs and supported explicit-US residency. It is
+**2026-11-10**, retaining Haiku 3.5's last published rates from 2026-10-10.
+It includes the whole-prompt Haiku 5.5 band above 100,000 tokens, recorded speed,
+exact known write TTLs and supported explicit-US residency. It is
 a comparison, not spend or a bill. `[1m]` adds no surcharge. Missing speed defaults
 to Standard for pricing only; missing nonzero write TTL defaults to all-5m;
 missing/`not_available` geography defaults to global; missing search count defaults
@@ -713,7 +714,7 @@ python -I -S -B scripts/test_claude_pricing.py
 python -B scripts/test_claude_share.py
 python -B scripts/test_claude_mutations.py
 node scripts/test_claude_page.js
-python -B scripts/fetch_anthropic_prices.py --from scripts/fixtures/anthropic_pricing.md --as-of 2026-10-10 --check
+python -B scripts/fetch_anthropic_prices.py --from scripts/fixtures/anthropic_pricing.md --as-of 2026-11-10 --check
 ```
 
 The manifest checker requires both marketplaces, versions, contained paths,

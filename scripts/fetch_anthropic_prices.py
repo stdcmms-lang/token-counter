@@ -17,6 +17,12 @@ REPO = Path(__file__).resolve().parent.parent
 VENDOR = REPO / 'plugins/token-counter-claude/assets/vendor/anthropic_prices.json'
 RATE_KEYS = ('input', 'cache_write_5m', 'cache_write_1h', 'cached', 'output')
 ALIASES = {'claude-haiku-4-5-20251001': 'claude-haiku-4-5'}
+RETAINED = {
+    # Last published in scripts/fixtures/anthropic_pricing.md at d69ebff (2026-10-10).
+    'claude-haiku-3-5': dict(zip(RATE_KEYS, (.8, 1.0, 1.6, .08, 4.0)),
+                           long_context_threshold=None, long_context=None, fast=None,
+                           us_residency_supported=False, image_tier='standard'),
+}
 
 
 def _section(markdown, heading):
@@ -49,7 +55,7 @@ def _tables(markdown):
 
 def _dollars(cell):
     cell = re.sub(r'<sup>.*?</sup>', '', cell)
-    match = re.fullmatch(r'\$(\d+(?:\.\d+)?)\s*/\s*MTok', cell.strip())
+    match = re.fullmatch(r'\$(\d+(?:\.\d+)?)(?: USD)?\s*/\s*MTok', cell.strip())
     if match is None:
         raise ValueError('unrecognized token price')
     return float(Decimal(match.group(1)))
@@ -99,7 +105,7 @@ def parse_prices(markdown, *, as_of, source_url) -> dict:
                                 us_residency_supported=version >= us_since,
                                 image_tier='high' if version >= high_since else 'standard')
         row_count += 1
-    if len(models) != 20 or row_count != 21 or any(
+    if len(models) != 21 or row_count != 22 or any(
             (r['long_context_threshold'] is None) != (r['long_context'] is None) for r in models.values()):
         raise ValueError('incomplete model price table')
     fast_tables = list(_tables(_section(markdown, 'Fast mode pricing')))
@@ -113,12 +119,14 @@ def parse_prices(markdown, *, as_of, source_url) -> dict:
             multiplier = Decimal(str(inp)) / Decimal(str(record['input']))
             record['fast'] = {k: float(Decimal(str(record[k])) * multiplier) for k in RATE_KEYS}
             record['fast']['output'] = out
-    if sum(r['fast'] is not None for r in models.values()) != 3:
+    if sum(r['fast'] is not None for r in models.values()) != 5:
         raise ValueError('incomplete Fast price table')
-    search = re.search(r'\*\*\$(\d+(?:\.\d+)?) per ([\d,]+) searches\*\*',
+    search = re.search(r'\*\*\$(\d+(?:\.\d+)?)(?: USD)? per ([\d,]+) searches\*\*',
                        _section(markdown, 'Web search tool'))
     if search is None or 'no additional charges' not in _section(markdown, 'Web fetch tool'):
         raise ValueError('missing server-tool fees')
+    for name, record in RETAINED.items():
+        models.setdefault(name, dict(record))
     return {'schema': 1, 'vendor': 'anthropic', 'as_of': as_of, 'source_url': source_url,
             'units': 'USD per million tokens', 'models': {k: models[k] for k in sorted(models)},
             'aliases': dict(ALIASES),

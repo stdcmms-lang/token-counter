@@ -23,7 +23,7 @@ LABELS = dict(zip(CATEGORIES, (
 )))
 KNOWN_MODELS = frozenset(
     ['claude-' + family + '-' + version for family in ('fable', 'mythos')
-     for version in ('5-1', '5')]
+     for version in ('5-2', '5-1', '5')]
     + ['claude-opus-' + v for v in ('5-5', '5', '4-8', '4-7', '4-6', '4-5', '4-1', '4')]
     + ['claude-sonnet-' + v for v in ('5-5', '5', '4-6', '4-5', '4')]
     + ['claude-haiku-' + v for v in ('5-5', '4-5', '3-5')])
